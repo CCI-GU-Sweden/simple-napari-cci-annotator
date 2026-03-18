@@ -1,0 +1,113 @@
+Metadata-Version: 2.4
+Name: simple-napari-cci-annotator
+Version: 0.0.1
+Summary: Plugin to easly test a yolo model and retrain it
+Author: Simon Leclerc
+Author-email: simon.leclerc@gu.se
+License: MIT License
+        
+        Copyright (c) 2026 LECLERC Simon
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Classifier: Development Status :: 2 - Pre-Alpha
+Classifier: Framework :: napari
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Image Processing
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: qtpy
+Requires-Dist: ultralytics
+Requires-Dist: pillow
+Provides-Extra: all
+Requires-Dist: napari[all]; extra == "all"
+Provides-Extra: testing
+Requires-Dist: tox; extra == "testing"
+Requires-Dist: pytest; extra == "testing"
+Requires-Dist: pytest-cov; extra == "testing"
+Requires-Dist: pytest-qt; extra == "testing"
+Requires-Dist: napari; extra == "testing"
+Requires-Dist: pyqt5; extra == "testing"
+Dynamic: license-file
+
+
+# Simple napari annotator
+
+Minimal napari plugin for YOLO bbox detection + quick correction + retraining.
+
+No dataset browser, no extra workflow logic. User provides the image in napari.
+
+## UI flow
+
+1. Path to model (`.pt`)
+2. `Load model`
+3. `Predict`
+4. Edit boxes in napari shapes layer (`yolo_bboxes`)
+5. `Add correction`
+6. `Retrain`
+
+## Assumptions
+
+- Input image is already RGB 8-bit (or compatible with clipping/conversion).
+- Single class (`0: LABEL`) for now.
+
+## Folder behavior
+
+Given a model path like:
+
+`.../my_model/best.pt`
+
+The plugin uses `.../my_model` as root.
+
+### Add correction
+
+Each click saves:
+
+- Image to `my_model/corrections/images/<image_name>_<timestamp>.png`
+- Labels to `my_model/corrections/labels/<image_name>_<timestamp>.txt`
+
+Label format is YOLO detection:
+
+`class x_center y_center width height`
+
+normalized to `[0, 1]`.
+
+### Retrain
+
+Each click creates:
+
+- `my_model/retrained_<timestamp>/dataset/`
+  - `images/train`, `images/val`
+  - `labels/train`, `labels/val`
+  - `dataset.yaml`
+- Trains YOLO from those corrections
+- Copies best model to:
+  - `my_model/retrained_<timestamp>/best.pt`
+- Deletes training traces folder after extracting `best.pt`
+
+So the retrained folder keeps a clean dataset + final model, without run artifacts.

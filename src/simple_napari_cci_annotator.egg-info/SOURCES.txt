@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+src/simple_napari_cci_annotator/__init__.py
+src/simple_napari_cci_annotator/_widget.py
+src/simple_napari_cci_annotator/_yolo_utils.py
+src/simple_napari_cci_annotator/napari.yaml
+src/simple_napari_cci_annotator.egg-info/PKG-INFO
+src/simple_napari_cci_annotator.egg-info/SOURCES.txt
+src/simple_napari_cci_annotator.egg-info/dependency_links.txt
+src/simple_napari_cci_annotator.egg-info/entry_points.txt
+src/simple_napari_cci_annotator.egg-info/requires.txt
+src/simple_napari_cci_annotator.egg-info/top_level.txt
+src/simple_napari_cci_annotator/models/yolov8n.pt

@@ -1,0 +1,110 @@
+[project]
+name = "simple-napari-cci-annotator"
+dynamic = ["version"]
+description = "Plugin to easly test a yolo model and retrain it"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Simon Leclerc"},
+  {email = "simon.leclerc@gu.se"},
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "qtpy",
+    "ultralytics",
+    "pillow",
+]
+
+[project.optional-dependencies]
+all = ["napari[all]"]
+
+testing = [
+    "tox",
+    "pytest",  # https://docs.pytest.org/en/latest/contents.html
+    "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
+    "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
+    "napari",
+    "pyqt5",
+]
+
+[project.entry-points."napari.manifest"]
+simple-napari-cci-annotator = "simple_napari_cci_annotator:napari.yaml"
+
+[build-system]
+requires = ["setuptools>=42.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.setuptools.dynamic]
+version = {attr = "simple_napari_cci_annotator.__init__.__version__"}
+
+[tool.black]
+line-length = 79
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 79
+lint.select = [
+    "E", "F", "W", #flake8
+    "UP", # pyupgrade
+    "I", # isort
+    "BLE", # flake8-blind-exception
+    "B", # flake8-bugbear
+    "A", # flake8-builtins
+    "C4", # flake8-comprehensions
+    "ISC", # flake8-implicit-str-concat
+    "G", # flake8-logging-format
+    "PIE", # flake8-pie
+    "SIM", # flake8-simplify
+]
+lint.ignore = [
+    "E501", # line too long. let black handle this
+    "SIM117",
+]
+
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".mypy_cache",
+    ".pants.d",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+    "*vendored*",
+    "*_vendor*",
+]
+
+target-version = "py312"
+fix = true

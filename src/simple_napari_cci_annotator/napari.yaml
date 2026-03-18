@@ -1,0 +1,14 @@
+name: simple-napari-cci-annotator
+display_name: CCI Annotator
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+categories: ["Annotation", "Segmentation"]
+contributions:
+  commands:
+    - id: simple-napari-cci-annotator.open_widget
+      python_name: simple_napari_cci_annotator:SimpleCciAnnotatorQWidget
+      title: Simple CCI annotator plugin
+  widgets:
+    - command: simple-napari-cci-annotator.open_widget
+      display_name: Simple CCI Annotator Plugin

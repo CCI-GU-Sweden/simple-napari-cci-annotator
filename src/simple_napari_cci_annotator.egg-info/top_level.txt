@@ -1,0 +1,1 @@
+simple_napari_cci_annotator
