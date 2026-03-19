@@ -55,6 +55,10 @@ jobs:
 
       - name: Run tests (Linux – headless via xvfb)
         if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+          NAPARI_TESTING: "1"
         run: xvfb-run --auto-servernum python -m pytest tests/ -v
 
       - name: Run tests (Windows / macOS)
