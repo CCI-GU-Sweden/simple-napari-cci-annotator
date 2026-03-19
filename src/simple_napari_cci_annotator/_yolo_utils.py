@@ -1,8 +1,6 @@
 import shutil
 from pathlib import Path
 
-from ultralytics import YOLO
-
 
 def _points_to_yolo_xywh(points: list[tuple[float, float]]) -> tuple[float, float, float, float] | None:
     """Convert normalized polygon points to normalized YOLO xywh box."""
@@ -161,7 +159,20 @@ class CCIYoloWrapper:
     def __init__(self, model_name_or_path: str = "yolov8n.pt"):
         self.model_name = ""
         self.res = None
-        self.model = YOLO(model_name_or_path)
+        self.model = self._create_model(model_name_or_path)
+
+    @staticmethod
+    def _create_model(model_name_or_path):
+        # Defer ultralytics/torch import so package import and pure helper tests
+        # do not fail on systems without a working torch runtime.
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:  # pragma: no cover - runtime environment guard
+            raise RuntimeError(
+                "Failed to import ultralytics/torch. Install a compatible CPU build "
+                "for this platform to run model inference or training."
+            ) from exc
+        return YOLO(model_name_or_path)
 
     # @classmethod
     # def load_model_by_name(cls, model_name: str, basedir: str = 'models'):
@@ -172,7 +183,7 @@ class CCIYoloWrapper:
     #     return cls(yolomodel(config, name=model_name, basedir=basedir), model_name=model_name, basedir=basedir)
 
     def load_model(self, weights_path: Path):
-        self.model = YOLO(weights_path)
+        self.model = self._create_model(weights_path)
 
     def predict(self, img):
         return self.model(img)

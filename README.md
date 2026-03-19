@@ -19,6 +19,8 @@ No dataset browser, no extra workflow logic. User provides the image in napari.
 6. `Add correction`
 7. `Retrain`
 
+![UI](assets/Plugin_UI.png)
+
 ## Starting from scratch
 
 The model input supports either:
@@ -39,11 +41,15 @@ If you do not have a model yet, start from a pretrained YOLOv8 nano checkpoint a
 
 After downloading, select that `yolov8n.pt` file in the Model field and continue with the correction/retrain loop.
 
+![Loading a model](assets/Loading_model.png)
+
 ## Assumptions
 
 - Input image is already RGB 8-bit (or compatible with clipping/conversion).
 - Single class (`0: LABEL`) for now.
 - Exactly one image layer should be present when using `Add correction`.
+
+![Predicting label](assets/Predicting_label.png)
 
 ## Folder behavior
 

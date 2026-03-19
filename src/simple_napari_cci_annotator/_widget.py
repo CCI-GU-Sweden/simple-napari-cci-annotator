@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from qtpy.QtCore import QThread, QTimer, Signal
 from qtpy.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -24,6 +25,76 @@ from ._yolo_utils import (
     create_training_set,
     save_vectors_to_txt,
 )
+
+
+class _RetrainWorker(QThread):
+    """Runs YOLO retraining in a background thread."""
+
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, yolo, model_root, destination_path, parent=None):
+        super().__init__(parent)
+        self._yolo = yolo
+        self._model_root = model_root
+        self._destination_path = destination_path
+
+    def run(self):
+        model_root = self._model_root
+        corrections_root = model_root / "corrections"
+
+        if self._destination_path is not None:
+            retrain_root = self._destination_path
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            retrain_root = model_root / f"retrained_{stamp}"
+
+        dataset_dir = retrain_root / "dataset"
+        traces_dir = retrain_root / "training_traces"
+
+        try:
+            retrain_root.mkdir(parents=True, exist_ok=True)
+            create_training_set(
+                path_to_images=corrections_root,
+                path_to_vectors=corrections_root,
+                destination_path=dataset_dir,
+                label_names=[(0, "LABEL")],
+            )
+
+            config = self._load_training_config(corrections_root)
+
+            self._yolo.train(
+                data_set_file=dataset_dir / "dataset.yaml",
+                image_size=config["image_size"],
+                batch=config["batch"],
+                epochs=config["epochs"],
+                patience=config["patience"],
+                project=traces_dir,
+                name="run",
+                exist_ok=True,
+            )
+
+            best_model = traces_dir / "run" / "weights" / "best.pt"
+            if not best_model.exists():
+                raise FileNotFoundError(f"best.pt not found at: {best_model}")
+
+            shutil.copy2(best_model, retrain_root / "best.pt")
+            shutil.rmtree(traces_dir, ignore_errors=True)
+        except Exception as exc:  # pragma: no cover - GUI runtime guard
+            self.failed.emit(f"Retrain failed: {exc}")
+            return
+
+        self.finished.emit(f"Retrain done. New model saved in: {retrain_root}")
+
+    def _load_training_config(self, corrections_root: Path) -> dict:
+        config_file = corrections_root / "training_config.json"
+        if config_file.exists():
+            try:
+                with open(config_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"image_size": 640, "batch": 8, "epochs": 100, "patience": 30}
 
 
 class SimpleCciAnnotatorQWidget(QWidget):
@@ -47,6 +118,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._yolo: CCIYoloWrapper | None = None
         self._model_path: Path | None = None
         self._destination_path: Path | None = None
+        self._retrain_worker: _RetrainWorker | None = None
+
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(400)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+        self._spinner_frames = ["Retraining .", "Retraining ..", "Retraining ...", "Retraining"]
+        self._spinner_index = 0
 
         self._model_path_input = QLineEdit()
         self._model_path_input.setPlaceholderText("Path to YOLO model (.pt) or model folder")
@@ -69,8 +147,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         add_correction_button = QPushButton("Add correction")
         add_correction_button.clicked.connect(self._on_add_correction)
 
-        retrain_button = QPushButton("Retrain")
-        retrain_button.clicked.connect(self._on_retrain)
+        self._retrain_button = QPushButton("Retrain")
+        self._retrain_button.clicked.connect(self._on_retrain)
 
         row_model = QHBoxLayout()
         row_model.addWidget(QLabel("Model"))
@@ -88,7 +166,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
         row_train = QHBoxLayout()
         row_train.addWidget(add_correction_button)
-        row_train.addWidget(retrain_button)
+        row_train.addWidget(self._retrain_button)
         #row_train.addStretch(1)
 
         layout = QVBoxLayout()
@@ -364,54 +442,37 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
         model_root = self._model_path.parent
         corrections_root = model_root / "corrections"
-        source_images = corrections_root
-        source_labels = corrections_root
 
-        if not source_images.exists() or not source_labels.exists():
+        if not corrections_root.exists():
             self._show_error("No corrections found. Add at least one correction first.")
             return
 
-        # Use destination path if provided, otherwise use default location
-        if self._destination_path is not None:
-            retrain_root = self._destination_path
-        else:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            retrain_root = model_root / f"retrained_{stamp}"
+        self._retrain_button.setEnabled(False)
+        self._spinner_index = 0
+        self._spinner_timer.start()
 
-        dataset_dir = retrain_root / "dataset"
-        traces_dir = retrain_root / "training_traces"
+        self._retrain_worker = _RetrainWorker(
+            yolo=self._yolo,
+            model_root=model_root,
+            destination_path=self._destination_path,
+            parent=self,
+        )
+        self._retrain_worker.finished.connect(self._on_retrain_done)
+        self._retrain_worker.failed.connect(self._on_retrain_error)
+        self._retrain_worker.start()
 
-        try:
-            retrain_root.mkdir(parents=True, exist_ok=True)
-            create_training_set(
-                path_to_images=source_images,
-                path_to_vectors=source_labels,
-                destination_path=dataset_dir,
-                label_names=[(0, "LABEL")],
-            )
+    def _tick_spinner(self) -> None:
+        self._retrain_button.setText(self._spinner_frames[self._spinner_index % len(self._spinner_frames)])
+        self._spinner_index += 1
 
-            # Load training configuration
-            config = self._load_training_config(corrections_root)
+    def _on_retrain_done(self, message: str) -> None:
+        self._spinner_timer.stop()
+        self._retrain_button.setText("Retrain")
+        self._retrain_button.setEnabled(True)
+        self._show_info(message)
 
-            self._yolo.train(
-                data_set_file=dataset_dir / "dataset.yaml",
-                image_size=config["image_size"],
-                batch=config["batch"],
-                epochs=config["epochs"],
-                patience=config["patience"],
-                project=traces_dir,
-                name="run",
-                exist_ok=True,
-            )
-
-            best_model = traces_dir / "run" / "weights" / "best.pt"
-            if not best_model.exists():
-                raise FileNotFoundError(f"best.pt not found at: {best_model}")
-
-            shutil.copy2(best_model, retrain_root / "best.pt")
-            shutil.rmtree(traces_dir, ignore_errors=True)
-        except Exception as exc:  # pragma: no cover - GUI runtime guard
-            self._show_error(f"Retrain failed: {exc}")
-            return
-
-        self._show_info(f"Retrain done. New model saved in: {retrain_root}")
+    def _on_retrain_error(self, message: str) -> None:
+        self._spinner_timer.stop()
+        self._retrain_button.setText("Retrain")
+        self._retrain_button.setEnabled(True)
+        self._show_error(message)
