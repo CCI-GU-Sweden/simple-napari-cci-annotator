@@ -1,3 +1,0 @@
-import simple_napari_cci_annotator
-
-print(simple_napari_cci_annotator.__version__)

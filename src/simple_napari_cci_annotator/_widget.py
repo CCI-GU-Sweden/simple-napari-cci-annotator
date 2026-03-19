@@ -49,7 +49,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._destination_path: Path | None = None
 
         self._model_path_input = QLineEdit()
-        self._model_path_input.setPlaceholderText("Path to YOLO model (.pt)")
+        self._model_path_input.setPlaceholderText("Path to YOLO model (.pt) or model folder")
 
         browse_button = QPushButton("Browse")
         browse_button.clicked.connect(self._on_browse_model)
@@ -89,7 +89,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         row_train = QHBoxLayout()
         row_train.addWidget(add_correction_button)
         row_train.addWidget(retrain_button)
-        row_train.addStretch(1)
+        #row_train.addStretch(1)
 
         layout = QVBoxLayout()
         layout.addLayout(row_model)
@@ -106,9 +106,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         QMessageBox.critical(self, "Simple CCI Annotator", text)
 
     def _on_browse_model(self) -> None:
-        model_file, _ = QFileDialog.getOpenFileName(self, "Select YOLO model", "", "Model (*.pt)")
-        if model_file:
-            self._model_path_input.setText(model_file)
+        model_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select model folder (.pt will be loaded or yolov8n.pt will be copied)"
+        )
+        if model_dir:
+            self._model_path_input.setText(model_dir)
 
     def _on_browse_destination(self) -> None:
         destination_dir = QFileDialog.getExistingDirectory(self, "Select destination for retrained model")
@@ -116,9 +119,39 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self.destination_path_input.setText(destination_dir)
 
     def _on_load_model(self) -> None:
-        model_path = Path(self._model_path_input.text().strip())
-        if not model_path.exists() or model_path.suffix.lower() != ".pt":
-            self._show_error("Select a valid .pt model file.")
+        model_input = self._model_path_input.text().strip()
+        if not model_input:
+            self._show_error("Model path cannot be empty. Select a .pt file or a folder.")
+            return
+
+        model_path_input = Path(model_input)
+        if not model_path_input.exists():
+            self._show_error("Model path does not exist.")
+            return
+
+        model_path: Path
+        copied_default_model = False
+
+        if model_path_input.is_file():
+            if model_path_input.suffix.lower() != ".pt":
+                self._show_error("Select a valid .pt model file or a folder.")
+                return
+            model_path = model_path_input
+        elif model_path_input.is_dir():
+            pt_files = sorted(model_path_input.glob("*.pt"))
+            if pt_files:
+                model_path = pt_files[0]
+            else:
+                default_model_source = Path(__file__).parent / "models" / "yolov8n.pt"
+                if not default_model_source.exists():
+                    self._show_error("No .pt found in selected folder, and bundled yolov8n.pt is missing.")
+                    return
+
+                model_path = model_path_input / "yolov8n.pt"
+                shutil.copy2(default_model_source, model_path)
+                copied_default_model = True
+        else:
+            self._show_error("Select a valid .pt model file or a folder.")
             return
 
         try:
@@ -127,6 +160,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         except Exception as exc:  # pragma: no cover - GUI runtime guard
             self._show_error(f"Could not load model: {exc}")
             return
+
+        if copied_default_model:
+            self._show_info(f"No .pt model was found in the folder. Copied bundled model to: {model_path}")
 
         self._show_info(f"Model loaded: {model_path.name}")
 
@@ -233,14 +269,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _create_training_config(self, corrections_root: Path, image_size: int | None = None) -> None:
         """Create a training configuration JSON file in the corrections directory.
-        
         Args:
             corrections_root: Path to the corrections directory
             image_size: Optional image size to use. If not provided, defaults to 640.
         """
         if image_size is None:
             image_size = 640
-        
+
         config = {
             "image_size": image_size,
             "batch": 8,
@@ -256,11 +291,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         config_file = corrections_root / "training_config.json"
         if config_file.exists():
             try:
-                with open(config_file, 'r') as f:
+                with open(config_file) as f:
                     return json.load(f)
             except Exception:
                 pass
-        
+
         # Return defaults if file doesn't exist or can't be read
         return {
             "image_size": 640,
@@ -342,7 +377,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         else:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             retrain_root = model_root / f"retrained_{stamp}"
-        
+
         dataset_dir = retrain_root / "dataset"
         traces_dir = retrain_root / "training_traces"
 
@@ -357,7 +392,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
             # Load training configuration
             config = self._load_training_config(corrections_root)
-            
+
             self._yolo.train(
                 data_set_file=dataset_dir / "dataset.yaml",
                 image_size=config["image_size"],
@@ -380,4 +415,3 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
 
         self._show_info(f"Retrain done. New model saved in: {retrain_root}")
-        

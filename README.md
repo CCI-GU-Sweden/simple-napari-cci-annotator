@@ -1,4 +1,8 @@
 
+[![License MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/blob/main/LICENSE)
+[![Python 3.10–3.12](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](https://python.org)
+[![tests](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/workflows/tests/badge.svg)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/actions)
+
 # Simple napari annotator
 
 Minimal napari plugin for YOLO bbox detection + quick correction + retraining.
@@ -7,13 +11,33 @@ No dataset browser, no extra workflow logic. User provides the image in napari.
 
 ## UI flow
 
-1. Path to model (`.pt`)
+1. Path to model (`.pt`) or model folder
 2. `Load model`
 3. `Predict`
 4. Optional destination folder for retrained model (browse or type)
 5. Edit boxes in napari shapes layer (`yolo_bboxes`)
 6. `Add correction`
 7. `Retrain`
+
+## Starting from scratch
+
+The model input supports either:
+
+- A `.pt` model file, or
+- A folder path.
+
+Folder behavior on `Load model`:
+
+- If the folder already contains one or more `.pt` files, the first one is loaded.
+- If the folder contains no `.pt` file, the plugin copies the bundled `yolov8n.pt` into that folder and loads it.
+- Empty model input is invalid and will show an error.
+
+If you do not have a model yet, start from a pretrained YOLOv8 nano checkpoint and use it as your initial file:
+
+- Direct download: <https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt>
+- Model overview: <https://docs.ultralytics.com/models/yolov8/>
+
+After downloading, select that `yolov8n.pt` file in the Model field and continue with the correction/retrain loop.
 
 ## Assumptions
 
@@ -77,3 +101,5 @@ Each click creates:
 - Otherwise it defaults to `my_model/retrained_<timestamp>`.
 
 So the retrained folder keeps a clean dataset + final model, without run artifacts.
+
+Warning: Data labeled will be equally divided between traning and validation (50%).

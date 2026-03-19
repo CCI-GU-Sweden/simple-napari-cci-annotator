@@ -107,13 +107,13 @@ def create_training_set(path_to_images: Path, path_to_vectors: Path, destination
         shutil.rmtree(images_dest_path)
     if labels_dest_path.exists():
         shutil.rmtree(labels_dest_path)
-    
+
     images_dest_val = images_dest_path / Path("val")
     images_dest_train = images_dest_path / Path("train")
-    
+
     labels_dest_val = labels_dest_path / Path("val")
     labels_dest_train = labels_dest_path / Path("train")
-    
+
     images_dest_val.mkdir(parents=True, exist_ok=True)
     images_dest_train.mkdir(parents=True, exist_ok=True)
     labels_dest_val.mkdir(parents=True, exist_ok=True)
@@ -145,7 +145,7 @@ def create_training_set(path_to_images: Path, path_to_vectors: Path, destination
         label_path = labels_by_stem.get(img_path.stem)
         if label_path is not None:
             shutil.copy2(label_path, label_destination_dir / f"{img_path.stem}.txt")
-        
+
     dataset_file = destination_path / Path("dataset.yaml")
     with open(dataset_file, 'w') as dataset_file:
         dataset_file.write("train: ./images/train/\n")
