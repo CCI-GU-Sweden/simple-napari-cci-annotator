@@ -109,3 +109,13 @@ Each click creates:
 So the retrained folder keeps a clean dataset + final model, without run artifacts.
 
 Warning: Data labeled will be equally divided between traning and validation (50%).
+
+## Roadmap
+
+- Napari image -> RGB translation -> v0.1.0
+- Better train/test split -> maybe use something similar to sklearn.model_selection? -> v0.1.5
+- Multiple classes (by color identification) -> v1
+    - in case of multiple classes, generate the color -> class -> name translation
+    - in both direction, training and prediction
+- Extend from object detection to also include instance segmentation -> v1.5
+- Add support for other 'classical' model such as StarDist -> v2
