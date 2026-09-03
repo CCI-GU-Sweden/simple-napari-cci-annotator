@@ -26,6 +26,10 @@ class InvalidProjectError(ProjectError):
     """Raised when an existing project is incomplete or invalid."""
 
 
+class ImageProcessingLockedError(ProjectError):
+    """Raised when code attempts to change locked image-processing settings."""
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
     root: Path
@@ -229,6 +233,26 @@ class ProjectStore:
     def update_config(self, config: ProjectConfig) -> None:
         _atomic_write_yaml(self.paths.config, config.to_mapping())
         self.config = config
+
+    def lock_image_processing(self, settings: dict[str, Any]) -> None:
+        """Persist the immutable conversion settings used by project images."""
+        requested = dict(settings)
+        requested["locked"] = True
+        if self.config.image_processing.get("locked"):
+            if self.config.image_processing != requested:
+                raise ImageProcessingLockedError(
+                    "Image-processing settings are locked for this project."
+                )
+            return
+
+        updated = ProjectConfig(
+            schema_version=self.config.schema_version,
+            name=self.config.name,
+            created_at=self.config.created_at,
+            classes=dict(self.config.classes),
+            image_processing=requested,
+        )
+        self.update_config(updated)
 
 
 def _atomic_write_yaml(path: Path, value: dict[str, Any]) -> None:

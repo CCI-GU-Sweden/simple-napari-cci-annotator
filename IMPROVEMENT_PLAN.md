@@ -428,18 +428,24 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 ### Phase 1 — Reliable annotation persistence and label loading
 
+**Status: completed in the annotation-only `0.2.0` milestone.**
+
 - Create `ProjectStore` and `AnnotationIO`.
 - Save same-stem image/label pairs atomically in persistent `annotations/images` and `annotations/labels` folders.
 - Add atomic overwrite/update behavior, empty label support, manifest audit entries, and dataset validation.
 - Add automatic/explicit YOLO bbox loading and round-trip tests.
 - Preserve class properties even while the UI exposes only class `0`.
+- Extract current Z/T planes from multidimensional TIFF/OME-TIFF data, map up to three selected channels to RGB, and save converted `uint8` training images.
+- Provide min/max, simple-max, percentile, Z-score, fixed-range, and integer-dtype normalization with an RGB preview.
+- Lock channel mapping and normalization in `project.yaml` after the first converted pair is saved.
+- Protect unsaved bbox edits during image/plane changes, label reload, and widget close.
 
 **Exit criteria:** users can load, edit, update, close, and reload annotations with no coordinate drift or unwanted duplicates.
 
-### Phase 2 — Prediction controls and safe image conversion
+### Phase 2 — Prediction controls and responsive inference
 
 - Add confidence, model IoU, image size, maximum detections, and device controls.
-- Add robust grayscale/16-bit/float/channel conversion with visible, saved settings.
+- Reuse the project's locked image conversion for inference so prediction sees the same pixels as training.
 - Move inference off the UI thread; add progress, cancellation, and error reporting.
 - Preserve class and confidence metadata on predicted shapes.
 

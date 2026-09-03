@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 from PIL import Image
@@ -83,7 +83,12 @@ class AnnotationIO:
 
     @staticmethod
     def safe_stem(value: str) -> str:
-        stem = Path(value).stem
+        path = Path(value)
+        stem = (
+            path.stem
+            if path.suffix.lower() in IMAGE_EXTENSIONS.union({".txt"})
+            else path.name
+        )
         stem = re.sub(r"[^a-zA-Z0-9._-]+", "_", stem.strip())
         return stem or "image"
 
@@ -98,10 +103,10 @@ class AnnotationIO:
 
         if source_path is not None:
             source_path = Path(source_path)
-            candidates.append(source_path.with_suffix(".txt"))
+            candidates.append(source_path.parent / f"{stem}.txt")
             if source_path.parent.name.lower() == "images":
                 candidates.append(
-                    source_path.parent.parent / "labels" / f"{source_path.stem}.txt"
+                    source_path.parent.parent / "labels" / f"{stem}.txt"
                 )
 
         seen: set[Path] = set()
@@ -214,10 +219,19 @@ class AnnotationIO:
         rectangles: Iterable[np.ndarray],
         class_ids: Sequence[int],
         source_path: Path | None = None,
+        sample_id: str | None = None,
+        conversion_metadata: dict[str, Any] | None = None,
     ) -> SaveResult:
         image = np.asarray(image_data)
         height, width = _validate_image_shape(image.shape)
-        stem = self.safe_stem(Path(source_path).stem if source_path else image_name)
+        identity = (
+            sample_id
+            if sample_id is not None
+            else Path(source_path).stem
+            if source_path
+            else image_name
+        )
+        stem = self.safe_stem(identity)
         rectangles = tuple(np.asarray(rectangle, dtype=float) for rectangle in rectangles)
         class_ids = tuple(int(class_id) for class_id in class_ids)
         if len(rectangles) != len(class_ids):
@@ -273,6 +287,7 @@ class AnnotationIO:
                     "source_path": str(source_path) if source_path is not None else None,
                     "shape": list(image.shape),
                     "dtype": str(image.dtype),
+                    "conversion": conversion_metadata,
                     "box_count": len(boxes),
                     "class_counts": {
                         str(class_id): sum(box.class_id == class_id for box in boxes)

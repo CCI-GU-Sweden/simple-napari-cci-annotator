@@ -11,10 +11,12 @@ The plugin is currently being rebuilt in milestones. This milestone intentionall
 
 1. Open the plugin in napari.
 2. Click **New Project** and select an empty folder, or click **Open Project** to reopen an initialized project.
-3. Open/select an image layer in napari.
-4. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
-5. Edit the boxes and click **Add Annotation**, **Import Annotation**, or **Update Annotation**.
-6. Use **Validate Project** to check image/label pairing and label contents.
+3. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
+4. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
+5. Select and preview the normalization used to create the RGB `uint8` training image.
+6. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
+7. Edit the boxes and click **Save/Import/Update Converted Image + BBoxes**.
+8. Use **Validate Project** to check image/label pairing and label contents.
 
 Automatic label discovery checks, in order:
 
@@ -43,7 +45,16 @@ annotations/images/field_001.png
 annotations/labels/field_001.txt
 ```
 
-Saving an existing stem overwrites its canonical image/label pair. Each successful create or update is recorded in `audit.jsonl`, including checksums and box/class counts. Empty label files are valid reviewed-negative annotations.
+Saving an existing stem overwrites its canonical image/label pair. Each successful create or update is recorded in `audit.jsonl`, including checksums, conversion metadata, selected Z/T indices, and box/class counts. Empty label files are valid reviewed-negative annotations.
+
+For multidimensional sources, each selected non-channel plane has a stable sample ID. For example, `field.ome.tif` at `T=1, Z=2` becomes:
+
+```text
+annotations/images/field.ome__t001__z002.tif
+annotations/labels/field.ome__t001__z002.txt
+```
+
+This prevents different Z/T planes from overwriting one another while keeping every training image and label stem identical.
 
 ## YOLO bbox format
 
@@ -62,8 +73,23 @@ classes:
 
 Class IDs and names are kept as napari Shapes properties so the storage layer is ready for multi-class support.
 
-## Image support in this milestone
+## Image conversion
 
-Annotation saving currently accepts 2D grayscale or 1-, 3-, or 4-channel arrays that Pillow can encode as PNG/TIFF/JPEG/WebP/BMP. The plugin does not silently normalize or select channels yet. Project-wide channel selection and normalization are the next dedicated image-processing milestone.
+The plugin extracts the currently displayed Z/T plane using napari's current dimension positions. Spatial axes are inferred from axis metadata (`Y` and `X`) and otherwise default to the last two non-channel axes. The channel axis remains user-selectable so unusual TIFF layouts can be handled explicitly.
+
+Each output component—red, green, and blue—can use any source channel or be left empty. Available normalization methods are:
+
+- Min/max
+- Simple max (`0..plane maximum`)
+- Percentile, with configurable lower/upper percentiles
+- Z-score, with configurable lower/upper Z values
+- Fixed input range
+- Integer data-type range
+
+Normalization is currently calculated independently for each selected channel of each 2D plane. The converted output is always RGB `uint8` with the same Y/X dimensions as the source plane, so bbox coordinates do not change.
+
+Channel mapping and normalization become immutable project settings after the first converted image/bbox pair is saved. Create a new project to use a different conversion. The audit log records both the configured method and the effective per-channel values used for every image.
+
+The widget warns about unsaved bbox edits before reloading labels, changing source image/Z/T context, or closing. Choosing Save uses the cached pixels and plane identity from the annotation being edited, avoiding accidental reassignment to a newly selected plane.
 
 See [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) for the complete roadmap.
