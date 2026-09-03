@@ -1,121 +1,69 @@
-
-[![License MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/blob/main/LICENSE)
+[![License MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Python 3.10–3.12](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](https://python.org)
-[![tests](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/workflows/tests/badge.svg)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/actions)
 
-# Simple napari annotator
+# Simple napari CCI annotator
 
-Minimal napari plugin for YOLO bbox detection + quick correction + retraining.
+A project-based napari plugin for reviewing and storing YOLO bounding-box annotations.
 
-No dataset browser, no extra workflow logic. User provides the image in napari.
+The plugin is currently being rebuilt in milestones. This milestone intentionally focuses on project and annotation management. Model loading, prediction, tiling, and retraining will return in later milestones.
 
-## UI flow
+## Current workflow
 
-1. Path to model (`.pt`) or model folder
-2. `Load model`
-3. `Predict`
-4. Optional destination folder for retrained model (browse or type)
-5. Edit boxes in napari shapes layer (`yolo_bboxes`)
-6. `Add correction`
-7. `Retrain`
+1. Open the plugin in napari.
+2. Click **New Project** and select an empty folder, or click **Open Project** to reopen an initialized project.
+3. Open/select an image layer in napari.
+4. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
+5. Edit the boxes and click **Add Annotation**, **Import Annotation**, or **Update Annotation**.
+6. Use **Validate Project** to check image/label pairing and label contents.
 
-![UI](assets/Plugin_UI.png)
+Automatic label discovery checks, in order:
 
-## Starting from scratch
+1. `<project>/annotations/labels/<image_stem>.txt`
+2. A `.txt` file beside the source image
+3. If the source image is in an `images/` folder, the matching file in its sibling `labels/` folder
 
-The model input supports either:
+## Project structure
 
-- A `.pt` model file, or
-- A folder path.
+Selecting an empty folder with **New Project** initializes:
 
-Folder behavior on `Load model`:
+```text
+project/
+├── project.yaml
+├── models/
+└── annotations/
+    ├── images/
+    ├── labels/
+    └── audit.jsonl
+```
 
-- If the folder already contains one or more `.pt` files, the first one is loaded.
-- If the folder contains no `.pt` file, the plugin copies the bundled `yolov8n.pt` into that folder and loads it.
-- Empty model input is invalid and will show an error.
+Images and labels are stored with the same stem:
 
-If you do not have a model yet, start from a pretrained YOLOv8 nano checkpoint and use it as your initial file:
+```text
+annotations/images/field_001.png
+annotations/labels/field_001.txt
+```
 
-- Direct download: <https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt>
-- Model overview: <https://docs.ultralytics.com/models/yolov8/>
+Saving an existing stem overwrites its canonical image/label pair. Each successful create or update is recorded in `audit.jsonl`, including checksums and box/class counts. Empty label files are valid reviewed-negative annotations.
 
-After downloading, select that `yolov8n.pt` file in the Model field and continue with the correction/retrain loop.
+## YOLO bbox format
 
-![Loading a model](assets/Loading_model.png)
+Each non-empty line must contain:
 
-## Assumptions
+```text
+<class_id> <x_center> <y_center> <width> <height>
+```
 
-- Input image is already RGB 8-bit (or compatible with clipping/conversion).
-- Single class (`0: LABEL`) for now.
-- Exactly one image layer should be present when using `Add correction`.
+Coordinates must be finite, normalized to `[0, 1]`, have positive width/height, and describe a box contained by the image. The project currently initializes with one class:
 
-![Predicting label](assets/Predicting_label.png)
+```yaml
+classes:
+  0: LABEL
+```
 
-## Folder behavior
+Class IDs and names are kept as napari Shapes properties so the storage layer is ready for multi-class support.
 
-Given a model path like:
+## Image support in this milestone
 
-`.../my_model/best.pt`
+Annotation saving currently accepts 2D grayscale or 1-, 3-, or 4-channel arrays that Pillow can encode as PNG/TIFF/JPEG/WebP/BMP. The plugin does not silently normalize or select channels yet. Project-wide channel selection and normalization are the next dedicated image-processing milestone.
 
-The plugin uses `.../my_model` as root.
-
-### Add correction
-
-Each click saves:
-
-- Image to `my_model/corrections/<image_name>_<timestamp>.png`
-- Labels to `my_model/corrections/<image_name>_<timestamp>.txt`
-- Training config to `my_model/corrections/training_config.json` (created/updated)
-
-Image layer behavior:
-
-- If no image layer exists, `Add correction` shows an error.
-- If more than one image layer exists, `Add correction` shows an error.
-- If exactly one image layer exists, that image layer is used for saving correction image data.
-
-`training_config.json` defaults:
-
-- `image_size`: prefilled from the current image size using `max(height, width)`
-- `batch`: `8`
-- `epochs`: `100`
-- `patience`: `30`
-
-You can edit this file before clicking `Retrain`.
-
-Label format is YOLO detection:
-
-`class x_center y_center width height`
-
-normalized to `[0, 1]`.
-
-### Retrain
-
-Each click creates:
-
-- `<retrain_root>/dataset/`
-  - `images/train`, `images/val`
-  - `labels/train`, `labels/val`
-  - `dataset.yaml`
-- Trains YOLO from those corrections
-- Copies best model to:
-  - `<retrain_root>/best.pt`
-- Deletes training traces folder after extracting `best.pt`
-
-`<retrain_root>` resolution:
-
-- If destination field is set, retraining outputs there.
-- Otherwise it defaults to `my_model/retrained_<timestamp>`.
-
-So the retrained folder keeps a clean dataset + final model, without run artifacts.
-
-Warning: Data labeled will be equally divided between traning and validation (50%).
-
-## Roadmap
-
-- Napari image -> RGB translation -> v0.1.0
-- Better train/test split -> maybe use something similar to sklearn.model_selection? -> v0.1.5
-- Multiple classes (by color identification) -> v1
-    - in case of multiple classes, generate the color -> class -> name translation
-    - in both direction, training and prediction
-- Extend from object detection to also include instance segmentation -> v1.5
-- Add support for other 'classical' model such as StarDist -> v2
+See [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) for the complete roadmap.
