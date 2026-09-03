@@ -12,3 +12,4 @@ src/simple_napari_cci_annotator.egg-info/entry_points.txt
 src/simple_napari_cci_annotator.egg-info/requires.txt
 src/simple_napari_cci_annotator.egg-info/top_level.txt
 src/simple_napari_cci_annotator/models/yolov8n.pt
+tests/test_plugin.py
