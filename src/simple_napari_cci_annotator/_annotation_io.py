@@ -138,6 +138,7 @@ class AnnotationIO:
             ),
             "confidence": np.full(len(boxes), np.nan, dtype=float),
             "source": np.full(len(boxes), "import", dtype=object),
+            "tile_id": np.full(len(boxes), -1, dtype=int),
         }
         return LoadedAnnotations(
             label_path=Path(label_path),

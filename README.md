@@ -3,9 +3,9 @@
 
 # Simple napari CCI annotator
 
-A project-based napari plugin for reviewing and storing YOLO bounding-box annotations.
+A project-based napari plugin for tiled YOLO bounding-box prediction, review, and annotation storage.
 
-The plugin is currently being rebuilt in milestones. This milestone intentionally focuses on project and annotation management. Model loading, prediction, tiling, and retraining will return in later milestones.
+The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, and large-image detection inference are available. Dataset splitting and retraining remain later milestones.
 
 ## Current workflow
 
@@ -15,8 +15,10 @@ The plugin is currently being rebuilt in milestones. This milestone intentionall
 4. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
 5. Select and preview the normalization used to create the RGB `uint8` training image.
 6. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
-7. Edit the boxes and click **Save/Import/Update Converted Image + BBoxes**.
-8. Use **Validate Project** to check image/label pairing and label contents.
+7. To run inference, choose a YOLO detection model and set device, confidence, model IoU, tile size/overlap, merge IoU, and maximum detections per tile.
+8. Click **Predict Current RGB Plane**. Prediction runs outside the UI thread and can be cancelled between tiles.
+9. Correct the merged boxes and click **Save Prediction + Corrections** (or use the normal Save/Import/Update button without predicting).
+10. Use **Validate Project** to check image/label pairing and label contents.
 
 Automatic label discovery checks, in order:
 
@@ -72,6 +74,14 @@ classes:
 ```
 
 Class IDs and names are kept as napari Shapes properties so the storage layer is ready for multi-class support.
+
+## Large-image prediction and merging
+
+Inference always uses the same converted RGB `uint8` pixels shown by **Preview RGB Conversion** and stored for training. Images are covered by deterministic square tiles (1024 pixels and 20% overlap by default). Images smaller than a tile are reflection-padded for inference; detections centered in padding are discarded.
+
+Tile-local detections are clipped to valid pixels and translated directly into full-image coordinates. Overlap ownership regions identify which tile should represent a seam object, then a separate class-aware global NMS removes duplicates. **Model IoU** controls suppression inside each YOLO tile; **Merge IoU** controls suppression across tiles. Different classes never suppress one another.
+
+The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project.
 
 ## Image conversion
 

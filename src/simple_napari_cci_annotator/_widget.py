@@ -12,7 +12,9 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -25,15 +27,14 @@ from ._image_adapter import (
     ImageConversionError,
     ImageProcessingSettings,
 )
+from ._inference_worker import InferenceWorker
 from ._project_store import ProjectError, ProjectStore
+from ._tiled_inference import Detection, InferenceError, InferenceSettings
+from ._yolo_inference import YoloDetectionModel, available_devices
 
 
 class SimpleCciAnnotatorQWidget(QWidget):
-    """Project-based YOLO bbox annotation UI.
-
-    This milestone intentionally contains no model loading, inference, or
-    retraining controls. It initializes projects and loads/saves bbox labels.
-    """
+    """Project-based YOLO bbox annotation and tiled inference UI."""
 
     ANNOTATION_LAYER_NAME = "yolo_bboxes"
 
@@ -52,6 +53,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._locked_processing_settings: ImageProcessingSettings | None = None
         self._updating_processing_controls = False
         self._last_normalization_method: str | None = None
+        self._model: YoloDetectionModel | None = None
+        self._inference_worker: InferenceWorker | None = None
+        self._inference_sample_id: str | None = None
+        self._inference_converted: ConvertedImage | None = None
 
         self._project_path_label = QLabel("No project selected")
         self._project_path_label.setWordWrap(True)
@@ -135,6 +140,41 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._validate_project_button = QPushButton("Validate Project")
         self._validate_project_button.clicked.connect(self._on_validate_project)
 
+        self._model_path_label = QLabel("No detection model loaded")
+        self._model_path_label.setWordWrap(True)
+        self._model_status_label = QLabel("Model: unavailable")
+        self._model_status_label.setWordWrap(True)
+        self._choose_model_button = QPushButton("Choose Detection Model")
+        self._choose_model_button.clicked.connect(self._on_choose_model)
+
+        self._device_combo = QComboBox()
+        for label, value in available_devices():
+            self._device_combo.addItem(label, value)
+        self._confidence_spin = self._fraction_spin(0.25)
+        self._model_iou_spin = self._fraction_spin(0.45)
+        self._merge_iou_spin = self._fraction_spin(0.50)
+        self._tile_size_spin = QSpinBox()
+        self._tile_size_spin.setRange(64, 8192)
+        self._tile_size_spin.setSingleStep(64)
+        self._tile_size_spin.setValue(1024)
+        self._overlap_percent_spin = QDoubleSpinBox()
+        self._overlap_percent_spin.setRange(0.0, 90.0)
+        self._overlap_percent_spin.setDecimals(1)
+        self._overlap_percent_spin.setSuffix(" %")
+        self._overlap_percent_spin.setValue(20.0)
+        self._max_detections_spin = QSpinBox()
+        self._max_detections_spin.setRange(1, 100_000)
+        self._max_detections_spin.setValue(300)
+        self._predict_button = QPushButton("Predict Current RGB Plane")
+        self._predict_button.clicked.connect(self._on_predict)
+        self._cancel_inference_button = QPushButton("Cancel")
+        self._cancel_inference_button.clicked.connect(self._on_cancel_inference)
+        self._inference_progress = QProgressBar()
+        self._inference_progress.setRange(0, 1)
+        self._inference_progress.setValue(0)
+        self._inference_status_label = QLabel("Inference: idle")
+        self._inference_status_label.setWordWrap(True)
+
         project_group = QGroupBox("Project")
         project_buttons = QHBoxLayout()
         project_buttons.addWidget(self._new_project_button)
@@ -168,15 +208,47 @@ class SimpleCciAnnotatorQWidget(QWidget):
         annotation_layout.addWidget(self._validate_project_button)
         annotation_group.setLayout(annotation_layout)
 
+        inference_group = QGroupBox("Large-image tiled prediction")
+        inference_form = QFormLayout()
+        inference_form.addRow("Device", self._device_combo)
+        inference_form.addRow("Confidence", self._confidence_spin)
+        inference_form.addRow("Model IoU", self._model_iou_spin)
+        inference_form.addRow("Tile size", self._tile_size_spin)
+        inference_form.addRow("Tile overlap", self._overlap_percent_spin)
+        inference_form.addRow("Merge IoU", self._merge_iou_spin)
+        inference_form.addRow("Max detections/tile", self._max_detections_spin)
+        inference_buttons = QHBoxLayout()
+        inference_buttons.addWidget(self._predict_button)
+        inference_buttons.addWidget(self._cancel_inference_button)
+        inference_layout = QVBoxLayout()
+        inference_layout.addWidget(self._model_path_label)
+        inference_layout.addWidget(self._model_status_label)
+        inference_layout.addWidget(self._choose_model_button)
+        inference_layout.addLayout(inference_form)
+        inference_layout.addLayout(inference_buttons)
+        inference_layout.addWidget(self._inference_progress)
+        inference_layout.addWidget(self._inference_status_label)
+        inference_group.setLayout(inference_layout)
+
         layout = QVBoxLayout()
         layout.addWidget(project_group)
         layout.addWidget(annotation_group)
+        layout.addWidget(inference_group)
         layout.addStretch(1)
         self.setLayout(layout)
 
         self._connect_viewer_events()
         self._on_normalization_changed()
         self._update_action_state()
+
+    @staticmethod
+    def _fraction_spin(value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.05)
+        spin.setValue(value)
+        return spin
 
     def _connect_viewer_events(self) -> None:
         try:
@@ -246,6 +318,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._annotation_image_layer = None
         self._project = project
         self._annotation_io = AnnotationIO(project)
+        self._model = None
+        self._model_path_label.setText("No detection model loaded")
+        self._model_status_label.setText("Model: unavailable")
         self._project_path_label.setText(str(project.paths.root))
         class_summary = ", ".join(
             f"{class_id}: {name}"
@@ -433,6 +508,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "class_name": np.asarray([], dtype=object),
             "confidence": np.asarray([], dtype=float),
             "source": np.asarray([], dtype=object),
+            "tile_id": np.asarray([], dtype=int),
         }
 
     def _set_default_current_properties(self, shapes_layer) -> None:
@@ -447,6 +523,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 ),
                 "confidence": np.asarray([np.nan]),
                 "source": np.asarray(["manual"], dtype=object),
+                "tile_id": np.asarray([-1], dtype=int),
             }
         except (AttributeError, KeyError, ValueError):
             pass
@@ -519,6 +596,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "plane_indices": converted.plane.non_spatial_indices,
                 "axis_labels": list(converted.plane.axis_labels),
                 "normalization_stats": list(converted.normalization_stats),
+                "prediction": getattr(shapes_layer, "metadata", {}).get(
+                    "cci_prediction"
+                ),
             },
         )
         self._project.lock_image_processing(converted.settings.to_mapping())
@@ -586,6 +666,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return True
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        if self._inference_worker is not None and self._inference_worker.isRunning():
+            self._inference_worker.request_cancel()
+            self._inference_status_label.setText(
+                "Inference: cancelling after the current tile. Close again when it stops."
+            )
+            event.ignore()
+            return
         if not self._annotation_dirty:
             event.accept()
             return
@@ -831,7 +918,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         self._converted_image = None
         image_layer = self._image_for_annotation()
-        if self._is_source_image_layer(image_layer):
+        if self._annotation_io is not None and self._is_source_image_layer(
+            image_layer
+        ):
             self._update_plane_status(image_layer)
             if self._annotation_dirty:
                 try:
@@ -962,6 +1051,226 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         return None
 
+    def _on_choose_model(self) -> None:
+        if self._project is None:
+            self._show_error("Create or open a project first.")
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a YOLO detection model",
+            str(self._project.paths.models),
+            "YOLO models (*.pt *.onnx *.engine);;All files (*)",
+        )
+        if not selected:
+            return
+        try:
+            model = YoloDetectionModel(selected)
+            project_ids = set(self._project.config.classes)
+            model_ids = set(model.names)
+            if model_ids and model_ids != project_ids:
+                raise InferenceError(
+                    "Model class IDs do not match the project. "
+                    f"Project IDs: {sorted(project_ids)}; model IDs: {sorted(model_ids)}."
+                )
+        except InferenceError as exc:
+            self._show_error(str(exc))
+            return
+        self._model = model
+        self._model_path_label.setText(str(model.path))
+        names = ", ".join(
+            f"{class_id}: {name}" for class_id, name in sorted(model.names.items())
+        )
+        project_names = self._project.config.classes
+        names_differ = bool(model.names) and any(
+            model.names.get(class_id) != name
+            for class_id, name in project_names.items()
+        )
+        suffix = " · names mapped to project names" if names_differ else ""
+        self._model_status_label.setText(
+            f"Model: loaded · task {model.task} · classes [{names or 'unknown'}]{suffix}"
+        )
+        self._update_action_state()
+
+    def _inference_settings(self) -> InferenceSettings:
+        tile_size = self._tile_size_spin.value()
+        overlap = round(tile_size * self._overlap_percent_spin.value() / 100.0)
+        return InferenceSettings(
+            tile_size=tile_size,
+            overlap=min(overlap, tile_size - 1),
+            confidence=self._confidence_spin.value(),
+            model_iou=self._model_iou_spin.value(),
+            merge_iou=self._merge_iou_spin.value(),
+            max_detections=self._max_detections_spin.value(),
+            device=self._device_combo.currentData(),
+        )
+
+    def _on_predict(self) -> None:
+        if self._project is None or self._model is None:
+            self._show_error("Open a project and choose a detection model first.")
+            return
+        if self._inference_worker is not None and self._inference_worker.isRunning():
+            return
+        image_layer = self._image_for_annotation()
+        if not self._is_source_image_layer(image_layer):
+            self._show_error("Select a source image layer first.")
+            return
+        if not self._resolve_unsaved_changes():
+            return
+        existing = self._annotation_layer()
+        if existing is not None and len(getattr(existing, "data", ())) > 0:
+            response = QMessageBox.warning(
+                self,
+                "Replace bounding boxes",
+                "Prediction will replace the current bbox layer. Continue?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response != QMessageBox.Yes:
+                return
+        try:
+            converted = self._convert_current_image(image_layer)
+            settings = self._inference_settings()
+            settings.validate()
+        except (ImageConversionError, InferenceError) as exc:
+            self._show_error(f"Could not start inference:\n{exc}")
+            return
+
+        worker = InferenceWorker(self._model, converted.data, settings)
+        worker.progress.connect(self._on_inference_progress)
+        worker.succeeded.connect(self._on_inference_succeeded)
+        worker.failed.connect(self._on_inference_failed)
+        worker.cancelled.connect(self._on_inference_cancelled)
+        worker.finished.connect(self._on_inference_thread_finished)
+        self._inference_worker = worker
+        self._inference_sample_id = converted.sample_id
+        self._inference_converted = converted
+        self._inference_progress.setRange(0, 1)
+        self._inference_progress.setValue(0)
+        self._inference_status_label.setText("Inference: preparing tiles")
+        self._update_action_state()
+        worker.start()
+
+    def _on_cancel_inference(self) -> None:
+        worker = self._inference_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.request_cancel()
+        self._inference_status_label.setText(
+            "Inference: cancellation requested; waiting for the current tile"
+        )
+        self._cancel_inference_button.setEnabled(False)
+
+    def _on_inference_progress(self, current: int, total: int, text: str) -> None:
+        self._inference_progress.setRange(0, max(1, total))
+        self._inference_progress.setValue(current)
+        self._inference_status_label.setText(f"Inference: {text}")
+
+    def _on_inference_succeeded(self, detections: object) -> None:
+        result = tuple(detections)
+        image_layer = self._annotation_image_layer
+        if image_layer is None or self._inference_sample_id is None:
+            self._inference_status_label.setText(
+                "Inference: result discarded because the source image was closed"
+            )
+            return
+        try:
+            live_sample = self._image_stem(image_layer)
+        except (AttributeError, ImageConversionError):
+            live_sample = None
+        if live_sample != self._inference_sample_id:
+            self._inference_status_label.setText(
+                "Inference: result discarded because the active Z/T plane changed"
+            )
+            return
+        assert self._project is not None
+        unknown = sorted(
+            {item.class_id for item in result} - set(self._project.config.classes)
+        )
+        if unknown:
+            self._show_error(
+                f"The model returned class IDs not defined by the project: {unknown}."
+            )
+            return
+
+        existing = self._annotation_layer()
+        if existing is not None:
+            self.napari_viewer.layers.remove(existing)
+        typed_result: tuple[Detection, ...] = result
+        rectangles = [item.as_napari_rectangle() for item in typed_result]
+        properties = {
+            "class_id": np.asarray(
+                [item.class_id for item in typed_result], dtype=int
+            ),
+            "class_name": np.asarray(
+                [
+                    self._project.config.classes[item.class_id]
+                    for item in typed_result
+                ],
+                dtype=object,
+            ),
+            "confidence": np.asarray(
+                [item.confidence for item in typed_result], dtype=float
+            ),
+            "source": np.full(len(typed_result), "prediction", dtype=object),
+            "tile_id": np.asarray(
+                [item.tile_id for item in typed_result], dtype=int
+            ),
+        }
+        shapes = self.napari_viewer.add_shapes(
+            rectangles,
+            name=self.ANNOTATION_LAYER_NAME,
+            shape_type="rectangle",
+            properties=properties,
+            edge_width=2,
+            edge_color="yellow",
+            face_color="transparent",
+        )
+        settings = self._inference_settings()
+        shapes.metadata["cci_image_stem"] = self._inference_sample_id
+        shapes.metadata["cci_project_root"] = str(self._project.paths.root)
+        shapes.metadata["cci_label_path"] = None
+        shapes.metadata["cci_prediction"] = {
+            "model_path": str(self._model.path) if self._model else None,
+            "tile_size": settings.tile_size,
+            "tile_overlap": settings.overlap,
+            "confidence": settings.confidence,
+            "model_iou": settings.model_iou,
+            "merge_iou": settings.merge_iou,
+            "device": str(settings.device),
+        }
+        self._set_default_current_properties(shapes)
+        try:
+            shapes.events.data.connect(self._on_shapes_data_changed)
+        except (AttributeError, TypeError):
+            pass
+        self._converted_image = self._inference_converted
+        self._current_sample_id = self._inference_sample_id
+        self._annotation_dirty = True
+        self._label_status_label.setText(
+            f"Labels: {len(typed_result)} merged prediction(s), not yet saved."
+        )
+        self._save_annotation_button.setText("Save Prediction + Corrections")
+        total = self._inference_progress.maximum()
+        self._inference_progress.setValue(total)
+        self._inference_status_label.setText(
+            f"Inference: complete · {len(typed_result)} merged detection(s)"
+        )
+
+    def _on_inference_failed(self, message: str) -> None:
+        self._inference_status_label.setText("Inference: failed")
+        self._show_error(f"Inference failed:\n{message}")
+
+    def _on_inference_cancelled(self) -> None:
+        self._inference_status_label.setText("Inference: cancelled")
+
+    def _on_inference_thread_finished(self) -> None:
+        worker = self._inference_worker
+        if worker is not None:
+            worker.deleteLater()
+        self._inference_worker = None
+        self._inference_converted = None
+        self._update_action_state()
+
     def _on_validate_project(self) -> None:
         if self._annotation_io is None:
             self._show_error("Create or open a project first.")
@@ -986,14 +1295,36 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._image_for_annotation()
         has_image = self._is_image_layer(image_layer)
         has_shapes = self._annotation_layer() is not None
-        self._reload_labels_button.setEnabled(has_project and has_image)
+        running = (
+            self._inference_worker is not None
+            and self._inference_worker.isRunning()
+        )
+        self._new_project_button.setEnabled(not running)
+        self._open_project_button.setEnabled(not running)
+        self._reload_labels_button.setEnabled(has_project and has_image and not running)
         self._save_annotation_button.setEnabled(
-            has_project and has_image and has_shapes
+            has_project and has_image and has_shapes and not running
         )
         self._validate_project_button.setEnabled(has_project)
-        self._preview_button.setEnabled(has_project and has_image)
+        self._preview_button.setEnabled(has_project and has_image and not running)
+        self._choose_model_button.setEnabled(has_project and not running)
+        self._predict_button.setEnabled(
+            has_project and has_image and self._model is not None and not running
+        )
+        self._cancel_inference_button.setEnabled(running)
+        for control in (
+            self._device_combo,
+            self._confidence_spin,
+            self._model_iou_spin,
+            self._merge_iou_spin,
+            self._tile_size_spin,
+            self._overlap_percent_spin,
+            self._max_detections_spin,
+        ):
+            control.setEnabled(not running)
         self._set_processing_controls_enabled(
             has_project
             and has_image
             and self._locked_processing_settings is None
+            and not running
         )

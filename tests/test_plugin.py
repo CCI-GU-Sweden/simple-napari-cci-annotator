@@ -1,4 +1,4 @@
-"""Tests for project initialization and annotation-only workflows."""
+"""Tests for project annotation and tiled inference workflows."""
 
 from __future__ import annotations
 
@@ -11,10 +11,14 @@ import pytest
 
 from simple_napari_cci_annotator import (
     AnnotationIO,
+    Detection,
     ImageAdapter,
     ImageProcessingSettings,
+    InferenceSettings,
     ProjectStore,
     SimpleCciAnnotatorQWidget,
+    TiledInferenceEngine,
+    create_tile_plan,
 )
 from simple_napari_cci_annotator import _widget as widget_module
 from simple_napari_cci_annotator._annotation_io import LabelValidationError
@@ -27,12 +31,20 @@ from simple_napari_cci_annotator._project_store import (
     InvalidProjectError,
     ProjectConflictError,
 )
+from simple_napari_cci_annotator._tiled_inference import (
+    InferenceCancelled,
+    RawDetection,
+    box_iou,
+    class_aware_nms,
+    extract_padded_tile,
+)
+from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 
 
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.2.0"
+    assert simple_napari_cci_annotator.__version__ == "0.3.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -341,6 +353,125 @@ def test_project_validation_finds_pairs_and_missing_labels(annotation_io):
     assert any("Missing label" in error for error in report.errors)
 
 
+def test_tile_plan_covers_edges_and_assigns_unique_ownership():
+    plan = create_tile_plan(1800, 2500, tile_size=1024, overlap=200)
+
+    assert plan.tiles[0].y0 == 0
+    assert plan.tiles[0].x0 == 0
+    assert max(tile.y1 for tile in plan.tiles) == 1800
+    assert max(tile.x1 for tile in plan.tiles) == 2500
+    assert len({(tile.row, tile.column) for tile in plan.tiles}) == len(plan.tiles)
+    for y, x in ((0, 0), (900, 1000), (1799, 2499)):
+        owners = [tile for tile in plan.tiles if tile.owns(x, y)]
+        assert len(owners) == 1
+
+
+def test_small_image_tile_is_reflect_padded_without_changing_source():
+    image = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
+    plan = create_tile_plan(5, 7, tile_size=16, overlap=4)
+
+    padded = extract_padded_tile(image, plan.tiles[0], 16)
+
+    assert padded.shape == (16, 16, 3)
+    np.testing.assert_array_equal(padded[:5, :7], image)
+
+
+def test_detection_centered_in_padding_is_discarded():
+    class PaddingPredictor:
+        def predict_tile(self, image, settings):
+            return (
+                RawDetection(1, 1, 5, 5, 0.8, 0),
+                RawDetection(10, 10, 15, 15, 0.9, 0),
+            )
+
+    result = TiledInferenceEngine(PaddingPredictor()).predict(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=0),
+    )
+
+    assert len(result) == 1
+    np.testing.assert_allclose(
+        [result[0].x1, result[0].y1, result[0].x2, result[0].y2],
+        [1, 1, 5, 5],
+    )
+
+
+def _detection(x1, y1, x2, y2, score, class_id=0, tile_id=0, owned=True):
+    return Detection(x1, y1, x2, y2, score, class_id, tile_id, owned)
+
+
+def test_merge_is_class_aware_and_prefers_owner_before_confidence():
+    owner = _detection(10, 10, 30, 30, 0.70, tile_id=1, owned=True)
+    seam_duplicate = _detection(11, 11, 31, 31, 0.95, tile_id=0, owned=False)
+    other_class = _detection(11, 11, 31, 31, 0.90, class_id=1, tile_id=0)
+
+    merged = class_aware_nms((seam_duplicate, owner, other_class), 0.5)
+
+    assert owner in merged
+    assert seam_duplicate not in merged
+    assert other_class in merged
+    assert box_iou(owner, seam_duplicate) > 0.5
+
+
+class _FakePredictor:
+    def __init__(self):
+        self.calls = 0
+
+    def predict_tile(self, image, settings):
+        self.calls += 1
+        # The same global object appears in the horizontal overlap of two tiles.
+        if self.calls == 1:
+            return (RawDetection(75, 20, 95, 40, 0.8, 0),)
+        return (RawDetection(15, 20, 35, 40, 0.9, 0),)
+
+
+def test_tiled_engine_maps_and_merges_overlap_predictions():
+    predictor = _FakePredictor()
+    settings = InferenceSettings(
+        tile_size=100, overlap=40, merge_iou=0.5, device="cpu"
+    )
+
+    detections = TiledInferenceEngine(predictor).predict(
+        np.zeros((80, 160, 3), dtype=np.uint8), settings
+    )
+
+    assert predictor.calls == 2
+    assert len(detections) == 1
+    assert detections[0].owned
+    np.testing.assert_allclose(
+        [detections[0].x1, detections[0].y1, detections[0].x2, detections[0].y2],
+        [75, 20, 95, 40],
+    )
+
+
+def test_tiled_engine_cancels_between_tiles():
+    settings = InferenceSettings(tile_size=100, overlap=40)
+    checks = iter((False, True))
+
+    with pytest.raises(InferenceCancelled):
+        TiledInferenceEngine(_FakePredictor()).predict(
+            np.zeros((80, 160, 3), dtype=np.uint8),
+            settings,
+            cancelled=lambda: next(checks),
+        )
+
+
+def test_yolo_adapter_preserves_rgb_semantics_for_numpy_sources():
+    class FakeUltralyticsModel:
+        def predict(self, **kwargs):
+            self.source = kwargs["source"]
+            return []
+
+    adapter = YoloDetectionModel.__new__(YoloDetectionModel)
+    adapter.model = FakeUltralyticsModel()
+    rgb = np.asarray([[[10, 20, 30]]], dtype=np.uint8)
+
+    assert adapter.predict_tile(rgb, InferenceSettings(tile_size=64)) == ()
+    np.testing.assert_array_equal(
+        adapter.model.source, np.asarray([[[30, 20, 10]]], dtype=np.uint8)
+    )
+
+
 class _Signal:
     def connect(self, callback):
         self.callback = callback
@@ -389,13 +520,15 @@ class _Viewer:
         return layer
 
 
-def test_widget_starts_without_model_controls(qtbot):
+def test_widget_starts_with_disabled_model_controls(qtbot):
     widget = SimpleCciAnnotatorQWidget(_Viewer())
     qtbot.addWidget(widget)
 
     assert widget._project is None
     assert widget._new_project_button.text() == "New Project"
-    assert not hasattr(widget, "_model_path_input")
+    assert widget._model is None
+    assert not widget._choose_model_button.isEnabled()
+    assert not widget._predict_button.isEnabled()
     assert not widget._save_annotation_button.isEnabled()
 
 

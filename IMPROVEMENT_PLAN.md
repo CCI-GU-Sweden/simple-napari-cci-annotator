@@ -444,6 +444,8 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 ### Phase 2 — Prediction controls and responsive inference
 
+**Status: completed as a prerequisite of tiled inference in `0.3.0`.**
+
 - Add confidence, model IoU, image size, maximum detections, and device controls.
 - Reuse the project's locked image conversion for inference so prediction sees the same pixels as training.
 - Move inference off the UI thread; add progress, cancellation, and error reporting.
@@ -453,12 +455,14 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 ### Phase 3 — Large-image tiling and merge
 
+**Status: core workflow completed in `0.3.0`.** The initial backend is the planned direct iterator. Dask benchmarking, lazy-array optimization, and tile-grid visualization remain optional follow-up work rather than correctness requirements for the first tiled release.
+
 - Implement/test deterministic tile planning, padding metadata, and source-coordinate transforms.
-- Preserve compatibility with the segmentation repository's overlapped-core convention and port its tile-grid visualization.
+- Preserve compatibility with the segmentation repository's overlapped-core convention; consider porting its tile-grid visualization after the core workflow is validated with real datasets.
 - Add overlap and ownership regions.
 - Implement class-aware cross-tile NMS with a separate merge IoU control.
 - Add tile progress and seam-focused visual/test fixtures.
-- Benchmark a direct/batched iterator against an optional Dask local backend on representative large NumPy, Dask, and lazy napari images; record runtime and peak memory before selecting a default.
+- Benchmark the direct iterator against an optional Dask local backend on representative large NumPy, Dask, and lazy napari images before adding a second backend.
 
 **Exit criteria:** images larger than 1024 are fully covered, boxes appear in correct global positions, padding creates no detections, and duplicates at seams are consistently resolved.
 
