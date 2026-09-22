@@ -490,6 +490,24 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 **Exit criteria:** multi-class detection works without changing storage or training architecture, and users can compare successive retrain runs.
 
+### Phase 6 — Movable fixed-size bbox failure crops
+
+**Status: completed in `0.6.0`.**
+
+- Separate arbitrary-size inference sources from canonical training samples.
+- Add a movable, fixed 1024×1024 or 512×512 napari crop-selection rectangle centered on the current view.
+- Snap accidental selection resizing back to the project size and clamp its movable origin to source pixels.
+- Extract the locked RGB conversion without resizing and use constant value 114 only where the source image needs bottom/right padding.
+- Translate class/confidence/source-aware bbox properties into local crop coordinates.
+- Reuse the 90% retained-area and `min(10 px, 10%)` per-axis clipping tolerance; block saving when a crop severely truncates a source box.
+- Reject boxes drawn into synthetic padding.
+- Save deterministic same-stem image/YOLO pairs using source sample ID plus crop origin and size, so saving the same crop updates it.
+- Record crop bounds, valid extent, padding, source path, Z/T plane, normalization, model, and inference settings in the audit event.
+- Lock `training_patch.size` and padding policy after the first canonical save, drive retraining size from that contract, and reject mismatched images during project/dataset validation.
+- Keep crops from the same audited source in one train/validation group.
+
+**Exit criteria:** a user can infer an arbitrary-size image, move a fixed crop over a failure, correct local boxes, save an exact-size YOLO pair, repeat at other locations, retrain, and restart the loop without coordinate drift or source leakage.
+
 ### Later — Segmentation adapter
 
 - Migrate from the personal segmentation repository at the pinned baseline rather than reimplementing from memory.

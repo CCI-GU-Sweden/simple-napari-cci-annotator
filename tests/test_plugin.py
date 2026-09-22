@@ -27,7 +27,10 @@ from simple_napari_cci_annotator import (
 )
 from simple_napari_cci_annotator import _widget as widget_module
 from simple_napari_cci_annotator import _training as training_module
-from simple_napari_cci_annotator._annotation_io import LabelValidationError
+from simple_napari_cci_annotator._annotation_io import (
+    AnnotationError,
+    LabelValidationError,
+)
 from simple_napari_cci_annotator._image_adapter import (
     ImageConversionError,
     normalize_to_uint8,
@@ -37,6 +40,16 @@ from simple_napari_cci_annotator._project_store import (
     ImageProcessingLockedError,
     InvalidProjectError,
     ProjectConflictError,
+    TrainingPatchLockedError,
+)
+from simple_napari_cci_annotator._training_crop import (
+    TrainingCropError,
+    crop_bounds_from_center,
+    crop_bounds_from_rectangle,
+    crop_rectangles,
+    crop_sample_id,
+    extract_padded_crop,
+    validate_boxes_within_valid_crop,
 )
 from simple_napari_cci_annotator._tiled_inference import (
     InferenceCancelled,
@@ -52,7 +65,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.5.0"
+    assert simple_napari_cci_annotator.__version__ == "0.6.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -73,6 +86,11 @@ def test_initialize_and_reopen_project(tmp_path):
     assert project.config.image_processing == {
         "channels": "unset",
         "normalization": "unset",
+        "locked": False,
+    }
+    assert project.config.training_patch == {
+        "size": 1024,
+        "padding_value": 114,
         "locked": False,
     }
 
@@ -347,6 +365,117 @@ def test_project_image_processing_settings_lock(tmp_path):
     )
     with pytest.raises(ImageProcessingLockedError):
         reopened.lock_image_processing(changed.to_mapping())
+
+
+def test_project_training_patch_contract_locks(tmp_path):
+    root = tmp_path / "patch-project"
+    project = ProjectStore.initialize(root)
+
+    project.lock_training_patch(512, padding_value=114)
+    reopened = ProjectStore.load(root)
+
+    assert reopened.config.training_patch == {
+        "size": 512,
+        "padding_value": 114,
+        "locked": True,
+    }
+    reopened.lock_training_patch(512, padding_value=114)
+    with pytest.raises(TrainingPatchLockedError):
+        reopened.lock_training_patch(1024, padding_value=114)
+
+    annotation_io = AnnotationIO(reopened)
+    with pytest.raises(AnnotationError, match="must be 512×512"):
+        annotation_io.save_pair(
+            image_data=np.zeros((256, 512, 3), dtype=np.uint8),
+            image_name="wrong-size",
+            rectangles=(),
+            class_ids=(),
+        )
+
+
+def test_training_crop_is_fixed_size_padded_and_coordinate_stable():
+    image = np.zeros((300, 900, 3), dtype=np.uint8)
+    image[:, :, 0] = 7
+    bounds = crop_bounds_from_center(150, 700, 512, 300, 900)
+
+    assert (bounds.y0, bounds.x0) == (0, 388)
+    assert (bounds.valid_height, bounds.valid_width) == (300, 512)
+    crop = extract_padded_crop(image, bounds, padding_value=114)
+    assert crop.shape == (512, 512, 3)
+    assert np.all(crop[:300, :, 0] == 7)
+    assert np.all(crop[300:, :, :] == 114)
+
+    rectangle = np.asarray(
+        [[100, 500], [100, 600], [200, 600], [200, 500]], dtype=float
+    )
+    result = crop_rectangles(
+        (rectangle,),
+        {"class_id": np.asarray([1]), "source": np.asarray(["prediction"])},
+        bounds,
+    )
+    np.testing.assert_allclose(
+        result.rectangles[0],
+        np.asarray([[100, 112], [100, 212], [200, 212], [200, 112]]),
+    )
+    assert result.properties["class_id"].tolist() == [1]
+    assert crop_sample_id("field__z002", bounds).endswith(
+        "__crop_y000000_x000388_s512"
+    )
+
+
+def test_training_crop_resnaps_and_blocks_boxes_in_padding_or_badly_cut():
+    bounds = crop_bounds_from_rectangle(
+        np.asarray([[10, 10], [10, 300], [200, 300], [200, 10]]),
+        512,
+        300,
+        900,
+    )
+    assert bounds.as_rectangle()[2].tolist() == [512.0, 512.0]
+    crossing = np.asarray(
+        [[100, 490], [100, 540], [160, 540], [160, 490]], dtype=float
+    )
+    result = crop_rectangles(
+        (crossing,), {"class_id": np.asarray([0])}, bounds
+    )
+    assert result.rejected_indices == (0,)
+
+    in_padding = np.asarray(
+        [[280, 10], [280, 20], [320, 20], [320, 10]], dtype=float
+    )
+    with pytest.raises(TrainingCropError, match="padded pixels"):
+        validate_boxes_within_valid_crop((in_padding,), bounds)
+
+
+def test_project_and_dataset_validation_reject_bbox_in_crop_padding(tmp_path):
+    root = tmp_path / "padding-project"
+    project = ProjectStore.initialize(root)
+    annotation_io = AnnotationIO(project)
+    saved = annotation_io.save_pair(
+        image_data=np.full((512, 512, 3), 114, dtype=np.uint8),
+        image_name="crop",
+        sample_id="crop",
+        rectangles=(),
+        class_ids=(),
+        conversion_metadata={
+            "training_crop": {
+                "size": 512,
+                "valid_height": 300,
+                "valid_width": 512,
+            }
+        },
+    )
+    project.lock_training_patch(512)
+    saved.label_path.write_text("0 0.5 0.8 0.1 0.1\n", encoding="utf-8")
+
+    report = annotation_io.validate_project()
+    preview = DatasetBuilder(project).preview(
+        DatasetBuildSettings(tile_size=512, overlap=100),
+        train_only=True,
+        persist=False,
+    )
+
+    assert any("padding" in error for error in report.errors)
+    assert any("padding" in error for error in preview.errors)
 
 
 def test_invalid_percentile_settings_are_rejected():
@@ -756,7 +885,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.5.0" in text
+    assert "plugin_version: 0.6.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
 
@@ -795,26 +924,29 @@ class _Signal:
 
 
 class _Image:
-    def __init__(self, data, name="sample", path=None):
+    def __init__(self, data, name="sample", path=None, metadata=None, **kwargs):
         self.data = data
         self.name = name
-        self.metadata = {}
+        self.metadata = metadata or {}
         self.source = SimpleNamespace(path=str(path) if path else None)
         self.rgb = data.ndim == 3 and data.shape[-1] in {3, 4}
         self.axis_labels = ()
+        self.visible = True
 
 
 class _Shapes:
-    def __init__(self, data, name, properties, **kwargs):
+    def __init__(self, data, name, properties=None, **kwargs):
         self.data = data
         self.name = name
-        self.properties = properties
+        self.properties = properties or {}
         self.metadata = {}
         self.current_properties = {}
         self.current_edge_color = None
         self.edge_color = kwargs.get("edge_color")
         self.selected_data = set()
         self.events = SimpleNamespace(data=_Signal())
+        self.visible = True
+        self.mode = "select"
 
 
 class _Layers(list):
@@ -835,8 +967,13 @@ class _Viewer:
             events=SimpleNamespace(current_step=_Signal()),
         )
 
-    def add_shapes(self, data, *, name, properties, **kwargs):
+    def add_shapes(self, data, *, name, properties=None, **kwargs):
         layer = _Shapes(data, name, properties, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_image(self, data, *, name, metadata=None, **kwargs):
+        layer = _Image(data, name=name, metadata=metadata, **kwargs)
         self.layers.append(layer)
         return layer
 
@@ -942,3 +1079,51 @@ def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot)
     assert np.isnan(shapes.properties["confidence"][0])
     assert "1 Debris: 1" in widget._class_counts_label.text()
     assert widget._annotation_dirty
+
+
+def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
+    root = tmp_path / "project"
+    root.mkdir()
+    source_path = tmp_path / "field.png"
+    source_path.touch()
+    project = ProjectStore.initialize(root)
+    viewer = _Viewer()
+    source = _Image(
+        np.zeros((600, 800, 3), dtype=np.uint8), path=source_path
+    )
+    viewer.layers.append(source)
+    viewer.layers.selection.active = source
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    assert not widget._save_annotation_button.isEnabled()
+    source_boxes = widget._annotation_layer()
+    source_boxes.data = [
+        np.asarray([[100, 200], [100, 300], [200, 300], [200, 200]])
+    ]
+    source_boxes.properties = {
+        "class_id": np.asarray([0]),
+        "class_name": np.asarray(["LABEL"], dtype=object),
+        "confidence": np.asarray([0.8]),
+        "source": np.asarray(["prediction"], dtype=object),
+        "tile_id": np.asarray([1]),
+    }
+    widget._patch_size_combo.setCurrentIndex(
+        widget._patch_size_combo.findData(512)
+    )
+
+    widget._on_select_training_crop()
+    widget._on_create_training_crop()
+
+    crop_image = widget._get_layer_by_name(widget.CROP_IMAGE_LAYER_NAME)
+    crop_boxes = widget._crop_bbox_layer()
+    assert crop_image.data.shape == (512, 512, 3)
+    assert len(crop_boxes.data) == 1
+    assert widget._save_training_crop(show_message=False)
+    assert project.config.training_patch == {
+        "size": 512,
+        "padding_value": 114,
+        "locked": True,
+    }
+    assert len(list(project.paths.images.iterdir())) == 1
+    assert len(list(project.paths.labels.iterdir())) == 1

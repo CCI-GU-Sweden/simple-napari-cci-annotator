@@ -5,7 +5,7 @@
 
 A project-based napari plugin for tiled YOLO bounding-box prediction, review, and annotation storage.
 
-The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, multi-class annotation, large-image detection inference, reproducible dataset building, and YOLO retraining are available.
+The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, multi-class annotation, large-image detection inference, movable failure crops, reproducible dataset building, and YOLO retraining are available.
 
 ## Current workflow
 
@@ -19,10 +19,12 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 8. Choose **Current class** before drawing a box. To reclassify boxes, select them and click **Apply Class to Selected**.
 9. To run inference, choose a YOLO detection model and set device, confidence, model IoU, tile size/overlap, merge IoU, and maximum detections per tile.
 10. Click **Predict Current RGB Plane**. Prediction runs outside the UI thread and can be cancelled between tiles.
-11. Correct the merged boxes and click **Save Prediction + Corrections** (or use the normal Save/Import/Update button without predicting).
-12. Use **Validate Project** to check image/label pairing and label contents.
-13. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
-14. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
+11. In **Movable training crop**, choose 1024 or 512 and click **Select Training Crop**. Move the cyan square over a failure location.
+12. Click **Create / Refresh Crop**, correct its local bbox layer, then click **Add Crop + Corrections**.
+13. Click **Return to Source**, move the selection to another failure, and repeat. The full-size inference image is not added to the training pool.
+14. Use **Validate Project** to check image/label pairing, fixed image dimensions, and label contents.
+15. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
+16. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
 
 Automatic label discovery checks, in order:
 
@@ -52,6 +54,8 @@ annotations/labels/field_001.txt
 ```
 
 Saving an existing stem overwrites its canonical image/label pair. Each successful create or update is recorded in `audit.jsonl`, including checksums, conversion metadata, selected Z/T indices, and box/class counts. Empty label files are valid reviewed-negative annotations.
+
+Canonical training images have one project-wide size: 1024×1024 by default, or 512×512. The choice locks after the first training sample is saved. Arbitrary-size files remain valid inference sources, but cannot be saved directly into the canonical training pool; use a training crop instead. Images smaller than the chosen patch are padded without resizing.
 
 For multidimensional sources, each selected non-channel plane has a stable sample ID. For example, `field.ome.tif` at `T=1, Z=2` becomes:
 
@@ -89,9 +93,33 @@ Tile-local detections are clipped to valid pixels and translated directly into f
 
 The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project; model names may differ because the project names are authoritative in the annotation UI.
 
+## Movable fixed-size training crops
+
+The crop workflow turns a local inference failure into one immediately retrainable sample:
+
+1. **Select Training Crop** creates a cyan square centered on the current view. The square can be moved freely. If it is resized, **Create / Refresh Crop** snaps it back to the configured project size around its new center.
+2. **Create / Refresh Crop** extracts the already-previewed RGB conversion, translates intersecting source boxes into crop coordinates, and opens `training_crop_rgb` plus `training_crop_bboxes` layers.
+3. Correct the local boxes, including their classes, and click **Add Crop + Corrections**. The image and YOLO label are stored with one deterministic stem such as `field__t000__z002__crop_y001024_x002048_s1024`. Saving the same source location again updates that pair instead of creating a duplicate.
+4. **Return to Source** restores the inference image and its boxes. The crop selection remains available to move to the next failure location.
+
+No crop is resized. When the source runs out at its bottom or right edge, missing pixels are filled with RGB value `114`; the audit record stores the source bounds, valid extent, and padding. Boxes are forbidden in padded pixels.
+
+Fully contained boxes are copied directly. Artificial crop clipping is accepted only when at least 90% of the bbox remains and neither axis loses more than `min(10 px, 10% of that bbox dimension)`. A more severely cut source box blocks saving so the user can move the crop. Boxes entirely outside the crop are ignored.
+
+The project stores this immutable contract in `project.yaml`:
+
+```yaml
+training_patch:
+  size: 1024
+  padding_value: 114
+  locked: true
+```
+
+The normal **Save Converted Image + BBoxes** action remains available when the entire converted source is already exactly the configured size. Otherwise it directs the user to the crop workflow.
+
 ## Dataset building and retraining
 
-Retraining uses the complete canonical annotation pool. Source images are assigned to a deterministic 80/20 train/validation split before tiling, and existing assignments remain stable as new annotations are added. Z/T samples derived from the same audited source path stay in the same split. An optional audit metadata field can provide a patient, well, acquisition, or other higher-level grouping key.
+Retraining uses the complete fixed-size canonical annotation pool. Source groups are assigned to a deterministic 80/20 train/validation split, and existing assignments remain stable as new crops are added. Crops and Z/T samples derived from the same audited source path stay in the same split. An optional audit metadata field can provide a patient, well, acquisition, or other higher-level grouping key.
 
 ### Adding audit grouping metadata
 
@@ -110,7 +138,7 @@ Metadata records are merged per sample in append order. A later metadata record 
 
 The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base and the currently loaded compatible model as the fine-tuned option. This choice affects only the new run; successful training never silently replaces the prediction model.
 
-Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Large source images use deterministic overlapped tiles. Each bbox is assigned once, preferably to a tile containing it completely. Clipping is accepted only when at least 90% of its area remains and neither axis loses more than `min(10 pixels, 10%)`. Tiles containing a rejected, unlabeled object are excluded rather than treated as background. Reviewed-negative/background tiles are sampled with the visible negative-tile ratio.
+Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Each canonical image already matches the locked project patch size, so it becomes one training item without resizing or further spatial subdivision. The dataset validator rejects mismatched dimensions. Reviewed-negative crops remain first-class empty-label samples.
 
 Each run contains:
 

@@ -30,6 +30,10 @@ class ImageProcessingLockedError(ProjectError):
     """Raised when code attempts to change locked image-processing settings."""
 
 
+class TrainingPatchLockedError(ProjectError):
+    """Raised when code attempts to change a locked training patch contract."""
+
+
 class ClassMapError(ProjectError):
     """Raised when a class-map edit would invalidate saved annotations."""
 
@@ -66,6 +70,7 @@ class ProjectConfig:
     created_at: str
     classes: dict[int, str]
     image_processing: dict[str, Any]
+    training_patch: dict[str, Any]
     dataset_split: dict[str, Any]
 
     @classmethod
@@ -84,6 +89,10 @@ class ProjectConfig:
         created_at = value.get("created_at")
         raw_classes = value.get("classes")
         image_processing = value.get("image_processing")
+        training_patch = value.get(
+            "training_patch",
+            {"size": 1024, "padding_value": 114, "locked": False},
+        )
         dataset_split = value.get(
             "dataset_split",
             {
@@ -119,6 +128,7 @@ class ProjectConfig:
             raise InvalidProjectError("image_processing must be a mapping.")
         if not isinstance(image_processing.get("locked"), bool):
             raise InvalidProjectError("image_processing.locked must be true or false.")
+        training_patch = _validate_training_patch(training_patch)
         dataset_split = _validate_dataset_split(dataset_split)
 
         return cls(
@@ -127,6 +137,7 @@ class ProjectConfig:
             created_at=created_at,
             classes=classes,
             image_processing=dict(image_processing),
+            training_patch=training_patch,
             dataset_split=dataset_split,
         )
 
@@ -137,6 +148,7 @@ class ProjectConfig:
             "created_at": self.created_at,
             "classes": dict(sorted(self.classes.items())),
             "image_processing": self.image_processing,
+            "training_patch": self.training_patch,
             "dataset_split": self.dataset_split,
         }
 
@@ -184,6 +196,11 @@ class ProjectStore:
             image_processing={
                 "channels": "unset",
                 "normalization": "unset",
+                "locked": False,
+            },
+            training_patch={
+                "size": 1024,
+                "padding_value": 114,
                 "locked": False,
             },
             dataset_split={
@@ -274,6 +291,7 @@ class ProjectStore:
             created_at=self.config.created_at,
             classes=dict(self.config.classes),
             image_processing=requested,
+            training_patch=dict(self.config.training_patch),
             dataset_split=dict(self.config.dataset_split),
         )
         self.update_config(updated)
@@ -298,6 +316,7 @@ class ProjectStore:
             created_at=self.config.created_at,
             classes=dict(self.config.classes),
             image_processing=dict(self.config.image_processing),
+            training_patch=dict(self.config.training_patch),
             dataset_split=dataset_split,
         )
         self.update_config(updated)
@@ -321,6 +340,29 @@ class ProjectStore:
             created_at=self.config.created_at,
             classes=normalized,
             image_processing=dict(self.config.image_processing),
+            training_patch=dict(self.config.training_patch),
+            dataset_split=dict(self.config.dataset_split),
+        )
+        self.update_config(updated)
+
+    def lock_training_patch(self, size: int, *, padding_value: int = 114) -> None:
+        """Persist the fixed-size contract used by canonical training images."""
+        requested = _validate_training_patch(
+            {"size": size, "padding_value": padding_value, "locked": True}
+        )
+        if self.config.training_patch.get("locked"):
+            if self.config.training_patch != requested:
+                raise TrainingPatchLockedError(
+                    "Training patch size and padding are locked for this project."
+                )
+            return
+        updated = ProjectConfig(
+            schema_version=self.config.schema_version,
+            name=self.config.name,
+            created_at=self.config.created_at,
+            classes=dict(self.config.classes),
+            image_processing=dict(self.config.image_processing),
+            training_patch=requested,
             dataset_split=dict(self.config.dataset_split),
         )
         self.update_config(updated)
@@ -348,6 +390,35 @@ def _validate_class_map(classes: dict[int, str]) -> None:
     folded = [name.casefold() for name in names]
     if len(folded) != len(set(folded)):
         raise InvalidProjectError("Class names must be unique.")
+
+
+def _validate_training_patch(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InvalidProjectError("training_patch must be a mapping.")
+    size = value.get("size", 1024)
+    padding_value = value.get("padding_value", 114)
+    locked = value.get("locked", False)
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size not in {512, 1024}
+    ):
+        raise InvalidProjectError("training_patch.size must be 512 or 1024.")
+    if (
+        isinstance(padding_value, bool)
+        or not isinstance(padding_value, int)
+        or not 0 <= padding_value <= 255
+    ):
+        raise InvalidProjectError(
+            "training_patch.padding_value must be an integer within 0..255."
+        )
+    if not isinstance(locked, bool):
+        raise InvalidProjectError("training_patch.locked must be true or false.")
+    return {
+        "size": size,
+        "padding_value": padding_value,
+        "locked": locked,
+    }
 
 
 def _used_label_class_ids(labels_path: Path) -> set[int]:

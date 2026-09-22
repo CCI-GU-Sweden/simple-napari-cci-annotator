@@ -225,6 +225,14 @@ class AnnotationIO:
     ) -> SaveResult:
         image = np.asarray(image_data)
         height, width = _validate_image_shape(image.shape)
+        patch_contract = self.project.config.training_patch
+        if patch_contract.get("locked"):
+            patch_size = int(patch_contract["size"])
+            if (height, width) != (patch_size, patch_size):
+                raise AnnotationError(
+                    f"Canonical training images must be {patch_size}×{patch_size}; "
+                    f"received {height}×{width}."
+                )
         identity = (
             sample_id
             if sample_id is not None
@@ -333,19 +341,40 @@ class AnnotationIO:
                 errors.append(f"Missing image for label '{label.name}'.")
 
         box_count = 0
+        crop_extents = self._crop_valid_extents()
         for label in labels:
             try:
                 boxes = self.parse_yolo_text(
                     label.read_text(encoding="utf-8"), source=str(label)
                 )
                 box_count += len(boxes)
+                crop_extent = crop_extents.get(label.stem)
+                if crop_extent is not None:
+                    size, valid_height, valid_width = crop_extent
+                    for index, box in enumerate(boxes, start=1):
+                        x2 = (box.x_center + box.width / 2.0) * size
+                        y2 = (box.y_center + box.height / 2.0) * size
+                        if x2 > valid_width + 1e-6 or y2 > valid_height + 1e-6:
+                            errors.append(
+                                f"{label}, box {index}: bbox extends into "
+                                "synthetic training-crop padding."
+                            )
             except (OSError, LabelValidationError) as exc:
                 errors.extend(str(exc).splitlines())
 
         for image in images:
             try:
                 with Image.open(image) as image_file:
+                    width, height = image_file.size
                     image_file.verify()
+                patch_contract = self.project.config.training_patch
+                if patch_contract.get("locked"):
+                    patch_size = int(patch_contract["size"])
+                    if (width, height) != (patch_size, patch_size):
+                        errors.append(
+                            f"Image '{image.name}' is {width}×{height}; project "
+                            f"training images must be {patch_size}×{patch_size}."
+                        )
             except (OSError, ValueError) as exc:
                 errors.append(f"Unreadable image '{image.name}': {exc}")
 
@@ -357,6 +386,27 @@ class AnnotationIO:
             box_count=box_count,
             errors=tuple(errors),
         )
+
+    def _crop_valid_extents(self) -> dict[str, tuple[int, int, int]]:
+        extents: dict[str, tuple[int, int, int]] = {}
+        try:
+            lines = self.project.paths.audit.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return extents
+        for raw_line in lines:
+            try:
+                event = json.loads(raw_line)
+                sample_id = event.get("sample_id")
+                crop = event.get("conversion", {}).get("training_crop")
+                if not isinstance(sample_id, str) or not isinstance(crop, dict):
+                    continue
+                size = int(crop["size"])
+                valid_height = int(crop["valid_height"])
+                valid_width = int(crop["valid_width"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            extents[sample_id] = (size, valid_height, valid_width)
+        return extents
 
     def _rectangle_to_box(
         self,

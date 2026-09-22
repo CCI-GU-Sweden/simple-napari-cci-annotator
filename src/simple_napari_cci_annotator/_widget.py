@@ -44,6 +44,16 @@ from ._inference_worker import InferenceWorker
 from ._project_store import ProjectError, ProjectStore
 from ._tiled_inference import Detection, InferenceError, InferenceSettings
 from ._training import TrainingError, TrainingRun, TrainingSettings
+from ._training_crop import (
+    CropBounds,
+    TrainingCropError,
+    crop_bounds_from_center,
+    crop_bounds_from_rectangle,
+    crop_rectangles,
+    crop_sample_id,
+    extract_padded_crop,
+    validate_boxes_within_valid_crop,
+)
 from ._training_worker import TrainingWorker
 from ._yolo_inference import YoloDetectionModel, available_devices
 
@@ -88,6 +98,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
     """Project-based YOLO bbox annotation and tiled inference UI."""
 
     ANNOTATION_LAYER_NAME = "yolo_bboxes"
+    CROP_SELECTION_LAYER_NAME = "training_crop_selection"
+    CROP_IMAGE_LAYER_NAME = "training_crop_rgb"
+    CROP_BBOX_LAYER_NAME = "training_crop_bboxes"
 
     def __init__(self, napari_viewer):
         super().__init__()
@@ -104,6 +117,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._locked_processing_settings: ImageProcessingSettings | None = None
         self._updating_processing_controls = False
         self._updating_class_controls = False
+        self._updating_patch_controls = False
         self._last_normalization_method: str | None = None
         self._model: YoloDetectionModel | None = None
         self._inference_worker: InferenceWorker | None = None
@@ -112,6 +126,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._training_worker: TrainingWorker | None = None
         self._training_preview: DatasetPreview | None = None
         self._last_training_run: TrainingRun | None = None
+        self._crop_bounds: CropBounds | None = None
+        self._crop_source_image_layer = None
+        self._crop_source_shapes_layer = None
+        self._crop_source_converted: ConvertedImage | None = None
+        self._crop_source_visibility: list[tuple[object, bool]] = []
+        self._crop_dirty = False
+        self._crop_rejected_count = 0
         self._base_model_path = Path(__file__).resolve().parents[2] / "yolo26n.pt"
 
         self._project_path_label = QLabel("No project selected")
@@ -247,6 +268,29 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._inference_progress.setValue(0)
         self._inference_status_label = QLabel("Inference: idle")
         self._inference_status_label.setWordWrap(True)
+
+        self._patch_size_combo = QComboBox()
+        self._patch_size_combo.addItem("1024 × 1024", 1024)
+        self._patch_size_combo.addItem("512 × 512", 512)
+        self._patch_size_combo.currentIndexChanged.connect(
+            self._on_patch_size_changed
+        )
+        self._patch_contract_label = QLabel(
+            "Training patch size is not locked until the first crop is saved."
+        )
+        self._patch_contract_label.setWordWrap(True)
+        self._select_crop_button = QPushButton("Select Training Crop")
+        self._select_crop_button.clicked.connect(self._on_select_training_crop)
+        self._create_crop_button = QPushButton("Create / Refresh Crop")
+        self._create_crop_button.clicked.connect(self._on_create_training_crop)
+        self._save_crop_button = QPushButton("Add Crop + Corrections")
+        self._save_crop_button.clicked.connect(self._on_save_training_crop)
+        self._return_crop_button = QPushButton("Return to Source")
+        self._return_crop_button.clicked.connect(self._on_return_to_source)
+        self._crop_status_label = QLabel(
+            "Crop: run inference, then place a crop over a failure location."
+        )
+        self._crop_status_label.setWordWrap(True)
 
         self._training_model_combo = QComboBox()
         self._destination_input = QLineEdit()
@@ -392,6 +436,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
             expanded=False,
         )
 
+        crop_form = QFormLayout()
+        crop_form.addRow("Training patch", self._patch_size_combo)
+        crop_buttons = QHBoxLayout()
+        crop_buttons.addWidget(self._select_crop_button)
+        crop_buttons.addWidget(self._create_crop_button)
+        crop_save_buttons = QHBoxLayout()
+        crop_save_buttons.addWidget(self._save_crop_button)
+        crop_save_buttons.addWidget(self._return_crop_button)
+        crop_layout = QVBoxLayout()
+        crop_layout.addLayout(crop_form)
+        crop_layout.addWidget(self._patch_contract_label)
+        crop_layout.addLayout(crop_buttons)
+        crop_layout.addLayout(crop_save_buttons)
+        crop_layout.addWidget(self._crop_status_label)
+        self._crop_section = CollapsibleSection(
+            "Movable training crop",
+            crop_layout,
+            expanded=True,
+        )
+
         retrain_form = QFormLayout()
         retrain_form.addRow("Starting model", self._training_model_combo)
         destination_row = QHBoxLayout()
@@ -401,7 +465,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         retrain_form.addRow("Group metadata", self._group_field_input)
         retrain_form.addRow("Validation fraction", self._validation_fraction_spin)
         retrain_form.addRow("Split seed", self._seed_spin)
-        retrain_form.addRow("Training tile size", self._training_tile_size_spin)
+        retrain_form.addRow(
+            "Training patch size (project)", self._training_tile_size_spin
+        )
         retrain_form.addRow("Tile overlap", self._training_overlap_spin)
         retrain_form.addRow("Negative tile ratio", self._negative_ratio_spin)
         retrain_form.addRow("Epochs", self._epochs_spin)
@@ -435,6 +501,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         content_layout.addWidget(self._project_section)
         content_layout.addWidget(self._annotation_section)
         content_layout.addWidget(self._inference_section)
+        content_layout.addWidget(self._crop_section)
         content_layout.addWidget(self._retrain_section)
         content_layout.addStretch(1)
         content = QWidget()
@@ -533,9 +600,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             f"{class_id}: {name}"
             for class_id, name in sorted(self._project.config.classes.items())
         )
+        patch = self._project.config.training_patch
+        patch_status = "locked" if patch.get("locked") else "not locked"
         self._project_status_label.setText(
             f"Project loaded · schema {self._project.config.schema_version} · "
-            f"classes [{class_summary}]"
+            f"classes [{class_summary}] · training patch {patch['size']} "
+            f"({patch_status})"
         )
 
     def _on_edit_classes(self) -> None:
@@ -599,6 +669,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_action_state()
 
     def _set_project(self, project: ProjectStore) -> None:
+        self._close_crop_session(remove_selection=True, restore_sources=True)
         previous_annotation = self._annotation_layer()
         if previous_annotation is not None:
             self.napari_viewer.layers.remove(previous_annotation)
@@ -618,6 +689,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_project_status()
         self._update_class_counts()
         self._apply_project_processing_settings()
+        self._apply_project_patch_settings()
         self._update_action_state()
         active = self._active_layer()
         if self._is_source_image_layer(active):
@@ -641,6 +713,15 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _on_active_layer_changed(self, event=None) -> None:
         active = self._active_layer()
         if self._is_source_image_layer(active):
+            if (
+                self._crop_bounds is not None
+                and active is not self._crop_source_image_layer
+            ):
+                if not self._resolve_crop_unsaved_changes():
+                    return
+                self._close_crop_session(
+                    remove_selection=True, restore_sources=True
+                )
             self._configure_image_controls(active)
             self._load_annotations_for_image(active)
         self._update_action_state()
@@ -649,6 +730,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._annotation_image_layer
         if image_layer is None or self._annotation_io is None:
             return
+        if self._crop_bounds is not None:
+            if not self._resolve_crop_unsaved_changes():
+                return
+            self._close_crop_session(
+                remove_selection=True, restore_sources=True
+            )
         self._load_annotations_for_image(image_layer)
 
     def _on_layers_changed(self, event=None) -> None:
@@ -672,8 +759,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     @classmethod
     def _is_source_image_layer(cls, layer) -> bool:
+        metadata = getattr(layer, "metadata", {}) or {}
         return cls._is_image_layer(layer) and not bool(
-            (getattr(layer, "metadata", {}) or {}).get("cci_rgb_preview")
+            metadata.get("cci_rgb_preview")
+            or metadata.get("cci_training_crop")
         )
 
     def _image_stem(self, image_layer) -> str:
@@ -838,7 +927,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         del index
         if self._updating_class_controls:
             return
-        shapes = self._annotation_layer()
+        shapes = self._editable_bbox_layer()
         if shapes is not None:
             self._set_default_current_properties(shapes)
 
@@ -862,7 +951,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if self._project is None:
             self._class_counts_label.setText("Class counts: unavailable")
             return
-        shapes_layer = shapes_layer or self._annotation_layer()
+        shapes_layer = shapes_layer or self._editable_bbox_layer()
         class_ids: tuple[int, ...] = ()
         if shapes_layer is not None:
             try:
@@ -885,7 +974,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._class_counts_label.setText(f"Class counts: {summary}")
 
     def _on_apply_class_to_selected(self) -> None:
-        shapes = self._annotation_layer()
+        shapes = self._editable_bbox_layer()
         class_id = self._current_class_id()
         if shapes is None or self._project is None or class_id is None:
             self._show_error("Open a project and bbox layer first.")
@@ -929,12 +1018,19 @@ class SimpleCciAnnotatorQWidget(QWidget):
         shapes.properties = properties
         self._apply_class_colors(shapes)
         self._set_default_current_properties(shapes)
-        self._annotation_dirty = True
         self._update_class_counts(shapes)
-        self._label_status_label.setText(
-            f"Labels: assigned class {class_id} to {len(selected)} selected box(es); "
-            "changes are not saved."
-        )
+        if shapes is self._crop_bbox_layer():
+            self._crop_dirty = True
+            self._crop_status_label.setText(
+                f"Crop: assigned class {class_id} to {len(selected)} selected "
+                "box(es); changes are not saved."
+            )
+        else:
+            self._annotation_dirty = True
+            self._label_status_label.setText(
+                f"Labels: assigned class {class_id} to "
+                f"{len(selected)} selected box(es); changes are not saved."
+            )
 
     @staticmethod
     def _property_values(
@@ -977,6 +1073,17 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         return None
 
+    def _crop_bbox_layer(self):
+        layer = self._get_layer_by_name(self.CROP_BBOX_LAYER_NAME)
+        return layer if self._is_shapes_layer(layer) else None
+
+    def _editable_bbox_layer(self):
+        if self._crop_bounds is not None:
+            crop_layer = self._crop_bbox_layer()
+            if crop_layer is not None:
+                return crop_layer
+        return self._annotation_layer()
+
     def _on_reload_labels(self) -> None:
         image_layer = self._image_for_annotation()
         if image_layer is None:
@@ -1017,6 +1124,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
     ):
         if self._annotation_io is None or self._project is None:
             raise AnnotationError("Create or open a project first.")
+        patch_size = self._training_patch_size()
+        if tuple(converted.data.shape[:2]) != (patch_size, patch_size):
+            raise AnnotationError(
+                f"Canonical training images must be {patch_size}×{patch_size}. "
+                "Use Select Training Crop for a larger or smaller source image."
+            )
         rectangles = tuple(
             np.asarray(shape, dtype=float) for shape in shapes_layer.data
         )
@@ -1039,6 +1152,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             },
         )
         self._project.lock_image_processing(converted.settings.to_mapping())
+        self._project.lock_training_patch(patch_size, padding_value=114)
         self._converted_image = converted
         self._current_sample_id = converted.sample_id
         self._annotation_dirty = False
@@ -1057,6 +1171,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 f"{result.label_path.name}"
             )
         self._apply_project_processing_settings()
+        self._apply_project_patch_settings()
+        self._update_project_status()
         return result
 
     def _on_shapes_data_changed(self, event=None) -> None:
@@ -1077,6 +1193,24 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _resolve_unsaved_changes(self) -> bool:
         if not self._annotation_dirty:
             return True
+        if (
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            != (self._training_patch_size(),) * 2
+        ):
+            response = QMessageBox.warning(
+                self,
+                "Discard full-size working boxes",
+                "The current source is not the fixed training size and cannot be "
+                "saved directly. Save useful failures as training crops first. "
+                "Discard the remaining full-size bbox edits?",
+                QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response == QMessageBox.Discard:
+                self._annotation_dirty = False
+                return True
+            return False
         response = QMessageBox.warning(
             self,
             "Unsaved bounding boxes",
@@ -1122,8 +1256,25 @@ class SimpleCciAnnotatorQWidget(QWidget):
             )
             event.ignore()
             return
+        if self._crop_bounds is not None:
+            if not self._resolve_crop_unsaved_changes():
+                event.ignore()
+                return
+            self._close_crop_session(
+                remove_selection=True, restore_sources=True
+            )
         if not self._annotation_dirty:
             event.accept()
+            return
+        if (
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            != (self._training_patch_size(),) * 2
+        ):
+            if self._resolve_unsaved_changes():
+                event.accept()
+            else:
+                event.ignore()
             return
         response = QMessageBox.warning(
             self,
@@ -1523,6 +1674,448 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         return None
 
+    def _training_patch_size(self) -> int:
+        value = self._patch_size_combo.currentData()
+        if value is not None:
+            return int(value)
+        if self._project is not None:
+            return int(self._project.config.training_patch["size"])
+        return 1024
+
+    def _apply_project_patch_settings(self) -> None:
+        if self._project is None:
+            return
+        contract = self._project.config.training_patch
+        size = int(contract["size"])
+        self._updating_patch_controls = True
+        try:
+            index = self._patch_size_combo.findData(size)
+            if index >= 0:
+                self._patch_size_combo.setCurrentIndex(index)
+            self._training_tile_size_spin.setValue(size)
+        finally:
+            self._updating_patch_controls = False
+        if contract.get("locked"):
+            self._patch_contract_label.setText(
+                f"Project contract: {size}×{size}, padding value "
+                f"{contract['padding_value']} · locked"
+            )
+        else:
+            self._patch_contract_label.setText(
+                f"Proposed contract: {size}×{size}, padding value "
+                f"{contract['padding_value']} · locks after first save"
+            )
+
+    def _on_patch_size_changed(self, index: int = -1) -> None:
+        del index
+        if self._updating_patch_controls:
+            return
+        size = self._training_patch_size()
+        self._training_tile_size_spin.setValue(size)
+        padding_value = (
+            self._project.config.training_patch["padding_value"]
+            if self._project is not None
+            else 114
+        )
+        self._patch_contract_label.setText(
+            f"Proposed contract: {size}×{size}, padding value "
+            f"{padding_value} · locks after first save"
+        )
+        selection = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+        if selection is not None and self._crop_bounds is None:
+            self.napari_viewer.layers.remove(selection)
+        self._crop_status_label.setText(
+            f"Crop: patch size changed to {size}×{size}; place a new selection."
+        )
+
+    def _on_select_training_crop(self) -> None:
+        if self._project is None:
+            self._show_error("Create or open a project first.")
+            return
+        if self._crop_bounds is not None:
+            if not self._resolve_crop_unsaved_changes():
+                return
+            self._close_crop_session(
+                remove_selection=False, restore_sources=True
+            )
+        image_layer = self._image_for_annotation()
+        if not self._is_source_image_layer(image_layer):
+            self._show_error("Select a source image layer first.")
+            return
+        try:
+            converted = self._convert_current_image(image_layer)
+        except ImageConversionError as exc:
+            self._show_error(f"Could not prepare training crop:\n{exc}")
+            return
+        height, width = converted.data.shape[:2]
+        center_y, center_x = self._current_view_center(
+            image_layer, height, width
+        )
+        bounds = crop_bounds_from_center(
+            center_y,
+            center_x,
+            self._training_patch_size(),
+            height,
+            width,
+        )
+        selection = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+        if selection is None:
+            selection = self.napari_viewer.add_shapes(
+                [bounds.as_rectangle()],
+                name=self.CROP_SELECTION_LAYER_NAME,
+                shape_type="rectangle",
+                edge_width=3,
+                edge_color="cyan",
+                face_color="transparent",
+            )
+        else:
+            selection.data = [bounds.as_rectangle()]
+        selection.metadata["source_sample_id"] = converted.sample_id
+        selection.metadata["source_image_layer_name"] = image_layer.name
+        selection.metadata["patch_size"] = bounds.size
+        try:
+            selection.mode = "select"
+        except AttributeError:
+            pass
+        self._crop_source_image_layer = image_layer
+        self._crop_source_converted = converted
+        self._crop_status_label.setText(
+            f"Crop selection: {bounds.size}×{bounds.size} at "
+            f"y={bounds.y0}, x={bounds.x0}. Move it, then click "
+            "Create / Refresh Crop."
+        )
+        self._update_action_state()
+
+    def _on_create_training_crop(self) -> None:
+        if self._project is None:
+            self._show_error("Create or open a project first.")
+            return
+        selection = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+        if selection is None or len(getattr(selection, "data", ())) != 1:
+            self._show_error("Create one training crop selection first.")
+            return
+        if self._crop_bounds is not None:
+            if not self._resolve_crop_unsaved_changes():
+                return
+            self._close_crop_session(
+                remove_selection=False, restore_sources=True
+            )
+        image_layer = self._crop_source_image_layer
+        if not self._is_source_image_layer(image_layer):
+            self._show_error("The crop source image is no longer available.")
+            return
+        try:
+            converted = self._convert_current_image(image_layer)
+            expected_sample = selection.metadata.get("source_sample_id")
+            if expected_sample and converted.sample_id != expected_sample:
+                raise TrainingCropError(
+                    "The displayed Z/T plane changed after crop selection. "
+                    "Select the crop again on the current plane."
+                )
+            height, width = converted.data.shape[:2]
+            bounds = crop_bounds_from_rectangle(
+                selection.data[0],
+                self._training_patch_size(),
+                height,
+                width,
+            )
+            selection.data = [bounds.as_rectangle()]
+            patch_config = self._project.config.training_patch
+            crop_image = extract_padded_crop(
+                converted.data,
+                bounds,
+                padding_value=int(patch_config["padding_value"]),
+            )
+            source_shapes = self._annotation_layer()
+            if source_shapes is None:
+                rectangles: tuple[np.ndarray, ...] = ()
+                properties = self._empty_properties()
+            else:
+                rectangles = tuple(
+                    np.asarray(value, dtype=float) for value in source_shapes.data
+                )
+                class_ids = self._class_ids(source_shapes, len(rectangles))
+                properties = dict(
+                    getattr(source_shapes, "properties", {}) or {}
+                )
+                properties["class_id"] = np.asarray(class_ids, dtype=int)
+                properties["class_name"] = np.asarray(
+                    [
+                        self._project.config.classes[class_id]
+                        for class_id in class_ids
+                    ],
+                    dtype=object,
+                )
+            cropped = crop_rectangles(rectangles, properties, bounds)
+        except (ImageConversionError, LabelValidationError, TrainingCropError) as exc:
+            self._show_error(f"Could not create training crop:\n{exc}")
+            return
+
+        crop_properties = self._complete_crop_properties(cropped.properties)
+        crop_image_layer = self.napari_viewer.add_image(
+            crop_image,
+            name=self.CROP_IMAGE_LAYER_NAME,
+            rgb=crop_image.ndim == 3,
+            metadata={
+                "cci_training_crop": True,
+                "source_sample_id": converted.sample_id,
+                "crop_bounds": bounds.to_mapping(),
+            },
+        )
+        crop_shapes = self.napari_viewer.add_shapes(
+            list(cropped.rectangles),
+            name=self.CROP_BBOX_LAYER_NAME,
+            shape_type="rectangle",
+            properties=crop_properties,
+            edge_width=2,
+            edge_color=[
+                class_color(value) for value in crop_properties["class_id"]
+            ]
+            if cropped.rectangles
+            else class_color(self._current_class_id() or 0),
+            face_color="transparent",
+        )
+        crop_shapes.metadata["source_sample_id"] = converted.sample_id
+        crop_shapes.metadata["crop_bounds"] = bounds.to_mapping()
+        self._set_default_current_properties(crop_shapes)
+        self._apply_class_colors(crop_shapes)
+        try:
+            crop_shapes.events.data.connect(self._on_crop_shapes_changed)
+        except (AttributeError, TypeError):
+            pass
+        self._crop_source_shapes_layer = self._annotation_layer()
+        self._crop_source_converted = converted
+        self._crop_bounds = bounds
+        self._crop_rejected_count = len(cropped.rejected_indices)
+        self._crop_dirty = True
+        self._crop_source_visibility = []
+        for layer in (image_layer, self._crop_source_shapes_layer, selection):
+            if layer is None:
+                continue
+            visible = bool(getattr(layer, "visible", True))
+            self._crop_source_visibility.append((layer, visible))
+            try:
+                layer.visible = False
+            except AttributeError:
+                pass
+        try:
+            self.napari_viewer.layers.selection.active = crop_shapes
+        except AttributeError:
+            pass
+        padding = (
+            f" · padding bottom {bounds.pad_bottom}, right {bounds.pad_right}"
+            if bounds.pad_bottom or bounds.pad_right
+            else ""
+        )
+        rejected = (
+            f" · {self._crop_rejected_count} severely cut box(es): saving blocked"
+            if self._crop_rejected_count
+            else ""
+        )
+        self._crop_status_label.setText(
+            f"Crop ready: {len(cropped.rectangles)} box(es), "
+            f"{cropped.clipped_count} safely clipped{padding}{rejected}."
+        )
+        self._update_class_counts(crop_shapes)
+        self._update_action_state()
+
+    def _complete_crop_properties(
+        self, properties: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        count = len(properties.get("class_id", ()))
+        class_ids = self._property_values(
+            properties,
+            "class_id",
+            count,
+            self._current_class_id() or 0,
+            int,
+        )
+        return {
+            "class_id": class_ids,
+            "class_name": np.asarray(
+                [self._project.config.classes[value] for value in class_ids],
+                dtype=object,
+            ),
+            "confidence": self._property_values(
+                properties, "confidence", count, np.nan, float
+            ),
+            "source": self._property_values(
+                properties, "source", count, "manual", object
+            ),
+            "tile_id": self._property_values(
+                properties, "tile_id", count, -1, int
+            ),
+        }
+
+    def _on_crop_shapes_changed(self, event=None) -> None:
+        del event
+        self._crop_dirty = True
+        self._update_class_counts(self._crop_bbox_layer())
+        self._crop_status_label.setText(
+            "Crop: unsaved bbox edits. Add the crop or return and discard it."
+        )
+
+    def _on_save_training_crop(self) -> None:
+        self._save_training_crop(show_message=True)
+
+    def _save_training_crop(self, *, show_message: bool) -> bool:
+        if (
+            self._project is None
+            or self._annotation_io is None
+            or self._crop_bounds is None
+            or self._crop_source_converted is None
+        ):
+            self._show_error("Create a training crop first.")
+            return False
+        if self._crop_rejected_count:
+            self._show_error(
+                f"This crop severely cuts {self._crop_rejected_count} source "
+                "box(es). Move the crop and refresh it before saving."
+            )
+            return False
+        crop_image_layer = self._get_layer_by_name(self.CROP_IMAGE_LAYER_NAME)
+        crop_shapes = self._crop_bbox_layer()
+        if crop_image_layer is None or crop_shapes is None:
+            self._show_error("The crop image and bbox layers are both required.")
+            return False
+        rectangles = tuple(
+            np.asarray(value, dtype=float) for value in crop_shapes.data
+        )
+        try:
+            validate_boxes_within_valid_crop(rectangles, self._crop_bounds)
+            class_ids = self._class_ids(crop_shapes, len(rectangles))
+            sample_id = crop_sample_id(
+                self._crop_source_converted.sample_id, self._crop_bounds
+            )
+            result = self._annotation_io.save_pair(
+                image_data=np.asarray(crop_image_layer.data),
+                image_name=sample_id,
+                source_path=self._source_path(self._crop_source_image_layer),
+                sample_id=sample_id,
+                rectangles=rectangles,
+                class_ids=class_ids,
+                conversion_metadata={
+                    "settings": self._crop_source_converted.settings.to_mapping(),
+                    "plane_indices": (
+                        self._crop_source_converted.plane.non_spatial_indices
+                    ),
+                    "axis_labels": list(
+                        self._crop_source_converted.plane.axis_labels
+                    ),
+                    "normalization_stats": list(
+                        self._crop_source_converted.normalization_stats
+                    ),
+                    "training_crop": self._crop_bounds.to_mapping(),
+                    "prediction": getattr(
+                        self._crop_source_shapes_layer, "metadata", {}
+                    ).get("cci_prediction"),
+                },
+            )
+            self._project.lock_image_processing(
+                self._crop_source_converted.settings.to_mapping()
+            )
+            self._project.lock_training_patch(
+                self._crop_bounds.size,
+                padding_value=int(
+                    self._project.config.training_patch["padding_value"]
+                ),
+            )
+        except (
+            AnnotationError,
+            LabelValidationError,
+            ProjectError,
+            TrainingCropError,
+            OSError,
+        ) as exc:
+            self._show_error(f"Could not save training crop:\n{exc}")
+            return False
+        self._crop_dirty = False
+        self._training_preview = None
+        crop_shapes.metadata["cci_label_path"] = str(result.label_path)
+        self._crop_status_label.setText(
+            f"Crop {result.operation}: {result.box_count} box(es) · "
+            f"{result.image_path.name}"
+        )
+        self._dataset_status_label.setText(
+            "Dataset: annotation pool changed; validate or preview the split again."
+        )
+        self._apply_project_processing_settings()
+        self._apply_project_patch_settings()
+        self._update_project_status()
+        self._update_action_state()
+        if show_message:
+            self._show_info(
+                f"Training crop {result.operation}:\n{result.image_path.name}\n"
+                f"{result.label_path.name}"
+            )
+        return True
+
+    def _on_return_to_source(self) -> None:
+        if not self._resolve_crop_unsaved_changes():
+            return
+        self._close_crop_session(remove_selection=False, restore_sources=True)
+        self._crop_status_label.setText(
+            "Crop: returned to source. Move the selection or choose another image."
+        )
+        self._update_action_state()
+
+    def _resolve_crop_unsaved_changes(self) -> bool:
+        if not self._crop_dirty:
+            return True
+        response = QMessageBox.warning(
+            self,
+            "Unsaved training crop",
+            "The current training crop has not been saved. Save it before "
+            "returning to the source image?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if response == QMessageBox.Cancel:
+            return False
+        if response == QMessageBox.Discard:
+            self._crop_dirty = False
+            return True
+        return self._save_training_crop(show_message=False)
+
+    def _close_crop_session(
+        self, *, remove_selection: bool, restore_sources: bool
+    ) -> None:
+        for name in (self.CROP_IMAGE_LAYER_NAME, self.CROP_BBOX_LAYER_NAME):
+            layer = self._get_layer_by_name(name)
+            if layer is not None:
+                self.napari_viewer.layers.remove(layer)
+        if restore_sources:
+            for layer, visible in self._crop_source_visibility:
+                try:
+                    if layer in self.napari_viewer.layers:
+                        layer.visible = visible
+                except (AttributeError, TypeError):
+                    pass
+        if remove_selection:
+            selection = self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME)
+            if selection is not None:
+                self.napari_viewer.layers.remove(selection)
+            self._crop_source_image_layer = None
+            self._crop_source_converted = None
+        self._crop_bounds = None
+        self._crop_source_shapes_layer = None
+        self._crop_source_visibility = []
+        self._crop_rejected_count = 0
+        self._crop_dirty = False
+        self._update_class_counts()
+
+    def _current_view_center(
+        self, image_layer, height: int, width: int
+    ) -> tuple[float, float]:
+        try:
+            center = tuple(self.napari_viewer.camera.center)
+            transform = getattr(image_layer, "world_to_data", None)
+            if callable(transform):
+                center = tuple(transform(center))
+            return float(center[-2]), float(center[-1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return height / 2.0, width / 2.0
+
     def _on_choose_model(self) -> None:
         if self._project is None:
             self._show_error("Create or open a project first.")
@@ -1734,12 +2327,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         self._converted_image = self._inference_converted
         self._current_sample_id = self._inference_sample_id
-        self._annotation_dirty = True
-        self._update_class_counts(shapes)
-        self._label_status_label.setText(
-            f"Labels: {len(typed_result)} merged prediction(s), not yet saved."
+        direct_save = bool(
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            == (self._training_patch_size(),) * 2
         )
-        self._save_annotation_button.setText("Save Prediction + Corrections")
+        self._annotation_dirty = direct_save
+        self._update_class_counts(shapes)
+        if direct_save:
+            self._label_status_label.setText(
+                f"Labels: {len(typed_result)} merged prediction(s), not yet saved."
+            )
+            self._save_annotation_button.setText("Save Prediction + Corrections")
+        else:
+            self._label_status_label.setText(
+                f"Labels: {len(typed_result)} working prediction(s). Move a "
+                "training crop over failures to save corrections."
+            )
+            self._save_annotation_button.setText(
+                "Use Training Crop to Save Corrections"
+            )
         total = self._inference_progress.maximum()
         self._inference_progress.setValue(total)
         self._inference_status_label.setText(
@@ -1793,7 +2400,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._training_preview = None
 
     def _dataset_settings(self) -> DatasetBuildSettings:
-        tile_size = self._training_tile_size_spin.value()
+        tile_size = self._training_patch_size()
         overlap = round(tile_size * self._training_overlap_spin.value() / 100.0)
         return DatasetBuildSettings(
             validation_fraction=self._validation_fraction_spin.value(),
@@ -2044,6 +2651,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._image_for_annotation()
         has_image = self._is_image_layer(image_layer)
         has_shapes = self._annotation_layer() is not None
+        has_editable_shapes = self._editable_bbox_layer() is not None
+        has_crop = self._crop_bounds is not None
+        has_crop_selection = (
+            self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME) is not None
+        )
+        direct_save_size = bool(
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            == (self._training_patch_size(),) * 2
+        )
         inference_running = (
             self._inference_worker is not None
             and self._inference_worker.isRunning()
@@ -2053,23 +2670,53 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and self._training_worker.isRunning()
         )
         running = inference_running or training_running
-        self._new_project_button.setEnabled(not running)
-        self._open_project_button.setEnabled(not running)
-        self._edit_classes_button.setEnabled(has_project and not running)
+        self._new_project_button.setEnabled(not running and not has_crop)
+        self._open_project_button.setEnabled(not running and not has_crop)
+        self._edit_classes_button.setEnabled(
+            has_project and not running and not has_crop
+        )
         self._class_combo.setEnabled(has_project and not running)
         self._apply_class_button.setEnabled(
-            has_project and has_shapes and not running
+            has_project and has_editable_shapes and not running
         )
-        self._reload_labels_button.setEnabled(has_project and has_image and not running)
+        self._reload_labels_button.setEnabled(
+            has_project and has_image and not running and not has_crop
+        )
         self._save_annotation_button.setEnabled(
-            has_project and has_image and has_shapes and not running
+            has_project
+            and has_image
+            and has_shapes
+            and direct_save_size
+            and not running
+            and not has_crop
         )
         self._validate_project_button.setEnabled(has_project and not running)
-        self._preview_button.setEnabled(has_project and has_image and not running)
+        self._preview_button.setEnabled(
+            has_project and has_image and not running and not has_crop
+        )
         self._choose_model_button.setEnabled(has_project and not running)
         self._predict_button.setEnabled(
-            has_project and has_image and self._model is not None and not running
+            has_project
+            and has_image
+            and self._model is not None
+            and not running
+            and not has_crop
         )
+        patch_locked = bool(
+            self._project
+            and self._project.config.training_patch.get("locked")
+        )
+        self._patch_size_combo.setEnabled(
+            has_project and not patch_locked and not running and not has_crop
+        )
+        self._select_crop_button.setEnabled(
+            has_project and has_image and not running
+        )
+        self._create_crop_button.setEnabled(
+            has_project and has_crop_selection and not running
+        )
+        self._save_crop_button.setEnabled(has_crop and not running)
+        self._return_crop_button.setEnabled(has_crop and not running)
         self._cancel_inference_button.setEnabled(inference_running)
         for control in (
             self._device_combo,
@@ -2082,21 +2729,28 @@ class SimpleCciAnnotatorQWidget(QWidget):
         ):
             control.setEnabled(not running)
         has_training_model = self._training_model_combo.count() > 0
-        self._validate_dataset_button.setEnabled(has_project and not running)
-        self._preview_split_button.setEnabled(has_project and not running)
-        self._regenerate_split_button.setEnabled(has_project and not running)
+        self._validate_dataset_button.setEnabled(
+            has_project and not running and not has_crop
+        )
+        self._preview_split_button.setEnabled(
+            has_project and not running and not has_crop
+        )
+        self._regenerate_split_button.setEnabled(
+            has_project and not running and not has_crop
+        )
         self._retrain_button.setEnabled(
-            has_project and has_training_model and not running
+            has_project and has_training_model and not running and not has_crop
         )
         self._cancel_training_button.setEnabled(training_running)
-        self._destination_button.setEnabled(has_project and not running)
+        self._destination_button.setEnabled(
+            has_project and not running and not has_crop
+        )
         for control in (
             self._training_model_combo,
             self._destination_input,
             self._group_field_input,
             self._validation_fraction_spin,
             self._seed_spin,
-            self._training_tile_size_spin,
             self._training_overlap_spin,
             self._negative_ratio_spin,
             self._epochs_spin,
@@ -2105,10 +2759,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._training_device_combo,
             self._train_only_checkbox,
         ):
-            control.setEnabled(has_project and not running)
+            control.setEnabled(has_project and not running and not has_crop)
+        self._training_tile_size_spin.setEnabled(False)
         self._set_processing_controls_enabled(
             has_project
             and has_image
             and self._locked_processing_settings is None
             and not running
+            and not has_crop
         )

@@ -131,6 +131,14 @@ class DatasetBuilder:
     ) -> DatasetPreview:
         settings.validate()
         samples, warnings, errors = self._load_samples(settings.group_field)
+        patch_contract = self.project.config.training_patch
+        if patch_contract.get("locked"):
+            patch_size = int(patch_contract["size"])
+            if settings.tile_size != patch_size:
+                errors.append(
+                    f"Training tile size must match the locked project patch size "
+                    f"of {patch_size}."
+                )
         assignments: dict[str, str] = {}
         if samples and not errors:
             try:
@@ -389,11 +397,28 @@ class DatasetBuilder:
                 with Image.open(image_path) as image_file:
                     width, height = image_file.size
                     image_file.verify()
+                patch_contract = self.project.config.training_patch
+                if patch_contract.get("locked"):
+                    patch_size = int(patch_contract["size"])
+                    if (width, height) != (patch_size, patch_size):
+                        errors.append(
+                            f"Invalid sample {stem!r}: image is {width}×{height}; "
+                            f"expected {patch_size}×{patch_size}."
+                        )
+                        continue
                 boxes = self.annotation_io.parse_yolo_text(
                     label_path.read_text(encoding="utf-8"), source=str(label_path)
                 )
             except (OSError, ValueError, LabelValidationError) as exc:
                 errors.append(f"Invalid sample {stem!r}: {exc}")
+                continue
+            event = audit.get(stem, {})
+            padding_errors = _crop_padding_errors(boxes, event)
+            if padding_errors:
+                errors.extend(
+                    f"Invalid sample {stem!r}: {item}"
+                    for item in padding_errors
+                )
                 continue
             image_hash = _sha256(image_path)
             if image_hash in hashes:
@@ -402,7 +427,6 @@ class DatasetBuilder:
                 )
             else:
                 hashes[image_hash] = stem
-            event = audit.get(stem, {})
             group = _sample_group(stem, event, group_field)
             if group_field and _lookup_field(event, group_field) in {None, ""}:
                 warnings.append(
@@ -568,6 +592,30 @@ class DatasetBuilder:
             ),
             rejected,
         )
+
+
+def _crop_padding_errors(
+    boxes: tuple[BoundingBox, ...], event: dict[str, Any]
+) -> tuple[str, ...]:
+    conversion = event.get("conversion", {})
+    crop = conversion.get("training_crop") if isinstance(conversion, dict) else None
+    if not isinstance(crop, dict):
+        return ()
+    try:
+        size = int(crop["size"])
+        valid_height = int(crop["valid_height"])
+        valid_width = int(crop["valid_width"])
+    except (KeyError, TypeError, ValueError):
+        return ("training-crop audit metadata is invalid.",)
+    errors: list[str] = []
+    for index, box in enumerate(boxes, start=1):
+        x2 = (box.x_center + box.width / 2.0) * size
+        y2 = (box.y_center + box.height / 2.0) * size
+        if x2 > valid_width + 1e-6 or y2 > valid_height + 1e-6:
+            errors.append(
+                f"box {index} extends into synthetic training-crop padding."
+            )
+    return tuple(errors)
 
 
 def _sample_group(stem: str, event: dict[str, Any], group_field: str) -> str:
