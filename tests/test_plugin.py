@@ -33,6 +33,7 @@ from simple_napari_cci_annotator._image_adapter import (
     normalize_to_uint8,
 )
 from simple_napari_cci_annotator._project_store import (
+    ClassMapError,
     ImageProcessingLockedError,
     InvalidProjectError,
     ProjectConflictError,
@@ -51,7 +52,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.4.0"
+    assert simple_napari_cci_annotator.__version__ == "0.5.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -89,6 +90,27 @@ def test_initialize_requires_empty_folder(tmp_path):
         ProjectStore.initialize(root)
 
     assert (root / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_project_class_map_can_grow_and_rename_but_not_orphan_labels(tmp_path):
+    root = tmp_path / "multi-class-project"
+    root.mkdir()
+    project = ProjectStore.initialize(root, classes={0: "Cell", 1: "Debris"})
+
+    project.update_classes({0: "Target cell", 1: "Artifact", 2: "Cluster"})
+    assert ProjectStore.load(root).config.classes == {
+        0: "Target cell",
+        1: "Artifact",
+        2: "Cluster",
+    }
+
+    (project.paths.labels / "sample.txt").write_text(
+        "2 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+    )
+    with pytest.raises(ClassMapError, match="used by saved annotations"):
+        project.update_classes({0: "Target cell", 1: "Artifact"})
+    with pytest.raises(InvalidProjectError, match="contiguous"):
+        project.update_classes({0: "Target cell", 2: "Cluster"})
 
 
 def test_existing_project_must_have_required_folders(tmp_path):
@@ -734,7 +756,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.4.0" in text
+    assert "plugin_version: 0.5.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
 
@@ -783,12 +805,16 @@ class _Image:
 
 
 class _Shapes:
-    def __init__(self, data, name, properties):
+    def __init__(self, data, name, properties, **kwargs):
         self.data = data
         self.name = name
         self.properties = properties
         self.metadata = {}
         self.current_properties = {}
+        self.current_edge_color = None
+        self.edge_color = kwargs.get("edge_color")
+        self.selected_data = set()
+        self.events = SimpleNamespace(data=_Signal())
 
 
 class _Layers(list):
@@ -810,7 +836,7 @@ class _Viewer:
         )
 
     def add_shapes(self, data, *, name, properties, **kwargs):
-        layer = _Shapes(data, name, properties)
+        layer = _Shapes(data, name, properties, **kwargs)
         self.layers.append(layer)
         return layer
 
@@ -884,3 +910,35 @@ def test_widget_new_project_and_automatic_bbox_loading(tmp_path, qtbot):
     assert shapes.properties["class_name"].tolist() == ["LABEL"]
     assert shapes.metadata["cci_label_path"] == str(source_image.with_suffix(".txt").resolve())
     assert widget._save_annotation_button.text() == "Import Converted Image + BBoxes"
+
+
+def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot):
+    root = tmp_path / "project"
+    root.mkdir()
+    project = ProjectStore.initialize(root, classes={0: "Cell", 1: "Debris"})
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    shapes = viewer.add_shapes(
+        [np.asarray([[10, 10], [10, 20], [20, 20], [20, 10]])],
+        name=widget.ANNOTATION_LAYER_NAME,
+        properties={
+            "class_id": np.asarray([0]),
+            "class_name": np.asarray(["Cell"], dtype=object),
+            "confidence": np.asarray([0.9]),
+            "source": np.asarray(["prediction"], dtype=object),
+            "tile_id": np.asarray([3]),
+        },
+    )
+    shapes.selected_data = {0}
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(1))
+
+    widget._on_apply_class_to_selected()
+
+    assert shapes.properties["class_id"].tolist() == [1]
+    assert shapes.properties["class_name"].tolist() == ["Debris"]
+    assert shapes.properties["source"].tolist() == ["manual"]
+    assert np.isnan(shapes.properties["confidence"][0])
+    assert "1 Debris: 1" in widget._class_counts_label.text()
+    assert widget._annotation_dirty

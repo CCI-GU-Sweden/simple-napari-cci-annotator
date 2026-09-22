@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from qtpy.QtCore import Qt, QUrl
-from qtpy.QtGui import QDesktopServices
+from qtpy.QtGui import QColor, QDesktopServices
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +25,8 @@ from qtpy.QtWidgets import (
 )
 
 from ._annotation_io import AnnotationError, AnnotationIO, LabelValidationError
+from ._class_editor import ClassMapDialog
+from ._class_map import class_color, class_display_name
 from ._dataset_builder import (
     DatasetBuildError,
     DatasetBuildSettings,
@@ -101,6 +103,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._annotation_dirty = False
         self._locked_processing_settings: ImageProcessingSettings | None = None
         self._updating_processing_controls = False
+        self._updating_class_controls = False
         self._last_normalization_method: str | None = None
         self._model: YoloDetectionModel | None = None
         self._inference_worker: InferenceWorker | None = None
@@ -122,6 +125,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._new_project_button.clicked.connect(self._on_new_project)
         self._open_project_button = QPushButton("Open Project")
         self._open_project_button.clicked.connect(self._on_open_project)
+        self._edit_classes_button = QPushButton("Edit Classes")
+        self._edit_classes_button.clicked.connect(self._on_edit_classes)
 
         self._image_status_label = QLabel("Select an image layer in napari.")
         self._image_status_label.setWordWrap(True)
@@ -185,6 +190,21 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Labels: unavailable until a project is open."
         )
         self._label_status_label.setWordWrap(True)
+
+        self._class_combo = QComboBox()
+        self._class_combo.setToolTip(
+            "Class assigned to newly drawn boxes. Use Apply Class to Selected "
+            "to reclassify existing boxes."
+        )
+        self._class_combo.currentIndexChanged.connect(
+            self._on_current_class_changed
+        )
+        self._apply_class_button = QPushButton("Apply Class to Selected")
+        self._apply_class_button.clicked.connect(
+            self._on_apply_class_to_selected
+        )
+        self._class_counts_label = QLabel("Class counts: unavailable")
+        self._class_counts_label.setWordWrap(True)
 
         self._reload_labels_button = QPushButton("Reload Labels")
         self._reload_labels_button.clicked.connect(self._on_reload_labels)
@@ -311,6 +331,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         project_layout.addWidget(self._project_path_label)
         project_layout.addWidget(self._project_status_label)
         project_layout.addLayout(project_buttons)
+        project_layout.addWidget(self._edit_classes_button)
         self._project_section = CollapsibleSection(
             "Project", project_layout, expanded=True
         )
@@ -332,6 +353,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         annotation_layout.addLayout(processing_form)
         annotation_layout.addWidget(self._processing_lock_label)
         annotation_layout.addWidget(self._preview_button)
+        class_form = QFormLayout()
+        class_form.addRow("Current class", self._class_combo)
+        annotation_layout.addLayout(class_form)
+        annotation_layout.addWidget(self._apply_class_button)
+        annotation_layout.addWidget(self._class_counts_label)
         annotation_layout.addWidget(self._label_status_label)
         annotation_layout.addLayout(annotation_buttons)
         annotation_layout.addWidget(self._validate_project_button)
@@ -497,6 +523,81 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         self._set_project(project)
 
+    def _update_project_status(self) -> None:
+        if self._project is None:
+            self._project_status_label.setText(
+                "Create a new project or open an initialized project."
+            )
+            return
+        class_summary = ", ".join(
+            f"{class_id}: {name}"
+            for class_id, name in sorted(self._project.config.classes.items())
+        )
+        self._project_status_label.setText(
+            f"Project loaded · schema {self._project.config.schema_version} · "
+            f"classes [{class_summary}]"
+        )
+
+    def _on_edit_classes(self) -> None:
+        if self._project is None:
+            self._show_error("Create or open a project first.")
+            return
+        if not self._resolve_unsaved_changes():
+            return
+
+        previous_class_id = self._current_class_id()
+        dialog = ClassMapDialog(self._project.config.classes, self)
+        if not dialog.exec():
+            return
+        classes = dialog.classes()
+        shapes = self._annotation_layer()
+        if shapes is not None:
+            try:
+                active_ids = set(self._class_ids(shapes, len(shapes.data)))
+            except LabelValidationError as exc:
+                self._show_error(f"Could not edit classes:\n{exc}")
+                return
+            removed_active = sorted(active_ids - set(classes))
+            if removed_active:
+                self._show_error(
+                    "Cannot remove class ID(s) used by the current bbox layer: "
+                    + ", ".join(str(value) for value in removed_active)
+                )
+                return
+        try:
+            self._project.update_classes(classes)
+        except (ProjectError, OSError, ValueError) as exc:
+            self._show_error(f"Could not update project classes:\n{exc}")
+            return
+
+        self._populate_class_selector(preferred=previous_class_id)
+        if shapes is not None:
+            properties = dict(getattr(shapes, "properties", {}) or {})
+            class_ids = self._class_ids(shapes, len(shapes.data))
+            properties["class_name"] = np.asarray(
+                [classes[class_id] for class_id in class_ids], dtype=object
+            )
+            shapes.properties = properties
+            self._apply_class_colors(shapes)
+            self._set_default_current_properties(shapes)
+            self._update_class_counts(shapes)
+
+        if self._model is not None and set(self._model.names) != set(classes):
+            self._model = None
+            self._model_path_label.setText("No detection model loaded")
+            self._model_status_label.setText(
+                "Model: unloaded because its class IDs no longer match the project"
+            )
+        elif self._model is not None:
+            self._update_loaded_model_status()
+        self._training_preview = None
+        self._dataset_status_label.setText(
+            "Dataset: class map changed; validate or preview the split again."
+        )
+        self._refresh_training_model_choices()
+        self._update_project_status()
+        self._update_action_state()
+
     def _set_project(self, project: ProjectStore) -> None:
         previous_annotation = self._annotation_layer()
         if previous_annotation is not None:
@@ -513,14 +614,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         self._refresh_training_model_choices()
         self._project_path_label.setText(str(project.paths.root))
-        class_summary = ", ".join(
-            f"{class_id}: {name}"
-            for class_id, name in sorted(project.config.classes.items())
-        )
-        self._project_status_label.setText(
-            f"Project loaded · schema {project.config.schema_version} · "
-            f"classes [{class_summary}]"
-        )
+        self._populate_class_selector()
+        self._update_project_status()
+        self._update_class_counts()
         self._apply_project_processing_settings()
         self._update_action_state()
         active = self._active_layer()
@@ -656,13 +752,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
             shape_type="rectangle",
             properties=properties,
             edge_width=2,
-            edge_color="yellow",
+            edge_color=[class_color(value) for value in properties["class_id"]]
+            if len(rectangles)
+            else class_color(self._current_class_id() or 0),
             face_color="transparent",
         )
         shapes.metadata["cci_image_stem"] = stem
         shapes.metadata["cci_project_root"] = str(self._project.paths.root)
         shapes.metadata["cci_label_path"] = str(label_path) if label_path else None
         self._set_default_current_properties(shapes)
+        self._apply_class_colors(shapes)
         try:
             shapes.events.data.connect(self._on_shapes_data_changed)
         except (AttributeError, TypeError):
@@ -674,6 +773,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         except ImageConversionError:
             self._converted_image = None
         self._annotation_dirty = False
+        self._update_class_counts(shapes)
         self._update_image_status(image_layer)
         if label_path is None:
             self._label_status_label.setText(
@@ -702,10 +802,155 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "tile_id": np.asarray([], dtype=int),
         }
 
+    def _populate_class_selector(self, *, preferred: int | None = None) -> None:
+        self._updating_class_controls = True
+        try:
+            self._class_combo.clear()
+            if self._project is None:
+                return
+            for class_id, name in sorted(self._project.config.classes.items()):
+                self._class_combo.addItem(
+                    class_display_name(class_id, name), class_id
+                )
+                index = self._class_combo.count() - 1
+                self._class_combo.setItemData(
+                    index,
+                    QColor(class_color(class_id)),
+                    Qt.ForegroundRole,
+                )
+            if preferred is not None:
+                index = self._class_combo.findData(preferred)
+                if index >= 0:
+                    self._class_combo.setCurrentIndex(index)
+        finally:
+            self._updating_class_controls = False
+        self._on_current_class_changed()
+
+    def _current_class_id(self) -> int | None:
+        value = self._class_combo.currentData()
+        if value is not None:
+            return int(value)
+        if self._project is not None and self._project.config.classes:
+            return min(self._project.config.classes)
+        return None
+
+    def _on_current_class_changed(self, index: int = -1) -> None:
+        del index
+        if self._updating_class_controls:
+            return
+        shapes = self._annotation_layer()
+        if shapes is not None:
+            self._set_default_current_properties(shapes)
+
+    def _apply_class_colors(self, shapes_layer) -> None:
+        count = len(getattr(shapes_layer, "data", ()))
+        try:
+            class_ids = self._class_ids(shapes_layer, count)
+        except LabelValidationError:
+            return
+        colors = [class_color(class_id) for class_id in class_ids]
+        try:
+            if colors:
+                shapes_layer.edge_color = colors
+            current_class_id = self._current_class_id()
+            if current_class_id is not None:
+                shapes_layer.current_edge_color = class_color(current_class_id)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def _update_class_counts(self, shapes_layer=None) -> None:
+        if self._project is None:
+            self._class_counts_label.setText("Class counts: unavailable")
+            return
+        shapes_layer = shapes_layer or self._annotation_layer()
+        class_ids: tuple[int, ...] = ()
+        if shapes_layer is not None:
+            try:
+                class_ids = self._class_ids(
+                    shapes_layer, len(getattr(shapes_layer, "data", ()))
+                )
+            except LabelValidationError:
+                self._class_counts_label.setText(
+                    "Class counts: unavailable (invalid class properties)"
+                )
+                return
+        counts = {
+            class_id: class_ids.count(class_id)
+            for class_id in self._project.config.classes
+        }
+        summary = " · ".join(
+            f"{class_id} {name}: {counts[class_id]}"
+            for class_id, name in sorted(self._project.config.classes.items())
+        )
+        self._class_counts_label.setText(f"Class counts: {summary}")
+
+    def _on_apply_class_to_selected(self) -> None:
+        shapes = self._annotation_layer()
+        class_id = self._current_class_id()
+        if shapes is None or self._project is None or class_id is None:
+            self._show_error("Open a project and bbox layer first.")
+            return
+        selected = sorted(getattr(shapes, "selected_data", set()))
+        if not selected:
+            self._show_info("Select one or more boxes in the bbox layer first.")
+            return
+        count = len(shapes.data)
+        if any(index < 0 or index >= count for index in selected):
+            self._show_error("The bbox selection is no longer valid.")
+            return
+        try:
+            class_ids = np.asarray(self._class_ids(shapes, count), dtype=int)
+        except LabelValidationError as exc:
+            self._show_error(str(exc))
+            return
+        properties = dict(getattr(shapes, "properties", {}) or {})
+        class_names = np.asarray(
+            [self._project.config.classes[value] for value in class_ids],
+            dtype=object,
+        )
+        sources = self._property_values(properties, "source", count, "manual", object)
+        confidences = self._property_values(
+            properties, "confidence", count, np.nan, float
+        )
+        tile_ids = self._property_values(properties, "tile_id", count, -1, int)
+        class_ids[selected] = class_id
+        class_names[selected] = self._project.config.classes[class_id]
+        sources[selected] = "manual"
+        confidences[selected] = np.nan
+        properties.update(
+            {
+                "class_id": class_ids,
+                "class_name": class_names,
+                "confidence": confidences,
+                "source": sources,
+                "tile_id": tile_ids,
+            }
+        )
+        shapes.properties = properties
+        self._apply_class_colors(shapes)
+        self._set_default_current_properties(shapes)
+        self._annotation_dirty = True
+        self._update_class_counts(shapes)
+        self._label_status_label.setText(
+            f"Labels: assigned class {class_id} to {len(selected)} selected box(es); "
+            "changes are not saved."
+        )
+
+    @staticmethod
+    def _property_values(
+        properties: dict, key: str, count: int, default, dtype
+    ) -> np.ndarray:
+        values = np.asarray(properties.get(key, ()), dtype=dtype)
+        if values.shape == (count,):
+            return values.copy()
+        return np.full(count, default, dtype=dtype)
+
     def _set_default_current_properties(self, shapes_layer) -> None:
         if self._project is None:
             return
-        class_id = min(self._project.config.classes)
+        class_id = self._current_class_id()
+        if class_id is None:
+            return
         try:
             shapes_layer.current_properties = {
                 "class_id": np.asarray([class_id]),
@@ -716,6 +961,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "source": np.asarray(["manual"], dtype=object),
                 "tile_id": np.asarray([-1], dtype=int),
             }
+            shapes_layer.current_edge_color = class_color(class_id)
         except (AttributeError, KeyError, ValueError):
             pass
 
@@ -815,6 +1061,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _on_shapes_data_changed(self, event=None) -> None:
         self._annotation_dirty = True
+        self._update_class_counts()
         image_layer = self._annotation_image_layer
         if self._is_source_image_layer(image_layer):
             try:
@@ -922,7 +1169,30 @@ class SimpleCciAnnotatorQWidget(QWidget):
             raise LabelValidationError(
                 ["Every bbox must have a valid class_id property."]
             )
-        return tuple(int(value) for value in values)
+        normalized: list[int] = []
+        for index, value in enumerate(values):
+            try:
+                class_id = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise LabelValidationError(
+                    [f"Box {index}: class_id must be an integer."]
+                ) from exc
+            if isinstance(value, (bool, np.bool_)) or value != class_id:
+                raise LabelValidationError(
+                    [f"Box {index}: class_id must be an integer."]
+                )
+            if (
+                self._project is not None
+                and class_id not in self._project.config.classes
+            ):
+                raise LabelValidationError(
+                    [
+                        f"Box {index}: class ID {class_id} is not defined by "
+                        "the project."
+                    ]
+                )
+            normalized.append(class_id)
+        return tuple(normalized)
 
     def _image_for_annotation(self):
         active = self._active_layer()
@@ -1284,21 +1554,28 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return False
         self._model = model
         self._model_path_label.setText(str(model.path))
+        self._update_loaded_model_status()
+        self._refresh_training_model_choices(preferred=model.path)
+        self._update_action_state()
+        return True
+
+    def _update_loaded_model_status(self) -> None:
+        if self._model is None or self._project is None:
+            return
         names = ", ".join(
-            f"{class_id}: {name}" for class_id, name in sorted(model.names.items())
+            f"{class_id}: {name}"
+            for class_id, name in sorted(self._model.names.items())
         )
         project_names = self._project.config.classes
-        names_differ = bool(model.names) and any(
-            model.names.get(class_id) != name
+        names_differ = bool(self._model.names) and any(
+            self._model.names.get(class_id) != name
             for class_id, name in project_names.items()
         )
         suffix = " · names mapped to project names" if names_differ else ""
         self._model_status_label.setText(
-            f"Model: loaded · task {model.task} · classes [{names or 'unknown'}]{suffix}"
+            f"Model: loaded · task {self._model.task} · "
+            f"classes [{names or 'unknown'}]{suffix}"
         )
-        self._refresh_training_model_choices(preferred=model.path)
-        self._update_action_state()
-        return True
 
     def _inference_settings(self) -> InferenceSettings:
         tile_size = self._tile_size_spin.value()
@@ -1431,7 +1708,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             shape_type="rectangle",
             properties=properties,
             edge_width=2,
-            edge_color="yellow",
+            edge_color=[class_color(value) for value in properties["class_id"]]
+            if rectangles
+            else class_color(self._current_class_id() or 0),
             face_color="transparent",
         )
         settings = self._inference_settings()
@@ -1448,6 +1727,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "device": str(settings.device),
         }
         self._set_default_current_properties(shapes)
+        self._apply_class_colors(shapes)
         try:
             shapes.events.data.connect(self._on_shapes_data_changed)
         except (AttributeError, TypeError):
@@ -1455,6 +1735,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._converted_image = self._inference_converted
         self._current_sample_id = self._inference_sample_id
         self._annotation_dirty = True
+        self._update_class_counts(shapes)
         self._label_status_label.setText(
             f"Labels: {len(typed_result)} merged prediction(s), not yet saved."
         )
@@ -1774,6 +2055,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         running = inference_running or training_running
         self._new_project_button.setEnabled(not running)
         self._open_project_button.setEnabled(not running)
+        self._edit_classes_button.setEnabled(has_project and not running)
+        self._class_combo.setEnabled(has_project and not running)
+        self._apply_class_button.setEnabled(
+            has_project and has_shapes and not running
+        )
         self._reload_labels_button.setEnabled(has_project and has_image and not running)
         self._save_annotation_button.setEnabled(
             has_project and has_image and has_shapes and not running

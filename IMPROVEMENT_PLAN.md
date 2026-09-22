@@ -4,7 +4,7 @@
 
 Turn the plugin from a single-image demo into a dependable, repeatable annotation and retraining workflow for large microscopy images.
 
-The near-term scope remains YOLO object detection with one class, while the data model and UI must not assume that class `0` is the only class forever. Multi-class detection should be a straightforward extension. YOLO segmentation is a later, separate milestone and should reuse the project, tiling, device, and training infrastructure without complicating the first implementation.
+The current scope is multi-class YOLO object detection. YOLO segmentation is a later, separate milestone and should reuse the project, tiling, device, and training infrastructure without complicating the detection workflow.
 
 The intended workflow is:
 
@@ -400,7 +400,7 @@ Keep Ultralytics-specific calls behind an adapter. This will make upgrades testa
 
 ## 10. Multi-class readiness and later segmentation
 
-Implement the first release with one configured class, but avoid single-class assumptions:
+Projects begin with one configured class for the simplest workflow, but detection is multi-class throughout:
 
 - Store a project class map such as `{0: "LABEL"}` and load names from the model when available.
 - Put `class_id` and `class_name` in napari shape properties for every box.
@@ -481,9 +481,11 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 ### Phase 5 — Quality, multi-class UI, and model lineage
 
+**Status: multi-class UI completed in `0.5.0`; remaining Phase 5 quality and lineage work is still planned.** Project class maps can be appended/renamed safely, bbox classes can be selected and reassigned, class colors and counts are visible, and the existing validation, tiling, dataset YAML, inference, save/reload, and retraining paths preserve all class IDs.
+
 - Add dataset/project browser, filters, next/previous image, autosave preference, and annotation completion/review status.
 - Add model comparison summaries and explicit `current` model lineage.
-- Expose multi-class selection, coloring, per-class counts, and class-map editing.
+- Expose multi-class selection, coloring, per-class counts, and class-map editing. **Completed in `0.5.0`.**
 - Add optional hard-negative and uncertainty-driven review queues.
 
 **Exit criteria:** multi-class detection works without changing storage or training architecture, and users can compare successive retrain runs.

@@ -5,22 +5,24 @@
 
 A project-based napari plugin for tiled YOLO bounding-box prediction, review, and annotation storage.
 
-The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, large-image detection inference, reproducible dataset building, and YOLO retraining are available.
+The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, multi-class annotation, large-image detection inference, reproducible dataset building, and YOLO retraining are available.
 
 ## Current workflow
 
 1. Open the plugin in napari.
 2. Click **New Project** and select an empty folder, or click **Open Project** to reopen an initialized project.
-3. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
-4. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
-5. Select and preview the normalization used to create the RGB `uint8` training image.
-6. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
-7. To run inference, choose a YOLO detection model and set device, confidence, model IoU, tile size/overlap, merge IoU, and maximum detections per tile.
-8. Click **Predict Current RGB Plane**. Prediction runs outside the UI thread and can be cancelled between tiles.
-9. Correct the merged boxes and click **Save Prediction + Corrections** (or use the normal Save/Import/Update button without predicting).
-10. Use **Validate Project** to check image/label pairing and label contents.
-11. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
-12. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
+3. Use **Edit Classes** to append or rename project classes when needed.
+4. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
+5. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
+6. Select and preview the normalization used to create the RGB `uint8` training image.
+7. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
+8. Choose **Current class** before drawing a box. To reclassify boxes, select them and click **Apply Class to Selected**.
+9. To run inference, choose a YOLO detection model and set device, confidence, model IoU, tile size/overlap, merge IoU, and maximum detections per tile.
+10. Click **Predict Current RGB Plane**. Prediction runs outside the UI thread and can be cancelled between tiles.
+11. Correct the merged boxes and click **Save Prediction + Corrections** (or use the normal Save/Import/Update button without predicting).
+12. Use **Validate Project** to check image/label pairing and label contents.
+13. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
+14. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
 
 Automatic label discovery checks, in order:
 
@@ -68,14 +70,16 @@ Each non-empty line must contain:
 <class_id> <x_center> <y_center> <width> <height>
 ```
 
-Coordinates must be finite, normalized to `[0, 1]`, have positive width/height, and describe a box contained by the image. The project currently initializes with one class:
+Coordinates must be finite, normalized to `[0, 1]`, have positive width/height, and describe a box contained by the image. A project initializes with one class:
 
 ```yaml
 classes:
   0: LABEL
 ```
 
-Class IDs and names are kept as napari Shapes properties so the storage layer is ready for multi-class support.
+Use **Edit Classes** to rename that class or append more classes. Class IDs are stable, contiguous YOLO indices starting at `0`; names must be non-empty and unique. Only the last class can be removed, and removal is blocked while that ID occurs in a saved label or the current bbox layer. This prevents an existing label from silently changing meaning.
+
+Every shape stores `class_id` and `class_name`. The current-class selector sets the class and stable display color for newly drawn boxes. **Apply Class to Selected** reclassifies only the selected boxes, marks them as manual corrections, and clears stale prediction confidence. Live per-class counts are shown beside the annotation controls. Saving still writes standard five-column YOLO rows, so no custom conversion is required for retraining.
 
 ## Large-image prediction and merging
 
@@ -83,7 +87,7 @@ Inference always uses the same converted RGB `uint8` pixels shown by **Preview R
 
 Tile-local detections are clipped to valid pixels and translated directly into full-image coordinates. Overlap ownership regions identify which tile should represent a seam object, then a separate class-aware global NMS removes duplicates. **Model IoU** controls suppression inside each YOLO tile; **Merge IoU** controls suppression across tiles. Different classes never suppress one another.
 
-The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project.
+The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project; model names may differ because the project names are authoritative in the annotation UI.
 
 ## Dataset building and retraining
 
@@ -124,7 +128,7 @@ retrain_YYYYMMDD_HHMMSS/
 └── README.txt
 ```
 
-`run.yaml` records the input model and checksum, package versions, dataset and training settings, split assignments, device, timestamps, warnings, outputs, and final status. Failed and cancelled runs remain on disk with their status and diagnostic information.
+`dataset.yaml` derives its complete `names` map from the project classes. `run.yaml` records the input model and checksum, package versions, dataset and training settings, split assignments, device, timestamps, warnings, outputs, and final status. Failed and cancelled runs remain on disk with their status and diagnostic information.
 
 With only one independent source group, validation is impossible. The plugin blocks normal retraining unless **Train without independent validation** is enabled and confirmed for that run. Such output is prominently marked exploratory and must not be used to claim generalization quality. Ultralytics requires a validation-loader path even when validation is disabled, so train-only `dataset.yaml` points that unused loader at the training images; `run.yaml` records this compatibility workaround and `validation_enabled: false`.
 

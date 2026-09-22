@@ -30,6 +30,10 @@ class ImageProcessingLockedError(ProjectError):
     """Raised when code attempts to change locked image-processing settings."""
 
 
+class ClassMapError(ProjectError):
+    """Raised when a class-map edit would invalidate saved annotations."""
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
     root: Path
@@ -109,6 +113,7 @@ class ProjectConfig:
                     f"Invalid class definition: {raw_id!r}: {raw_name!r}."
                 )
             classes[class_id] = raw_name.strip()
+        _validate_class_map(classes)
 
         if not isinstance(image_processing, dict):
             raise InvalidProjectError("image_processing must be a mapping.")
@@ -169,7 +174,8 @@ class ProjectStore:
         if not project_name:
             raise ProjectConflictError("The project must have a name.")
 
-        class_map = classes or {0: "LABEL"}
+        class_map = dict(classes) if classes is not None else {0: "LABEL"}
+        _validate_class_map(class_map)
         config = ProjectConfig(
             schema_version=PROJECT_SCHEMA_VERSION,
             name=project_name,
@@ -295,6 +301,74 @@ class ProjectStore:
             dataset_split=dataset_split,
         )
         self.update_config(updated)
+
+    def update_classes(self, classes: dict[int, str]) -> None:
+        """Persist a class map without orphaning IDs used by saved labels."""
+        _validate_class_map(classes)
+        normalized = {
+            class_id: name.strip() for class_id, name in classes.items()
+        }
+        used_ids = _used_label_class_ids(self.paths.labels)
+        removed_used_ids = sorted(used_ids - set(normalized))
+        if removed_used_ids:
+            raise ClassMapError(
+                "Cannot remove class ID(s) used by saved annotations: "
+                + ", ".join(str(class_id) for class_id in removed_used_ids)
+            )
+        updated = ProjectConfig(
+            schema_version=self.config.schema_version,
+            name=self.config.name,
+            created_at=self.config.created_at,
+            classes=normalized,
+            image_processing=dict(self.config.image_processing),
+            dataset_split=dict(self.config.dataset_split),
+        )
+        self.update_config(updated)
+
+
+def _validate_class_map(classes: dict[int, str]) -> None:
+    if not classes:
+        raise InvalidProjectError("Project classes must not be empty.")
+    if any(
+        isinstance(class_id, bool) or not isinstance(class_id, int)
+        for class_id in classes
+    ):
+        raise InvalidProjectError("Class IDs must be integers.")
+    expected = list(range(len(classes)))
+    if sorted(classes) != expected:
+        raise InvalidProjectError(
+            "Class IDs must be contiguous and start at 0; expected "
+            f"{expected}, found {sorted(classes)}."
+        )
+    if any(not isinstance(name, str) for name in classes.values()):
+        raise InvalidProjectError("Class names must be strings.")
+    names = [name.strip() for name in classes.values()]
+    if any(not name for name in names):
+        raise InvalidProjectError("Class names must not be empty.")
+    folded = [name.casefold() for name in names]
+    if len(folded) != len(set(folded)):
+        raise InvalidProjectError("Class names must be unique.")
+
+
+def _used_label_class_ids(labels_path: Path) -> set[int]:
+    used: set[int] = set()
+    for label_path in labels_path.glob("*.txt"):
+        try:
+            lines = label_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise ClassMapError(f"Could not inspect {label_path.name}: {exc}") from exc
+        for line_number, raw_line in enumerate(lines, start=1):
+            fields = raw_line.split()
+            if not fields:
+                continue
+            try:
+                used.add(int(fields[0]))
+            except ValueError as exc:
+                raise ClassMapError(
+                    f"Cannot edit classes while {label_path.name}, line "
+                    f"{line_number} has an invalid class ID."
+                ) from exc
+    return used
 
 
 def _validate_dataset_split(value: Any) -> dict[str, Any]:
