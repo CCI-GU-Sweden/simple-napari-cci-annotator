@@ -561,6 +561,50 @@ def test_grouped_split_is_stable_and_never_leaks_a_source(tmp_path):
     assert all(second.assignments[key] == value for key, value in original.items())
 
 
+def test_appended_audit_metadata_merges_and_survives_later_saves(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "field_a", source_path=tmp_path / "source_a.png"
+    )
+    with project.paths.audit.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "operation": "metadata",
+                    "sample_id": "field_a",
+                    "metadata": {"patient": "P001", "well": "A01"},
+                }
+            )
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "operation": "metadata",
+                    "sample_id": "field_a",
+                    "metadata": {"well": "A02"},
+                }
+            )
+            + "\n"
+        )
+    _save_training_sample(
+        annotation_io, "field_a", source_path=tmp_path / "source_a.png"
+    )
+
+    preview = DatasetBuilder(project).preview(
+        DatasetBuildSettings(tile_size=64, overlap=16, group_field="metadata.patient"),
+        train_only=True,
+    )
+    events = DatasetBuilder(project)._latest_audit_events()
+
+    assert preview.samples[0].group == "metadata:P001"
+    assert events["field_a"]["metadata"] == {
+        "patient": "P001",
+        "well": "A02",
+    }
+
+
 def test_one_source_requires_explicit_train_only_mode(tmp_path):
     project = ProjectStore.initialize(tmp_path / "project")
     annotation_io = AnnotationIO(project)

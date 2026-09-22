@@ -89,6 +89,21 @@ The output `yolo_bboxes` layer preserves `class_id`, project class name, confide
 
 Retraining uses the complete canonical annotation pool. Source images are assigned to a deterministic 80/20 train/validation split before tiling, and existing assignments remain stable as new annotations are added. Z/T samples derived from the same audited source path stay in the same split. An optional audit metadata field can provide a patient, well, acquisition, or other higher-level grouping key.
 
+### Adding audit grouping metadata
+
+The optional **Group metadata** box accepts a dot-separated field path from `annotations/audit.jsonl`, for example `metadata.patient`, `metadata.well`, or `metadata.acquisition`. `audit.jsonl` is JSON Lines: each line is one complete JSON object. Do not wrap the records in a JSON list and do not add commas between lines.
+
+The plugin writes annotation-save records automatically. To attach grouping information, append a metadata record using the exact canonical `sample_id` shown by the saved image/label stem. Avoid editing the file while an annotation is being saved, and keep a backup before bulk metadata edits:
+
+```json
+{"timestamp":"2026-09-22T10:30:00+02:00","operation":"metadata","sample_id":"field_001__t000__z000","metadata":{"patient":"P001","well":"A01","acquisition":"run_03"}}
+{"timestamp":"2026-09-22T10:31:00+02:00","operation":"metadata","sample_id":"field_002__t000__z000","metadata":{"patient":"P001","well":"A02","acquisition":"run_03"}}
+```
+
+Then enter one grouping level in the GUI—for example `metadata.patient`. Every sample with value `P001` is treated as one indivisible source group and can only appear in train or validation, never both. Use the grouping level that represents the true independent biological unit; if several images belong to one patient/specimen/well, they should carry the same value.
+
+Metadata records are merged per sample in append order. A later metadata record can update one field without repeating the others, and later annotation saves do not erase previously appended metadata. Keep `sample_id` spelling exact. Malformed JSON lines are ignored, so validate the dataset after editing. When **Group metadata** is left empty, the plugin groups by the original audited `source_path`, falling back to the canonical sample ID when no source path is available.
+
 The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base and the currently loaded compatible model as the fine-tuned option. This choice affects only the new run; successful training never silently replaces the prediction model.
 
 Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Large source images use deterministic overlapped tiles. Each bbox is assigned once, preferably to a tile containing it completely. Clipping is accepted only when at least 90% of its area remains and neither axis loses more than `min(10 pixels, 10%)`. Tiles containing a rejected, unlabeled object are excluded rather than treated as background. Reviewed-negative/background tiles are sampled with the visible negative-tile ratio.

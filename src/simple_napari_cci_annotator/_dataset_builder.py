@@ -436,7 +436,22 @@ class DatasetBuilder:
                 continue
             sample_id = event.get("sample_id")
             if isinstance(sample_id, str):
-                events[sample_id] = event
+                previous = events.get(sample_id, {})
+                merged = {**previous, **event}
+                previous_metadata = previous.get("metadata", {})
+                event_metadata = event.get("metadata", {})
+                if isinstance(previous_metadata, dict) or isinstance(
+                    event_metadata, dict
+                ):
+                    metadata = (
+                        dict(previous_metadata)
+                        if isinstance(previous_metadata, dict)
+                        else {}
+                    )
+                    if isinstance(event_metadata, dict):
+                        metadata.update(event_metadata)
+                    merged["metadata"] = metadata
+                events[sample_id] = merged
         return events
 
     def _assign_splits(
