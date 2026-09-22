@@ -1,8 +1,9 @@
-"""Tests for project annotation and tiled inference workflows."""
+"""Tests for project annotation, tiled inference, and retraining workflows."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +12,8 @@ import pytest
 
 from simple_napari_cci_annotator import (
     AnnotationIO,
+    DatasetBuildSettings,
+    DatasetBuilder,
     Detection,
     ImageAdapter,
     ImageProcessingSettings,
@@ -18,9 +21,12 @@ from simple_napari_cci_annotator import (
     ProjectStore,
     SimpleCciAnnotatorQWidget,
     TiledInferenceEngine,
+    TrainingService,
+    TrainingSettings,
     create_tile_plan,
 )
 from simple_napari_cci_annotator import _widget as widget_module
+from simple_napari_cci_annotator import _training as training_module
 from simple_napari_cci_annotator._annotation_io import LabelValidationError
 from simple_napari_cci_annotator._image_adapter import (
     ImageConversionError,
@@ -38,13 +44,14 @@ from simple_napari_cci_annotator._tiled_inference import (
     class_aware_nms,
     extract_padded_tile,
 )
+from simple_napari_cci_annotator._training import TrainingCancelled
 from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 
 
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.3.0"
+    assert simple_napari_cci_annotator.__version__ == "0.4.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -470,6 +477,250 @@ def test_yolo_adapter_preserves_rgb_semantics_for_numpy_sources():
     np.testing.assert_array_equal(
         adapter.model.source, np.asarray([[[30, 20, 10]]], dtype=np.uint8)
     )
+
+
+def _save_training_sample(
+    annotation_io,
+    sample_id,
+    *,
+    source_path,
+    positive=True,
+    shape=(80, 120, 3),
+    rectangle=None,
+):
+    if positive:
+        rectangle = rectangle if rectangle is not None else np.asarray(
+            [[20, 30], [20, 60], [45, 60], [45, 30]], dtype=float
+        )
+        rectangles = (rectangle,)
+        class_ids = (0,)
+    else:
+        rectangles = ()
+        class_ids = ()
+    return annotation_io.save_pair(
+        image_data=np.zeros(shape, dtype=np.uint8),
+        image_name=f"{sample_id}.png",
+        sample_id=sample_id,
+        source_path=Path(source_path),
+        rectangles=rectangles,
+        class_ids=class_ids,
+    )
+
+
+def test_project_split_config_is_backward_compatible_and_persistent(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+
+    assert project.config.dataset_split == {
+        "seed": 42,
+        "validation_fraction": 0.2,
+        "assignments": {},
+    }
+    project.update_dataset_split(
+        {"one": "train", "two": "val"}, seed=7, validation_fraction=0.25
+    )
+
+    reopened = ProjectStore.load(project.paths.root)
+    assert reopened.config.dataset_split["seed"] == 7
+    assert reopened.config.dataset_split["validation_fraction"] == 0.25
+    assert reopened.config.dataset_split["assignments"] == {
+        "one": "train",
+        "two": "val",
+    }
+
+
+def test_grouped_split_is_stable_and_never_leaks_a_source(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "field_a_z0", source_path=tmp_path / "source_a.png"
+    )
+    _save_training_sample(
+        annotation_io, "field_a_z1", source_path=tmp_path / "source_a.png"
+    )
+    _save_training_sample(
+        annotation_io,
+        "field_b",
+        source_path=tmp_path / "source_b.png",
+        positive=False,
+    )
+    settings = DatasetBuildSettings(tile_size=64, overlap=16, seed=11)
+
+    first = DatasetBuilder(project).preview(settings)
+
+    assert first.is_valid
+    assert first.assignments["field_a_z0"] == first.assignments["field_a_z1"]
+    assert set(first.assignments.values()) == {"train", "val"}
+    original = dict(first.assignments)
+
+    _save_training_sample(
+        annotation_io, "field_c", source_path=tmp_path / "source_c.png"
+    )
+    second = DatasetBuilder(project).preview(settings)
+
+    assert second.is_valid
+    assert all(second.assignments[key] == value for key, value in original.items())
+
+
+def test_one_source_requires_explicit_train_only_mode(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "only", source_path=tmp_path / "only.png"
+    )
+    builder = DatasetBuilder(project)
+    settings = DatasetBuildSettings(tile_size=64, overlap=16)
+
+    blocked = builder.preview(settings)
+    exploratory = builder.preview(settings, train_only=True)
+
+    assert not blocked.is_valid
+    assert any("at least two source groups" in error for error in blocked.errors)
+    assert exploratory.is_valid
+    assert exploratory.validation_mode == "none"
+    assert exploratory.assignments == {"only": "train"}
+
+    run_root = tmp_path / "train-only-run"
+    run_root.mkdir()
+    snapshot = builder.create_snapshot(run_root, exploratory, settings)
+    assert "val: images/train" in snapshot.dataset_yaml.read_text(encoding="utf-8")
+
+
+def test_snapshot_has_matching_pairs_manifests_and_no_group_leakage(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "one", source_path=tmp_path / "one.png"
+    )
+    _save_training_sample(
+        annotation_io,
+        "two",
+        source_path=tmp_path / "two.png",
+        positive=False,
+    )
+    settings = DatasetBuildSettings(
+        tile_size=64, overlap=16, negative_tile_ratio=0.5, seed=5
+    )
+    builder = DatasetBuilder(project)
+    preview = builder.preview(settings)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+
+    snapshot = builder.create_snapshot(run_root, preview, settings)
+
+    assert snapshot.dataset_yaml.is_file()
+    assert snapshot.split_manifest.is_file()
+    assert snapshot.tile_manifest.is_file()
+    for split in ("train", "val"):
+        image_stems = {
+            path.stem for path in (snapshot.dataset_root / "images" / split).glob("*.png")
+        }
+        label_stems = {
+            path.stem for path in (snapshot.dataset_root / "labels" / split).glob("*.txt")
+        }
+        assert image_stems == label_stems
+    manifest = snapshot.split_manifest.read_text(encoding="utf-8")
+    assert "image_sha256" in manifest
+    assert "label_sha256" in manifest
+
+
+def test_large_bbox_rejected_when_tile_clipping_is_too_severe(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    huge = np.asarray([[10, 10], [10, 190], [50, 190], [50, 10]], dtype=float)
+    _save_training_sample(
+        annotation_io,
+        "huge",
+        source_path=tmp_path / "huge.png",
+        shape=(64, 200, 3),
+        rectangle=huge,
+    )
+    settings = DatasetBuildSettings(tile_size=64, overlap=0)
+
+    preview = DatasetBuilder(project).preview(settings, train_only=True)
+
+    assert not preview.is_valid
+    assert preview.box_counts["train"] == 0
+    assert any("cannot meet" in warning for warning in preview.warnings)
+    assert any("No usable training tiles" in error for error in preview.errors)
+
+
+def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "one", source_path=tmp_path / "one.png"
+    )
+    _save_training_sample(
+        annotation_io, "two", source_path=tmp_path / "two.png", positive=False
+    )
+    dataset_settings = DatasetBuildSettings(tile_size=64, overlap=16, seed=3)
+    preview = DatasetBuilder(project).preview(dataset_settings)
+    base_model = tmp_path / "base.pt"
+    base_model.write_bytes(b"model")
+
+    class FakeModel:
+        task = "detect"
+
+        def add_callback(self, name, callback):
+            self.callback = callback
+
+        def train(self, **kwargs):
+            weights = Path(kwargs["project"]) / kwargs["name"] / "weights"
+            weights.mkdir(parents=True)
+            (weights / "best.pt").write_bytes(b"best")
+            (weights / "last.pt").write_bytes(b"last")
+            self.callback(SimpleNamespace(epoch=0, metrics={}))
+
+    destination = tmp_path / "outputs"
+    settings = TrainingSettings(
+        model_path=base_model,
+        destination=destination,
+        dataset=dataset_settings,
+        epochs=1,
+        batch=1,
+        patience=0,
+    )
+    with patch.object(training_module, "_load_ultralytics_model", return_value=FakeModel()):
+        result = TrainingService(project).run(settings, preview)
+
+    assert result.status == "completed"
+    assert result.run_root.parent == destination.resolve()
+    assert result.run_root.name.startswith("retrain_")
+    assert result.best_model.is_file()
+    run_yaml = result.run_root / "run.yaml"
+    text = run_yaml.read_text(encoding="utf-8")
+    assert "status: completed" in text
+    assert "plugin_version: 0.4.0" in text
+    assert "sha256:" in text
+    assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
+
+
+def test_training_cancellation_marks_partial_run(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "only", source_path=tmp_path / "only.png"
+    )
+    dataset_settings = DatasetBuildSettings(tile_size=64, overlap=0)
+    preview = DatasetBuilder(project).preview(dataset_settings, train_only=True)
+    model = tmp_path / "base.pt"
+    model.write_bytes(b"model")
+    destination = tmp_path / "outputs"
+    settings = TrainingSettings(
+        model_path=model,
+        destination=destination,
+        dataset=dataset_settings,
+        train_only=True,
+    )
+
+    with pytest.raises(TrainingCancelled):
+        TrainingService(project).run(
+            settings, preview, cancelled=lambda: True
+        )
+
+    runs = list(destination.glob("retrain_*"))
+    assert len(runs) == 1
+    assert "status: cancelled" in (runs[0] / "run.yaml").read_text(encoding="utf-8")
 
 
 class _Signal:

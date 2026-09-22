@@ -85,7 +85,7 @@ The **project root can be selected independently from the model path**. For conv
 
 When the user selects an empty directory, show what will be created and initialize it as a project by creating `project.yaml`, `models/`, `annotations/images/`, and `annotations/labels/`. Initialization must be idempotent and atomic enough that a failure is reported as an incomplete project rather than a valid empty project. A non-empty directory without `project.yaml` must not be silently adopted: offer an explicit **Initialize here** action after checking for path conflicts.
 
-Model selection remains independent after initialization. A selected external checkpoint may be referenced in project metadata or explicitly copied into `project_root/models/`; copying is recommended for reproducibility, but should be confirmed because model files can be large. An empty project is valid before a model is selected, but prediction and retraining remain disabled until a compatible model is loaded.
+Model selection remains independent after initialization. A selected external checkpoint may be referenced in project metadata or explicitly copied into `project_root/models/`; copying is recommended for reproducibility, but should be confirmed because model files can be large. An empty project is valid before a model is selected. Prediction requires a compatible project model, while retraining may explicitly start from the prototype's repository-root `yolo26n.pt` base or from the currently loaded fine-tuned model.
 
 Suggested structure:
 
@@ -467,6 +467,8 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 **Exit criteria:** images larger than 1024 are fully covered, boxes appear in correct global positions, padding creates no detections, and duplicates at seams are consistently resolved.
 
 ### Phase 4 — Reproducible dataset building and retraining
+
+**Status: core workflow completed in `0.4.0`.** Dataset creation uses a direct deterministic iterator. Rich epoch-metric plots, automatic batch fallback after out-of-memory failures, and editable model lineage remain follow-up work.
 
 - Implement group-aware deterministic 80/20 splitting and stable incremental assignments.
 - Generate derived training tiles inside a timestamped run snapshot.

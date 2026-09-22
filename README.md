@@ -5,7 +5,7 @@
 
 A project-based napari plugin for tiled YOLO bounding-box prediction, review, and annotation storage.
 
-The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, and large-image detection inference are available. Dataset splitting and retraining remain later milestones.
+The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, large-image detection inference, reproducible dataset building, and YOLO retraining are available.
 
 ## Current workflow
 
@@ -19,6 +19,8 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 8. Click **Predict Current RGB Plane**. Prediction runs outside the UI thread and can be cancelled between tiles.
 9. Correct the merged boxes and click **Save Prediction + Corrections** (or use the normal Save/Import/Update button without predicting).
 10. Use **Validate Project** to check image/label pairing and label contents.
+11. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
+12. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
 
 Automatic label discovery checks, in order:
 
@@ -82,6 +84,34 @@ Inference always uses the same converted RGB `uint8` pixels shown by **Preview R
 Tile-local detections are clipped to valid pixels and translated directly into full-image coordinates. Overlap ownership regions identify which tile should represent a seam object, then a separate class-aware global NMS removes duplicates. **Model IoU** controls suppression inside each YOLO tile; **Merge IoU** controls suppression across tiles. Different classes never suppress one another.
 
 The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project.
+
+## Dataset building and retraining
+
+Retraining uses the complete canonical annotation pool. Source images are assigned to a deterministic 80/20 train/validation split before tiling, and existing assignments remain stable as new annotations are added. Z/T samples derived from the same audited source path stay in the same split. An optional audit metadata field can provide a patient, well, acquisition, or other higher-level grouping key.
+
+The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base and the currently loaded compatible model as the fine-tuned option. This choice affects only the new run; successful training never silently replaces the prediction model.
+
+Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Large source images use deterministic overlapped tiles. Each bbox is assigned once, preferably to a tile containing it completely. Clipping is accepted only when at least 90% of its area remains and neither axis loses more than `min(10 pixels, 10%)`. Tiles containing a rejected, unlabeled object are excluded rather than treated as background. Reviewed-negative/background tiles are sampled with the visible negative-tile ratio.
+
+Each run contains:
+
+```text
+retrain_YYYYMMDD_HHMMSS/
+├── dataset/
+│   ├── images/train/ and images/val/
+│   ├── labels/train/ and labels/val/
+│   ├── dataset.yaml
+│   ├── split_manifest.csv
+│   └── tile_manifest.csv
+├── training/
+│   └── weights/best.pt and last.pt (train-only runs may have only last.pt)
+├── run.yaml
+└── README.txt
+```
+
+`run.yaml` records the input model and checksum, package versions, dataset and training settings, split assignments, device, timestamps, warnings, outputs, and final status. Failed and cancelled runs remain on disk with their status and diagnostic information.
+
+With only one independent source group, validation is impossible. The plugin blocks normal retraining unless **Train without independent validation** is enabled and confirmed for that run. Such output is prominently marked exploratory and must not be used to claim generalization quality. Ultralytics requires a validation-loader path even when validation is disabled, so train-only `dataset.yaml` points that unused loader at the training images; `run.yaml` records this compatibility workaround and `validation_enabled: false`.
 
 ## Image conversion
 

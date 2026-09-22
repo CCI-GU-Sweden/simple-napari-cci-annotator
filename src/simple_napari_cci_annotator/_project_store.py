@@ -62,6 +62,7 @@ class ProjectConfig:
     created_at: str
     classes: dict[int, str]
     image_processing: dict[str, Any]
+    dataset_split: dict[str, Any]
 
     @classmethod
     def from_mapping(cls, value: Any) -> ProjectConfig:
@@ -79,6 +80,14 @@ class ProjectConfig:
         created_at = value.get("created_at")
         raw_classes = value.get("classes")
         image_processing = value.get("image_processing")
+        dataset_split = value.get(
+            "dataset_split",
+            {
+                "seed": 42,
+                "validation_fraction": 0.2,
+                "assignments": {},
+            },
+        )
 
         if not isinstance(name, str) or not name.strip():
             raise InvalidProjectError("Project name must be a non-empty string.")
@@ -105,6 +114,7 @@ class ProjectConfig:
             raise InvalidProjectError("image_processing must be a mapping.")
         if not isinstance(image_processing.get("locked"), bool):
             raise InvalidProjectError("image_processing.locked must be true or false.")
+        dataset_split = _validate_dataset_split(dataset_split)
 
         return cls(
             schema_version=schema_version,
@@ -112,6 +122,7 @@ class ProjectConfig:
             created_at=created_at,
             classes=classes,
             image_processing=dict(image_processing),
+            dataset_split=dataset_split,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -121,6 +132,7 @@ class ProjectConfig:
             "created_at": self.created_at,
             "classes": dict(sorted(self.classes.items())),
             "image_processing": self.image_processing,
+            "dataset_split": self.dataset_split,
         }
 
 
@@ -167,6 +179,11 @@ class ProjectStore:
                 "channels": "unset",
                 "normalization": "unset",
                 "locked": False,
+            },
+            dataset_split={
+                "seed": 42,
+                "validation_fraction": 0.2,
+                "assignments": {},
             },
         )
 
@@ -251,8 +268,65 @@ class ProjectStore:
             created_at=self.config.created_at,
             classes=dict(self.config.classes),
             image_processing=requested,
+            dataset_split=dict(self.config.dataset_split),
         )
         self.update_config(updated)
+
+    def update_dataset_split(
+        self,
+        assignments: dict[str, str],
+        *,
+        seed: int,
+        validation_fraction: float,
+    ) -> None:
+        dataset_split = _validate_dataset_split(
+            {
+                "seed": seed,
+                "validation_fraction": validation_fraction,
+                "assignments": assignments,
+            }
+        )
+        updated = ProjectConfig(
+            schema_version=self.config.schema_version,
+            name=self.config.name,
+            created_at=self.config.created_at,
+            classes=dict(self.config.classes),
+            image_processing=dict(self.config.image_processing),
+            dataset_split=dataset_split,
+        )
+        self.update_config(updated)
+
+
+def _validate_dataset_split(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise InvalidProjectError("dataset_split must be a mapping.")
+    seed = value.get("seed", 42)
+    validation_fraction = value.get("validation_fraction", 0.2)
+    assignments = value.get("assignments", {})
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise InvalidProjectError("dataset_split.seed must be a non-negative integer.")
+    if not isinstance(validation_fraction, (int, float)) or not (
+        0 <= float(validation_fraction) < 1
+    ):
+        raise InvalidProjectError(
+            "dataset_split.validation_fraction must be in [0, 1)."
+        )
+    if not isinstance(assignments, dict):
+        raise InvalidProjectError("dataset_split.assignments must be a mapping.")
+    normalized: dict[str, str] = {}
+    for sample_id, split in assignments.items():
+        if not isinstance(sample_id, str) or not sample_id:
+            raise InvalidProjectError("Split assignment sample IDs must be strings.")
+        if split not in {"train", "val"}:
+            raise InvalidProjectError(
+                f"Invalid split {split!r} for sample {sample_id!r}."
+            )
+        normalized[sample_id] = split
+    return {
+        "seed": seed,
+        "validation_fraction": float(validation_fraction),
+        "assignments": dict(sorted(normalized.items())),
+    }
 
 
 def _atomic_write_yaml(path: Path, value: dict[str, Any]) -> None:
