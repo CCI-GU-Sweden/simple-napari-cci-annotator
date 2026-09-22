@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import QUrl
+from qtpy.QtCore import Qt, QUrl
 from qtpy.QtGui import QDesktopServices
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -11,14 +11,15 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +44,42 @@ from ._tiled_inference import Detection, InferenceError, InferenceSettings
 from ._training import TrainingError, TrainingRun, TrainingSettings
 from ._training_worker import TrainingWorker
 from ._yolo_inference import YoloDetectionModel, available_devices
+
+
+class CollapsibleSection(QWidget):
+    """Compact titled section whose content can be collapsed in a dock widget."""
+
+    def __init__(self, title: str, content_layout, *, expanded: bool = True):
+        super().__init__()
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.toggle_button.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; "
+            "text-align: left; padding: 6px 2px; }"
+        )
+        self.content = QWidget()
+        self.content.setLayout(content_layout)
+        self.content.setVisible(expanded)
+        self.toggle_button.toggled.connect(self._set_expanded)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content)
+        self.setLayout(layout)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.toggle_button.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+        self.content.setVisible(expanded)
 
 
 class SimpleCciAnnotatorQWidget(QWidget):
@@ -267,7 +304,6 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._cancel_training_button = QPushButton("Cancel")
         self._cancel_training_button.clicked.connect(self._on_cancel_training)
 
-        project_group = QGroupBox("Project")
         project_buttons = QHBoxLayout()
         project_buttons.addWidget(self._new_project_button)
         project_buttons.addWidget(self._open_project_button)
@@ -275,9 +311,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         project_layout.addWidget(self._project_path_label)
         project_layout.addWidget(self._project_status_label)
         project_layout.addLayout(project_buttons)
-        project_group.setLayout(project_layout)
+        self._project_section = CollapsibleSection(
+            "Project", project_layout, expanded=True
+        )
 
-        annotation_group = QGroupBox("Image and YOLO bounding boxes")
         processing_form = QFormLayout()
         processing_form.addRow("Channel axis", self._channel_axis_combo)
         processing_form.addRow("Output red", self._red_channel_combo)
@@ -298,9 +335,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         annotation_layout.addWidget(self._label_status_label)
         annotation_layout.addLayout(annotation_buttons)
         annotation_layout.addWidget(self._validate_project_button)
-        annotation_group.setLayout(annotation_layout)
+        self._annotation_section = CollapsibleSection(
+            "Image and YOLO bounding boxes",
+            annotation_layout,
+            expanded=True,
+        )
 
-        inference_group = QGroupBox("Large-image tiled prediction")
         inference_form = QFormLayout()
         inference_form.addRow("Device", self._device_combo)
         inference_form.addRow("Confidence", self._confidence_spin)
@@ -320,9 +360,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         inference_layout.addLayout(inference_buttons)
         inference_layout.addWidget(self._inference_progress)
         inference_layout.addWidget(self._inference_status_label)
-        inference_group.setLayout(inference_layout)
+        self._inference_section = CollapsibleSection(
+            "Large-image tiled prediction",
+            inference_layout,
+            expanded=False,
+        )
 
-        retrain_group = QGroupBox("Dataset building and retraining")
         retrain_form = QFormLayout()
         retrain_form.addRow("Starting model", self._training_model_combo)
         destination_row = QHBoxLayout()
@@ -355,14 +398,29 @@ class SimpleCciAnnotatorQWidget(QWidget):
         retrain_layout.addLayout(training_buttons)
         retrain_layout.addWidget(self._training_progress)
         retrain_layout.addWidget(self._training_status_label)
-        retrain_group.setLayout(retrain_layout)
+        self._retrain_section = CollapsibleSection(
+            "Dataset building and retraining",
+            retrain_layout,
+            expanded=False,
+        )
 
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.addWidget(self._project_section)
+        content_layout.addWidget(self._annotation_section)
+        content_layout.addWidget(self._inference_section)
+        content_layout.addWidget(self._retrain_section)
+        content_layout.addStretch(1)
+        content = QWidget()
+        content.setLayout(content_layout)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self._scroll_area.setWidget(content)
         layout = QVBoxLayout()
-        layout.addWidget(project_group)
-        layout.addWidget(annotation_group)
-        layout.addWidget(inference_group)
-        layout.addWidget(retrain_group)
-        layout.addStretch(1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._scroll_area)
         self.setLayout(layout)
 
         self._connect_viewer_events()

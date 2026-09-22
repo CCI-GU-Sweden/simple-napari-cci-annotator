@@ -783,6 +783,25 @@ def test_widget_starts_with_disabled_model_controls(qtbot):
     assert not widget._save_annotation_button.isEnabled()
 
 
+def test_widget_sections_collapse_and_scroll(qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget.resize(420, 300)
+    widget.show()
+
+    assert widget._project_section.content.isVisible()
+    assert not widget._inference_section.content.isVisible()
+    assert not widget._retrain_section.content.isVisible()
+
+    widget._inference_section.toggle_button.setChecked(True)
+    widget._retrain_section.toggle_button.setChecked(True)
+    qtbot.wait(10)
+
+    assert widget._inference_section.content.isVisible()
+    assert widget._retrain_section.content.isVisible()
+    assert widget._scroll_area.verticalScrollBar().maximum() > 0
+
+
 def test_widget_new_project_and_automatic_bbox_loading(tmp_path, qtbot):
     project_root = tmp_path / "project"
     project_root.mkdir()
