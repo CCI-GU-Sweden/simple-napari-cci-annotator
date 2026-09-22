@@ -52,6 +52,7 @@ from ._training_crop import (
     crop_rectangles,
     crop_sample_id,
     extract_padded_crop,
+    invalid_crop_box_indices,
     validate_boxes_within_valid_crop,
 )
 from ._training_worker import TrainingWorker
@@ -132,7 +133,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_source_converted: ConvertedImage | None = None
         self._crop_source_visibility: list[tuple[object, bool]] = []
         self._crop_dirty = False
-        self._crop_rejected_count = 0
+        self._crop_discarded_count = 0
+        self._crop_invalid_indices: tuple[int, ...] = ()
         self._base_model_path = Path(__file__).resolve().parents[2] / "yolo26n.pt"
 
         self._project_path_label = QLabel("No project selected")
@@ -1021,10 +1023,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_class_counts(shapes)
         if shapes is self._crop_bbox_layer():
             self._crop_dirty = True
-            self._crop_status_label.setText(
+            message = (
                 f"Crop: assigned class {class_id} to {len(selected)} selected "
                 "box(es); changes are not saved."
             )
+            self._refresh_crop_validation(valid_message=message)
+            self._update_action_state()
         else:
             self._annotation_dirty = True
             self._label_status_label.setText(
@@ -1886,7 +1890,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_source_shapes_layer = self._annotation_layer()
         self._crop_source_converted = converted
         self._crop_bounds = bounds
-        self._crop_rejected_count = len(cropped.rejected_indices)
+        self._crop_discarded_count = len(cropped.discarded_indices)
         self._crop_dirty = True
         self._crop_source_visibility = []
         for layer in (image_layer, self._crop_source_shapes_layer, selection):
@@ -1907,15 +1911,17 @@ class SimpleCciAnnotatorQWidget(QWidget):
             if bounds.pad_bottom or bounds.pad_right
             else ""
         )
-        rejected = (
-            f" · {self._crop_rejected_count} severely cut box(es): saving blocked"
-            if self._crop_rejected_count
+        discarded = (
+            f" · {self._crop_discarded_count} sub-2-pixel remnant(s) ignored"
+            if self._crop_discarded_count
             else ""
         )
-        self._crop_status_label.setText(
+        ready_message = (
             f"Crop ready: {len(cropped.rectangles)} box(es), "
-            f"{cropped.clipped_count} safely clipped{padding}{rejected}."
+            f"{cropped.clipped_count} clipped at crop boundaries"
+            f"{padding}{discarded}."
         )
+        self._refresh_crop_validation(valid_message=ready_message)
         self._update_class_counts(crop_shapes)
         self._update_action_state()
 
@@ -1951,9 +1957,47 @@ class SimpleCciAnnotatorQWidget(QWidget):
         del event
         self._crop_dirty = True
         self._update_class_counts(self._crop_bbox_layer())
-        self._crop_status_label.setText(
-            "Crop: unsaved bbox edits. Add the crop or return and discard it."
+        self._refresh_crop_validation(
+            valid_message=(
+                "Crop: unsaved bbox edits. Add the crop or return and "
+                "discard it."
+            )
         )
+        self._update_action_state()
+
+    def _refresh_crop_validation(
+        self, *, valid_message: str | None = None
+    ) -> None:
+        crop_shapes = self._crop_bbox_layer()
+        if self._crop_bounds is None or crop_shapes is None:
+            self._crop_invalid_indices = ()
+            return
+        rectangles = tuple(
+            np.asarray(value, dtype=float) for value in crop_shapes.data
+        )
+        invalid = invalid_crop_box_indices(rectangles, self._crop_bounds)
+        self._crop_invalid_indices = invalid
+
+        face_colors = np.zeros((len(rectangles), 4), dtype=float)
+        if invalid:
+            face_colors[list(invalid)] = (1.0, 0.0, 0.0, 0.35)
+        try:
+            crop_shapes.face_color = (
+                face_colors if len(rectangles) else "transparent"
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        if invalid:
+            indices = ", ".join(str(index) for index in invalid)
+            self._crop_status_label.setText(
+                f"Crop invalid: {len(invalid)} red-filled box(es) are invalid "
+                "or extend outside valid source pixels / into padding (zero-based "
+                f"indices: {indices}). Move, resize, or delete them before "
+                "saving."
+            )
+        elif valid_message is not None:
+            self._crop_status_label.setText(valid_message)
 
     def _on_save_training_crop(self) -> None:
         self._save_training_crop(show_message=True)
@@ -1966,12 +2010,6 @@ class SimpleCciAnnotatorQWidget(QWidget):
             or self._crop_source_converted is None
         ):
             self._show_error("Create a training crop first.")
-            return False
-        if self._crop_rejected_count:
-            self._show_error(
-                f"This crop severely cuts {self._crop_rejected_count} source "
-                "box(es). Move the crop and refresh it before saving."
-            )
             return False
         crop_image_layer = self._get_layer_by_name(self.CROP_IMAGE_LAYER_NAME)
         crop_shapes = self._crop_bbox_layer()
@@ -2100,7 +2138,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_bounds = None
         self._crop_source_shapes_layer = None
         self._crop_source_visibility = []
-        self._crop_rejected_count = 0
+        self._crop_discarded_count = 0
+        self._crop_invalid_indices = ()
         self._crop_dirty = False
         self._update_class_counts()
 
@@ -2715,7 +2754,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._create_crop_button.setEnabled(
             has_project and has_crop_selection and not running
         )
-        self._save_crop_button.setEnabled(has_crop and not running)
+        self._save_crop_button.setEnabled(
+            has_crop and not self._crop_invalid_indices and not running
+        )
         self._return_crop_button.setEnabled(has_crop and not running)
         self._cancel_inference_button.setEnabled(inference_running)
         for control in (

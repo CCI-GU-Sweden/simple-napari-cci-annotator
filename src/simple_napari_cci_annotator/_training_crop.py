@@ -73,7 +73,7 @@ class CropBoxResult:
     rectangles: tuple[np.ndarray, ...]
     properties: dict[str, np.ndarray]
     clipped_count: int
-    rejected_indices: tuple[int, ...]
+    discarded_indices: tuple[int, ...]
     ignored_count: int
 
 
@@ -139,17 +139,15 @@ def crop_rectangles(
     properties: dict[str, np.ndarray],
     bounds: CropBounds,
     *,
-    min_retained_area: float = 0.90,
-    max_clip_pixels: float = 10.0,
-    max_clip_fraction: float = 0.10,
+    min_visible_pixels: float = 2.0,
 ) -> CropBoxResult:
-    """Translate boxes into a crop and reject severe artificial truncation."""
-    if not 0 < min_retained_area <= 1:
-        raise TrainingCropError("Minimum retained area must be within (0, 1].")
+    """Translate all meaningful bbox intersections into crop coordinates."""
+    if min_visible_pixels <= 0:
+        raise TrainingCropError("Minimum visible bbox size must be positive.")
     count = len(rectangles)
     accepted_rectangles: list[np.ndarray] = []
     accepted_indices: list[int] = []
-    rejected: list[int] = []
+    discarded: list[int] = []
     clipped_count = 0
     ignored_count = 0
     crop_x1 = bounds.x0 + bounds.valid_width
@@ -178,18 +176,14 @@ def crop_rectangles(
             continue
         clipped_width = clipped_x1 - clipped_x0
         clipped_height = clipped_y1 - clipped_y0
-        retained = clipped_width * clipped_height / (width * height)
         loss_x = width - clipped_width
         loss_y = height - clipped_height
-        allowed_x = min(max_clip_pixels, max_clip_fraction * width)
-        allowed_y = min(max_clip_pixels, max_clip_fraction * height)
         was_clipped = loss_x > 1e-6 or loss_y > 1e-6
-        if was_clipped and (
-            retained < min_retained_area
-            or loss_x > allowed_x + 1e-6
-            or loss_y > allowed_y + 1e-6
+        if (
+            clipped_width < min_visible_pixels
+            or clipped_height < min_visible_pixels
         ):
-            rejected.append(index)
+            discarded.append(index)
             continue
         if was_clipped:
             clipped_count += 1
@@ -215,7 +209,7 @@ def crop_rectangles(
         rectangles=tuple(accepted_rectangles),
         properties=accepted_properties,
         clipped_count=clipped_count,
-        rejected_indices=tuple(rejected),
+        discarded_indices=tuple(discarded),
         ignored_count=ignored_count,
     )
 
@@ -226,26 +220,45 @@ def validate_boxes_within_valid_crop(
     """Reject annotations that extend into synthetic crop padding."""
     errors: list[str] = []
     for index, raw_rectangle in enumerate(rectangles):
-        rectangle = np.asarray(raw_rectangle, dtype=float)
-        if rectangle.ndim != 2 or rectangle.shape[1] != 2 or len(rectangle) < 2:
-            errors.append(f"Box {index} is not a valid rectangle.")
-            continue
-        y0 = float(np.min(rectangle[:, 0]))
-        y1 = float(np.max(rectangle[:, 0]))
-        x0 = float(np.min(rectangle[:, 1]))
-        x1 = float(np.max(rectangle[:, 1]))
-        if (
-            x0 < -1e-6
-            or y0 < -1e-6
-            or x1 > bounds.valid_width + 1e-6
-            or y1 > bounds.valid_height + 1e-6
-        ):
-            errors.append(
-                f"Box {index} extends into padded pixels; move or resize it "
-                "inside the valid crop area."
-            )
+        error = _crop_box_error(raw_rectangle, bounds)
+        if error is not None:
+            errors.append(f"Box {index} {error}")
     if errors:
         raise TrainingCropError("\n".join(errors))
+
+
+def invalid_crop_box_indices(
+    rectangles: tuple[np.ndarray, ...], bounds: CropBounds
+) -> tuple[int, ...]:
+    """Return zero-based indices of boxes that cannot be saved in a crop."""
+    return tuple(
+        index
+        for index, rectangle in enumerate(rectangles)
+        if _crop_box_error(rectangle, bounds) is not None
+    )
+
+
+def _crop_box_error(raw_rectangle: np.ndarray, bounds: CropBounds) -> str | None:
+    rectangle = np.asarray(raw_rectangle, dtype=float)
+    if rectangle.ndim != 2 or rectangle.shape[1] != 2 or len(rectangle) < 2:
+        return "is not a valid rectangle."
+    if not np.all(np.isfinite(rectangle)):
+        return "contains non-finite coordinates."
+    y0 = float(np.min(rectangle[:, 0]))
+    y1 = float(np.max(rectangle[:, 0]))
+    x0 = float(np.min(rectangle[:, 1]))
+    x1 = float(np.max(rectangle[:, 1]))
+    if (
+        x0 < -1e-6
+        or y0 < -1e-6
+        or x1 > bounds.valid_width + 1e-6
+        or y1 > bounds.valid_height + 1e-6
+    ):
+        return (
+            "extends into padded pixels; move or resize it inside the valid "
+            "crop area."
+        )
+    return None
 
 
 def crop_sample_id(source_sample_id: str, bounds: CropBounds) -> str:

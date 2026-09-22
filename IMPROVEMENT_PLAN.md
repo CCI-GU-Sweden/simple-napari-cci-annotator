@@ -494,12 +494,16 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 **Status: completed in `0.6.0`.**
 
+`0.6.1` made manual-crop boundary clipping permissive: partial boxes remain labeled and no longer block saving, while automatic tiling retains its conservative clipping safeguards.
+
+`0.6.2` adds live crop validation: boxes extending into synthetic padding receive a translucent red face without changing their class-colored edge, the status identifies their zero-based indices, and **Add Crop + Corrections** remains disabled until they are corrected or removed. Save-time validation remains as a final safeguard.
+
 - Separate arbitrary-size inference sources from canonical training samples.
 - Add a movable, fixed 1024×1024 or 512×512 napari crop-selection rectangle centered on the current view.
 - Snap accidental selection resizing back to the project size and clamp its movable origin to source pixels.
 - Extract the locked RGB conversion without resizing and use constant value 114 only where the source image needs bottom/right padding.
 - Translate class/confidence/source-aware bbox properties into local crop coordinates.
-- Reuse the 90% retained-area and `min(10 px, 10%)` per-axis clipping tolerance; block saving when a crop severely truncates a source box.
+- For manually reviewed crops, clip and retain every meaningful bbox intersection regardless of retained fraction. Report boundary clipping without blocking the save; omit only remnants below 2 pixels on either axis. Keep the stricter 90%/10-pixel policy exclusively for automatic dataset tiling.
 - Reject boxes drawn into synthetic padding.
 - Save deterministic same-stem image/YOLO pairs using source sample ID plus crop origin and size, so saving the same crop updates it.
 - Record crop bounds, valid extent, padding, source path, Z/T plane, normalization, model, and inference settings in the audit event.

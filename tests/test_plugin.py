@@ -49,6 +49,7 @@ from simple_napari_cci_annotator._training_crop import (
     crop_rectangles,
     crop_sample_id,
     extract_padded_crop,
+    invalid_crop_box_indices,
     validate_boxes_within_valid_crop,
 )
 from simple_napari_cci_annotator._tiled_inference import (
@@ -65,7 +66,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.6.0"
+    assert simple_napari_cci_annotator.__version__ == "0.6.2"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -423,7 +424,7 @@ def test_training_crop_is_fixed_size_padded_and_coordinate_stable():
     )
 
 
-def test_training_crop_resnaps_and_blocks_boxes_in_padding_or_badly_cut():
+def test_training_crop_resnaps_clips_partial_boxes_and_blocks_padding():
     bounds = crop_bounds_from_rectangle(
         np.asarray([[10, 10], [10, 300], [200, 300], [200, 10]]),
         512,
@@ -437,11 +438,26 @@ def test_training_crop_resnaps_and_blocks_boxes_in_padding_or_badly_cut():
     result = crop_rectangles(
         (crossing,), {"class_id": np.asarray([0])}, bounds
     )
-    assert result.rejected_indices == (0,)
+    assert result.discarded_indices == ()
+    assert result.clipped_count == 1
+    np.testing.assert_allclose(
+        result.rectangles[0],
+        np.asarray([[100, 490], [100, 512], [160, 512], [160, 490]]),
+    )
+
+    tiny_remnant = np.asarray(
+        [[100, 511], [100, 540], [160, 540], [160, 511]], dtype=float
+    )
+    discarded = crop_rectangles(
+        (tiny_remnant,), {"class_id": np.asarray([0])}, bounds
+    )
+    assert discarded.discarded_indices == (0,)
+    assert discarded.rectangles == ()
 
     in_padding = np.asarray(
         [[280, 10], [280, 20], [320, 20], [320, 10]], dtype=float
     )
+    assert invalid_crop_box_indices((in_padding,), bounds) == (0,)
     with pytest.raises(TrainingCropError, match="padded pixels"):
         validate_boxes_within_valid_crop((in_padding,), bounds)
 
@@ -885,7 +901,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.6.0" in text
+    assert "plugin_version: 0.6.2" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
 
@@ -943,6 +959,7 @@ class _Shapes:
         self.current_properties = {}
         self.current_edge_color = None
         self.edge_color = kwargs.get("edge_color")
+        self.face_color = kwargs.get("face_color")
         self.selected_data = set()
         self.events = SimpleNamespace(data=_Signal())
         self.visible = True
@@ -1088,9 +1105,7 @@ def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
     source_path.touch()
     project = ProjectStore.initialize(root)
     viewer = _Viewer()
-    source = _Image(
-        np.zeros((600, 800, 3), dtype=np.uint8), path=source_path
-    )
+    source = _Image(np.zeros((300, 800, 3), dtype=np.uint8), path=source_path)
     viewer.layers.append(source)
     viewer.layers.selection.active = source
     widget = SimpleCciAnnotatorQWidget(viewer)
@@ -1099,14 +1114,15 @@ def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
     assert not widget._save_annotation_button.isEnabled()
     source_boxes = widget._annotation_layer()
     source_boxes.data = [
-        np.asarray([[100, 200], [100, 300], [200, 300], [200, 200]])
+        np.asarray([[100, 200], [100, 300], [200, 300], [200, 200]]),
+        np.asarray([[100, 630], [100, 750], [200, 750], [200, 630]]),
     ]
     source_boxes.properties = {
-        "class_id": np.asarray([0]),
-        "class_name": np.asarray(["LABEL"], dtype=object),
-        "confidence": np.asarray([0.8]),
-        "source": np.asarray(["prediction"], dtype=object),
-        "tile_id": np.asarray([1]),
+        "class_id": np.asarray([0, 0]),
+        "class_name": np.asarray(["LABEL", "LABEL"], dtype=object),
+        "confidence": np.asarray([0.8, 0.7]),
+        "source": np.asarray(["prediction", "prediction"], dtype=object),
+        "tile_id": np.asarray([1, 2]),
     }
     widget._patch_size_combo.setCurrentIndex(
         widget._patch_size_combo.findData(512)
@@ -1118,7 +1134,26 @@ def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
     crop_image = widget._get_layer_by_name(widget.CROP_IMAGE_LAYER_NAME)
     crop_boxes = widget._crop_bbox_layer()
     assert crop_image.data.shape == (512, 512, 3)
-    assert len(crop_boxes.data) == 1
+    assert len(crop_boxes.data) == 2
+    assert "1 clipped at crop boundaries" in widget._crop_status_label.text()
+    assert widget._save_crop_button.isEnabled()
+
+    valid_box = np.asarray(crop_boxes.data[0]).copy()
+    crop_boxes.data[0] = np.asarray(
+        [[280, 40], [280, 90], [320, 90], [320, 40]], dtype=float
+    )
+    widget._on_crop_shapes_changed()
+    assert widget._crop_invalid_indices == (0,)
+    assert not widget._save_crop_button.isEnabled()
+    np.testing.assert_allclose(crop_boxes.face_color[0], [1, 0, 0, 0.35])
+    np.testing.assert_allclose(crop_boxes.face_color[1], [0, 0, 0, 0])
+    assert "zero-based indices: 0" in widget._crop_status_label.text()
+
+    crop_boxes.data[0] = valid_box
+    widget._on_crop_shapes_changed()
+    assert widget._crop_invalid_indices == ()
+    assert widget._save_crop_button.isEnabled()
+    np.testing.assert_allclose(crop_boxes.face_color, np.zeros((2, 4)))
     assert widget._save_training_crop(show_message=False)
     assert project.config.training_patch == {
         "size": 512,

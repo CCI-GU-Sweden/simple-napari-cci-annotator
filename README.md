@@ -102,9 +102,9 @@ The crop workflow turns a local inference failure into one immediately retrainab
 3. Correct the local boxes, including their classes, and click **Add Crop + Corrections**. The image and YOLO label are stored with one deterministic stem such as `field__t000__z002__crop_y001024_x002048_s1024`. Saving the same source location again updates that pair instead of creating a duplicate.
 4. **Return to Source** restores the inference image and its boxes. The crop selection remains available to move to the next failure location.
 
-No crop is resized. When the source runs out at its bottom or right edge, missing pixels are filled with RGB value `114`; the audit record stores the source bounds, valid extent, and padding. Boxes are forbidden in padded pixels.
+No crop is resized. When the source runs out at its bottom or right edge, missing pixels are filled with RGB value `114`; the audit record stores the source bounds, valid extent, and padding. Boxes are forbidden in padded pixels. Any edited box that enters padding is shown with a translucent red face while its class-colored edge remains unchanged; **Add Crop + Corrections** stays disabled until every red box is moved, resized, or deleted. Save-time validation repeats the same check as a final safeguard.
 
-Fully contained boxes are copied directly. Artificial crop clipping is accepted only when at least 90% of the bbox remains and neither axis loses more than `min(10 px, 10% of that bbox dimension)`. A more severely cut source box blocks saving so the user can move the crop. Boxes entirely outside the crop are ignored.
+Fully contained boxes are copied directly. Every bbox intersecting a manually reviewed crop is clipped to the crop boundary and retained as a valid YOLO annotation, even when only part of the object is visible. Boundary clipping is reported but never blocks saving. Only degenerate remnants narrower or shorter than 2 pixels are omitted with a warning; boxes entirely outside the crop are ignored. This permissive manual-crop policy is intentionally separate from the stricter clipping policy used by automatic dataset tiling.
 
 The project stores this immutable contract in `project.yaml`:
 
