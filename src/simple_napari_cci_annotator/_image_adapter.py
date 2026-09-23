@@ -178,6 +178,7 @@ class ConvertedImage:
     plane: PlaneSelection
     settings: ImageProcessingSettings
     normalization_stats: tuple[dict[str, float | str | None], ...]
+    inverted: bool = False
 
 
 class ImageAdapter:
@@ -299,6 +300,7 @@ class ImageAdapter:
         settings: ImageProcessingSettings,
         *,
         base_stem: str | None = None,
+        invert: bool = False,
     ) -> ConvertedImage:
         shape = _shape_of(image_layer.data)
         plane = self.plane_selection(image_layer, viewer, settings)
@@ -325,6 +327,8 @@ class ImageAdapter:
                 lower=settings.lower,
                 upper=settings.upper,
             )
+            if invert:
+                converted = np.asarray(255 - converted, dtype=np.uint8)
             stats["filter_method"] = settings.filter_method
             stats["filter_radius"] = settings.filter_radius
             normalized.append(converted)
@@ -338,6 +342,7 @@ class ImageAdapter:
             plane=plane,
             settings=settings,
             normalization_stats=tuple(statistics),
+            inverted=bool(invert),
         )
 
     def _extract_channels(

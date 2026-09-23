@@ -234,6 +234,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._filter_radius_spin.valueChanged.connect(
             self._on_processing_value_changed
         )
+        self._invert_checkbox = QCheckBox("Invert intensities for this image")
+        self._invert_checkbox.setToolTip(
+            "Invert each normalized selected channel (255 − value). This is a "
+            "per-image override and remains editable after project settings lock."
+        )
+        self._invert_checkbox.toggled.connect(self._on_processing_value_changed)
 
         self._normalization_combo = QComboBox()
         self._normalization_combo.setToolTip(
@@ -587,6 +593,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         processing_form.addRow("Output blue", self._blue_channel_combo)
         processing_form.addRow("Pre-filter", self._filter_combo)
         processing_form.addRow("Filter radius", self._filter_radius_spin)
+        processing_form.addRow(self._invert_checkbox)
         processing_form.addRow("Normalization", self._normalization_combo)
         processing_form.addRow(self._lower_parameter_label, self._lower_value_spin)
         processing_form.addRow(self._upper_parameter_label, self._upper_value_spin)
@@ -1786,6 +1793,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             raise SegmentationError("; ".join(self._segmentation_errors))
         conversion_metadata = {
             "settings": converted.settings.to_mapping(),
+            "inverted": converted.inverted,
             "plane_indices": converted.plane.non_spatial_indices,
             "axis_labels": list(converted.plane.axis_labels),
             "normalization_stats": list(converted.normalization_stats),
@@ -1841,6 +1849,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         class_ids = self._class_ids(shapes_layer, len(rectangles))
         conversion_metadata = {
             "settings": converted.settings.to_mapping(),
+            "inverted": converted.inverted,
             "plane_indices": converted.plane.non_spatial_indices,
             "axis_labels": list(converted.plane.axis_labels),
             "normalization_stats": list(converted.normalization_stats),
@@ -1854,6 +1863,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             current_prediction = conversion_metadata["prediction"]
             conversion_metadata = dict(prior_conversion)
             conversion_metadata["settings"] = converted.settings.to_mapping()
+            conversion_metadata.setdefault("inverted", converted.inverted)
             conversion_metadata.setdefault(
                 "plane_indices", converted.plane.non_spatial_indices
             )
@@ -2469,6 +2479,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 ),
                 settings=settings,
                 normalization_stats=statistics,
+                inverted=bool(
+                    conversion.get("inverted", False)
+                    if isinstance(conversion, dict)
+                    else False
+                ),
             )
             self._converted_image = converted
             self._current_sample_id = sample_id
@@ -2489,11 +2504,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self.napari_viewer,
             settings,
             base_stem=base_stem,
+            invert=self._invert_checkbox.isChecked(),
         )
         self._converted_image = converted
         self._current_sample_id = converted.sample_id
         self._plane_status_label.setText(
-            f"Current sample: {converted.sample_id} · output {converted.data.shape} uint8"
+            f"Current sample: {converted.sample_id} · output {converted.data.shape} "
+            f"uint8{' · inverted' if converted.inverted else ''}"
         )
         return converted
 
@@ -2521,7 +2538,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
             preview.metadata["cci_rgb_preview"] = True
         self._label_status_label.setText(
             f"RGB preview updated for {converted.sample_id}. "
-            "Saving will use exactly this conversion."
+            f"Saving will use exactly this conversion"
+            f"{' with inversion' if converted.inverted else ''}."
         )
 
     def _update_plane_status(self, image_layer) -> None:
@@ -2906,6 +2924,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 class_ids=class_ids,
                 conversion_metadata={
                     "settings": self._crop_source_converted.settings.to_mapping(),
+                    "inverted": self._crop_source_converted.inverted,
                     "plane_indices": (
                         self._crop_source_converted.plane.non_spatial_indices
                     ),
@@ -3962,6 +3981,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             has_project
             and has_image
             and self._locked_processing_settings is None
+            and not running
+            and not has_crop
+        )
+        self._invert_checkbox.setEnabled(
+            has_project
+            and self._is_source_image_layer(image_layer)
             and not running
             and not has_crop
         )

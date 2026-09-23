@@ -71,7 +71,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.8.2"
+    assert simple_napari_cci_annotator.__version__ == "0.8.3"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -388,6 +388,36 @@ def test_filter_is_applied_per_channel_before_normalization():
     assert np.all(converted.data[..., 2] == 0)
     assert converted.normalization_stats[0]["filter_method"] == "mean"
     assert converted.normalization_stats[0]["filter_radius"] == 1
+
+
+def test_inversion_happens_after_normalization_and_preserves_empty_channels():
+    data = np.asarray([[[0, 10], [5, 10]]], dtype=np.uint16)
+    layer = SimpleNamespace(
+        data=data,
+        name="inverted",
+        metadata={"axes": "CYX"},
+        axis_labels=(),
+        rgb=False,
+    )
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0, 0)))
+    settings = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=None,
+        blue_channel=None,
+        normalization="fixed_range",
+        lower=0,
+        upper=10,
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings, invert=True)
+
+    np.testing.assert_array_equal(
+        converted.data[..., 0], np.asarray([[255, 0], [127, 0]], dtype=np.uint8)
+    )
+    assert np.all(converted.data[..., 1:] == 0)
+    assert converted.inverted
+    assert "inverted" not in settings.to_mapping()
 
 
 def test_multidimensional_current_tz_plane_and_channel_mapping():
@@ -1078,7 +1108,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.8.2" in text
+    assert "plugin_version: 0.8.3" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1219,6 +1249,7 @@ def test_parameter_controls_have_tooltips(qtbot):
         widget._normalization_combo,
         widget._filter_combo,
         widget._filter_radius_spin,
+        widget._invert_checkbox,
         widget._confidence_spin,
         widget._model_iou_spin,
         widget._merge_iou_spin,
@@ -1330,6 +1361,14 @@ def test_locked_project_normalization_is_authoritative_for_inference_input(
     assert converted.settings.normalization == "min_max"
     assert converted.settings.filter_method == "none"
     assert converted.settings.filter_radius == 1
+    assert widget._invert_checkbox.isEnabled()
+
+    widget._invert_checkbox.setChecked(True)
+    inverted = widget._convert_current_image(source)
+    assert inverted.inverted
+    np.testing.assert_array_equal(
+        inverted.data[..., 0], np.asarray([[255, 170], [85, 0]])
+    )
     np.testing.assert_array_equal(
         converted.data[..., 0], np.asarray([[0, 85], [170, 255]])
     )
@@ -1515,6 +1554,7 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     assert labels is not None
     assert labels.data.dtype == np.uint32
 
+    widget._invert_checkbox.setChecked(True)
     widget._on_new_mask_instance()
     instance_id = labels.selected_label
     data = labels.data.copy()
@@ -1526,6 +1566,10 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
 
     assert (project.paths.masks / "sample.tif").is_file()
     assert (project.paths.instances / "sample.json").is_file()
+    metadata = json.loads(
+        (project.paths.instances / "sample.json").read_text(encoding="utf-8")
+    )
+    assert metadata["conversion"]["inverted"] is True
     widget._load_annotations_for_image(image, force=True)
     reloaded = widget._segmentation_layer()
     assert int(reloaded.data[12, 32]) == instance_id
