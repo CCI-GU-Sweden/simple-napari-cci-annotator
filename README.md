@@ -87,7 +87,9 @@ Use **Edit Classes** to rename that class or append more classes. Class IDs are 
 
 Every shape stores `class_id` and `class_name`. The current-class selector sets the class and stable display color for newly drawn boxes. **Apply Class to Selected** reclassifies only the selected boxes, marks them as manual corrections, and clears stale prediction confidence. Live per-class counts are shown beside the annotation controls. Saving still writes standard five-column YOLO rows, so no custom conversion is required for retraining.
 
-The **Review saved annotations** section lists every canonical image/label pair and provides **Previous**, **Load Selected**, and **Next** navigation. Invalid stored pairs receive a warning marker and an explanation instead of being loaded silently. During editing, malformed boxes or boxes extending outside the image receive a translucent red face while retaining their class-colored edge; saving is disabled until every red box is corrected or deleted.
+The **Review saved annotations** section lists every canonical image/label pair and provides **Previous**, **Load Selected**, **Next**, and **Save Corrections** controls in one place. **Save Corrections** uses the same atomic image/YOLO update path as the main annotation section. Invalid stored pairs receive a warning marker and an explanation instead of being loaded silently. During editing, malformed boxes or boxes extending outside the image receive a translucent red face while retaining their class-colored edge; both save buttons are disabled until every red box is corrected or deleted.
+
+Short tooltips on the image-processing, prediction, crop, review, split, and retraining controls explain what each parameter changes and highlight important speed, memory, and validation tradeoffs.
 
 ## Large-image prediction and merging
 

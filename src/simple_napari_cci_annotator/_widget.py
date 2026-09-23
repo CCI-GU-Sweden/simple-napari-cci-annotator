@@ -205,6 +205,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         for spin in (self._lower_value_spin, self._upper_value_spin):
             spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
             spin.setDecimals(4)
+            spin.setToolTip(
+                "Lower/upper limits used by percentile, Z-score, or fixed-range "
+                "normalization."
+            )
         self._lower_value_spin.setValue(1.0)
         self._upper_value_spin.setValue(99.0)
         self._lower_value_spin.valueChanged.connect(self._on_processing_value_changed)
@@ -251,17 +255,35 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Saved project annotations. A warning prefix marks an invalid pair."
         )
         self._review_refresh_button = QPushButton("Refresh")
+        self._review_refresh_button.setToolTip(
+            "Rescan the project's canonical annotation image/label pairs."
+        )
         self._review_refresh_button.clicked.connect(self._refresh_annotation_browser)
         self._review_previous_button = QPushButton("Previous")
+        self._review_previous_button.setToolTip(
+            "Load the previous saved annotation, prompting first if edits are unsaved."
+        )
         self._review_previous_button.clicked.connect(
             lambda: self._navigate_annotation(-1)
         )
         self._review_load_button = QPushButton("Load Selected")
+        self._review_load_button.setToolTip(
+            "Open the selected canonical image and its YOLO boxes for correction."
+        )
         self._review_load_button.clicked.connect(self._on_load_review_annotation)
         self._review_next_button = QPushButton("Next")
+        self._review_next_button.setToolTip(
+            "Load the next saved annotation, prompting first if edits are unsaved."
+        )
         self._review_next_button.clicked.connect(
             lambda: self._navigate_annotation(1)
         )
+        self._review_save_button = QPushButton("Save Corrections")
+        self._review_save_button.setToolTip(
+            "Update the loaded canonical image and YOLO bbox file using the "
+            "current corrected layer."
+        )
+        self._review_save_button.clicked.connect(self._on_save_annotation)
         self._review_status_label = QLabel(
             "Review: open a project to browse saved annotations."
         )
@@ -275,23 +297,45 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._choose_model_button.clicked.connect(self._on_choose_model)
 
         self._device_combo = QComboBox()
+        self._device_combo.setToolTip(
+            "Processor used for prediction. GPU is normally faster when available."
+        )
         for label, value in available_devices():
             self._device_combo.addItem(label, value)
         self._confidence_spin = self._fraction_spin(0.25)
+        self._confidence_spin.setToolTip(
+            "Minimum model confidence retained as a candidate detection."
+        )
         self._model_iou_spin = self._fraction_spin(0.45)
+        self._model_iou_spin.setToolTip(
+            "YOLO's per-tile NMS threshold. Lower values suppress more overlapping boxes."
+        )
         self._merge_iou_spin = self._fraction_spin(0.50)
+        self._merge_iou_spin.setToolTip(
+            "Global NMS threshold used to merge duplicate detections from overlapping tiles."
+        )
         self._tile_size_spin = QSpinBox()
         self._tile_size_spin.setRange(64, 8192)
         self._tile_size_spin.setSingleStep(64)
         self._tile_size_spin.setValue(1024)
+        self._tile_size_spin.setToolTip(
+            "Square prediction tile size in pixels. Larger tiles use more memory."
+        )
         self._overlap_percent_spin = QDoubleSpinBox()
         self._overlap_percent_spin.setRange(0.0, 90.0)
         self._overlap_percent_spin.setDecimals(1)
         self._overlap_percent_spin.setSuffix(" %")
         self._overlap_percent_spin.setValue(20.0)
+        self._overlap_percent_spin.setToolTip(
+            "Overlap between prediction tiles. More overlap reduces seam failures but "
+            "increases inference time."
+        )
         self._max_detections_spin = QSpinBox()
         self._max_detections_spin.setRange(1, 100_000)
         self._max_detections_spin.setValue(300)
+        self._max_detections_spin.setToolTip(
+            "Maximum detections YOLO may return from one prediction tile."
+        )
         self._predict_button = QPushButton("Predict Current RGB Plane")
         self._predict_button.clicked.connect(self._on_predict)
         self._cancel_inference_button = QPushButton("Cancel")
@@ -305,6 +349,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._patch_size_combo = QComboBox()
         self._patch_size_combo.addItem("1024 × 1024", 1024)
         self._patch_size_combo.addItem("512 × 512", 512)
+        self._patch_size_combo.setToolTip(
+            "Fixed size of every canonical training sample. It locks after the "
+            "first sample is saved."
+        )
         self._patch_size_combo.currentIndexChanged.connect(
             self._on_patch_size_changed
         )
@@ -326,9 +374,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_status_label.setWordWrap(True)
 
         self._training_model_combo = QComboBox()
+        self._training_model_combo.setToolTip(
+            "Checkpoint used to initialize retraining: the naive base model or a "
+            "previous fine-tuned project model."
+        )
         self._destination_input = QLineEdit()
         self._destination_input.setPlaceholderText(
             "Project root (default), or choose another output parent"
+        )
+        self._destination_input.setToolTip(
+            "Parent folder where a new immutable retrain_<date>_<time> run is created."
         )
         self._destination_button = QPushButton("Choose Destination")
         self._destination_button.clicked.connect(self._on_choose_destination)
@@ -336,20 +391,36 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._group_field_input.setPlaceholderText(
             "Optional audit field, e.g. metadata.patient"
         )
+        self._group_field_input.setToolTip(
+            "Optional audit field used to keep related samples in the same split, "
+            "for example metadata.patient."
+        )
         self._validation_fraction_spin = self._fraction_spin(0.20)
         self._validation_fraction_spin.setRange(0.05, 0.50)
+        self._validation_fraction_spin.setToolTip(
+            "Fraction of independent source groups reserved for validation."
+        )
         self._seed_spin = QSpinBox()
         self._seed_spin.setRange(0, 2_147_483_647)
         self._seed_spin.setValue(42)
+        self._seed_spin.setToolTip(
+            "Seed used for deterministic train/validation assignment and training."
+        )
         self._training_tile_size_spin = QSpinBox()
         self._training_tile_size_spin.setRange(64, 8192)
         self._training_tile_size_spin.setSingleStep(64)
         self._training_tile_size_spin.setValue(1024)
+        self._training_tile_size_spin.setToolTip(
+            "Locked project training size. Change it only before saving the first sample."
+        )
         self._training_overlap_spin = QDoubleSpinBox()
         self._training_overlap_spin.setRange(0.0, 90.0)
         self._training_overlap_spin.setDecimals(1)
         self._training_overlap_spin.setSuffix(" %")
         self._training_overlap_spin.setValue(20.0)
+        self._training_overlap_spin.setToolTip(
+            "Overlap used when deriving training tiles from canonical images."
+        )
         self._negative_ratio_spin = QDoubleSpinBox()
         self._negative_ratio_spin.setRange(0.0, 10.0)
         self._negative_ratio_spin.setDecimals(2)
@@ -361,18 +432,34 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._epochs_spin = QSpinBox()
         self._epochs_spin.setRange(1, 100_000)
         self._epochs_spin.setValue(100)
+        self._epochs_spin.setToolTip(
+            "Maximum complete passes through the training dataset."
+        )
         self._batch_spin = QSpinBox()
         self._batch_spin.setRange(-1, 4096)
         self._batch_spin.setSpecialValueText("Auto")
         self._batch_spin.setValue(-1)
+        self._batch_spin.setToolTip(
+            "Images per optimization step. Auto lets Ultralytics choose based on memory."
+        )
         self._patience_spin = QSpinBox()
         self._patience_spin.setRange(0, 100_000)
         self._patience_spin.setValue(30)
+        self._patience_spin.setToolTip(
+            "Epochs without validation improvement before early stopping; 0 disables it."
+        )
         self._training_device_combo = QComboBox()
+        self._training_device_combo.setToolTip(
+            "Processor used for retraining. GPU is normally much faster when available."
+        )
         for label, value in available_devices():
             self._training_device_combo.addItem(label, value)
         self._train_only_checkbox = QCheckBox(
             "Train without independent validation (exploratory)"
+        )
+        self._train_only_checkbox.setToolTip(
+            "Allow training with too few independent groups for validation. The result "
+            "cannot measure generalization."
         )
         self._train_only_checkbox.toggled.connect(self._on_train_only_toggled)
         self._train_only_warning = QLabel(
@@ -451,6 +538,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         review_buttons.addWidget(self._review_previous_button)
         review_buttons.addWidget(self._review_load_button)
         review_buttons.addWidget(self._review_next_button)
+        review_buttons.addWidget(self._review_save_button)
         review_layout = QVBoxLayout()
         review_layout.addLayout(review_top)
         review_layout.addLayout(review_buttons)
@@ -3039,7 +3127,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._reload_labels_button.setEnabled(
             has_project and has_image and not running and not has_crop
         )
-        self._save_annotation_button.setEnabled(
+        can_save_annotation = (
             has_project
             and has_image
             and has_shapes
@@ -3048,6 +3136,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and not running
             and not has_crop
         )
+        self._save_annotation_button.setEnabled(can_save_annotation)
         self._validate_project_button.setEnabled(has_project and not running)
         self._preview_button.setEnabled(
             has_project and has_image and not running and not has_crop
@@ -3089,6 +3178,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
             )
         self._review_refresh_button.setEnabled(
             has_project and not running and not has_crop
+        )
+        self._review_save_button.setEnabled(
+            can_save_annotation
+            and self._is_annotation_review_image(image_layer)
         )
         self._cancel_inference_button.setEnabled(inference_running)
         for control in (

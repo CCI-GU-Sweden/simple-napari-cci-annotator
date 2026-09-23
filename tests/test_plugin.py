@@ -70,7 +70,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.7.0"
+    assert simple_napari_cci_annotator.__version__ == "0.7.1"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -987,7 +987,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.7.0" in text
+    assert "plugin_version: 0.7.1" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1098,6 +1098,27 @@ def test_widget_starts_with_disabled_model_controls(qtbot):
     assert not widget._choose_model_button.isEnabled()
     assert not widget._predict_button.isEnabled()
     assert not widget._save_annotation_button.isEnabled()
+
+
+def test_parameter_controls_have_tooltips(qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+
+    controls = (
+        widget._normalization_combo,
+        widget._confidence_spin,
+        widget._model_iou_spin,
+        widget._merge_iou_spin,
+        widget._tile_size_spin,
+        widget._overlap_percent_spin,
+        widget._patch_size_combo,
+        widget._training_model_combo,
+        widget._validation_fraction_spin,
+        widget._epochs_spin,
+        widget._batch_spin,
+        widget._training_device_combo,
+    )
+    assert all(control.toolTip().strip() for control in controls)
 
 
 def test_widget_sections_collapse_and_scroll(qtbot):
@@ -1262,6 +1283,7 @@ def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbo
     assert shapes is not None
     assert len(shapes.data) == 1
     assert widget._save_annotation_button.isEnabled()
+    assert widget._review_save_button.isEnabled()
 
     valid = np.asarray(shapes.data[0]).copy()
     shapes.data[0] = np.asarray(
@@ -1270,6 +1292,7 @@ def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbo
     widget._on_shapes_data_changed()
     assert widget._annotation_invalid_indices == (0,)
     assert not widget._save_annotation_button.isEnabled()
+    assert not widget._review_save_button.isEnabled()
     np.testing.assert_allclose(shapes.face_color[0], [1, 0, 0, 0.35])
     assert "zero-based indices: 0" in widget._label_status_label.text()
 
@@ -1277,6 +1300,16 @@ def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbo
     widget._on_shapes_data_changed()
     assert widget._annotation_invalid_indices == ()
     assert widget._save_annotation_button.isEnabled()
+    assert widget._review_save_button.isEnabled()
+
+    shapes.data[0] = np.asarray(
+        [[20, 20], [20, 50], [50, 50], [50, 20]], dtype=float
+    )
+    widget._on_shapes_data_changed()
+    with patch.object(widget, "_show_info"):
+        widget._review_save_button.click()
+    assert not widget._annotation_dirty
+    assert "updated" in widget._label_status_label.text()
 
 
 def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):

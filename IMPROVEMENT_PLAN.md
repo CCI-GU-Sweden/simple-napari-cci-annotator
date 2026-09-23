@@ -490,6 +490,8 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 `0.7.0` also makes locked project normalization directly authoritative for inference, validates canonical training-image conversion provenance before dataset construction, highlights live out-of-bounds boxes, and atomically copies a successful run's `best.pt` to `models/<retrain-folder-name>.pt`.
 
+`0.7.1` keeps review actions together with a dedicated **Save Corrections** button and begins the parameter-help pass with concise tooltips across image conversion, inference, crops, dataset splitting, and retraining.
+
 **Exit criteria:** multi-class detection works without changing storage or training architecture, and users can compare successive retrain runs.
 
 ### Phase 6 — Movable fixed-size bbox failure crops
