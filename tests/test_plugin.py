@@ -25,8 +25,9 @@ from simple_napari_cci_annotator import (
     TrainingSettings,
     create_tile_plan,
 )
-from simple_napari_cci_annotator import _widget as widget_module
+from simple_napari_cci_annotator import _project_store as project_store_module
 from simple_napari_cci_annotator import _training as training_module
+from simple_napari_cci_annotator import _widget as widget_module
 from simple_napari_cci_annotator._annotation_io import (
     AnnotationError,
     LabelValidationError,
@@ -85,6 +86,8 @@ def test_initialize_and_reopen_project(tmp_path):
 
     assert project.paths.config.is_file()
     assert project.paths.models.is_dir()
+    assert (project.paths.models / "yolo26n.pt").is_file()
+    assert not (project.paths.models / "yolo26n-seg.pt").exists()
     assert project.paths.images.is_dir()
     assert project.paths.labels.is_dir()
     assert project.paths.audit.is_file()
@@ -115,6 +118,20 @@ def test_initialize_requires_empty_folder(tmp_path):
         ProjectStore.initialize(root)
 
     assert (root / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_initialize_rolls_back_starter_model_if_config_write_fails(tmp_path):
+    root = tmp_path / "rolled-back-project"
+    with patch.object(
+        project_store_module,
+        "_atomic_write_yaml",
+        side_effect=OSError("simulated config failure"),
+    ):
+        with pytest.raises(OSError, match="simulated config failure"):
+            ProjectStore.initialize(root)
+
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
 
 
 def test_project_class_map_can_grow_and_rename_but_not_orphan_labels(tmp_path):

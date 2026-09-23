@@ -70,6 +70,8 @@ def test_segment_project_contract_and_uint32_round_trip(tmp_path):
     assert project.config.task == "segment"
     assert project.paths.masks.is_dir()
     assert project.paths.instances.is_dir()
+    assert (project.paths.models / "yolo26n-seg.pt").is_file()
+    assert not (project.paths.models / "yolo26n.pt").exists()
 
     image = np.zeros((8, 8, 3), dtype=np.uint8)
     mask = np.zeros((8, 8), dtype=np.uint32)

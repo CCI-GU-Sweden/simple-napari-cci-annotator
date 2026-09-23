@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,10 @@ import yaml
 PROJECT_FILENAME = "project.yaml"
 PROJECT_SCHEMA_VERSION = 1
 PROJECT_TASKS = {"detect", "segment"}
+STARTER_MODELS = {
+    "detect": "yolo26n.pt",
+    "segment": "yolo26n-seg.pt",
+}
 
 
 class ProjectError(RuntimeError):
@@ -232,6 +238,7 @@ class ProjectStore:
         )
 
         created_directories: list[Path] = []
+        created_files: list[Path] = []
         try:
             for directory in (
                 paths.models,
@@ -243,11 +250,16 @@ class ProjectStore:
             ):
                 directory.mkdir(parents=True, exist_ok=True)
                 created_directories.append(directory)
+            starter_model = paths.models / STARTER_MODELS[task]
+            _copy_packaged_starter_model(task, starter_model)
+            created_files.append(starter_model)
             paths.audit.touch(exist_ok=False)
+            created_files.append(paths.audit)
             _atomic_write_yaml(paths.config, config.to_mapping())
+            created_files.append(paths.config)
         except Exception:  # noqa: BLE001 - initialization cleanup must always run
-            if paths.audit.exists():
-                paths.audit.unlink()
+            for path in reversed(created_files):
+                path.unlink(missing_ok=True)
             for directory in reversed(created_directories):
                 try:
                     directory.rmdir()
@@ -507,6 +519,46 @@ def _used_instance_class_ids(instances_path: Path) -> set[int]:
                 f"Could not inspect segmentation metadata {metadata_path.name}: {exc}"
             ) from exc
     return used
+
+
+def _copy_packaged_starter_model(task: str, destination: Path) -> None:
+    """Atomically copy the task-compatible checkpoint from package resources."""
+    try:
+        filename = STARTER_MODELS[task]
+    except KeyError as exc:
+        raise ProjectConflictError(
+            f"No starter model is defined for task {task!r}."
+        ) from exc
+    resource = resources.files("simple_napari_cci_annotator").joinpath(
+        "models", filename
+    )
+    temporary: Path | None = None
+    try:
+        if not resource.is_file():
+            raise ProjectConflictError(
+                f"The installed package is missing starter model {filename!r}."
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as output, resource.open("rb") as source:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    except ProjectConflictError:
+        raise
+    except OSError as exc:
+        raise ProjectConflictError(
+            f"Could not install starter model {filename!r}: {exc}"
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _validate_dataset_split(value: Any) -> dict[str, Any]:

@@ -10,7 +10,7 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 ## Current workflow
 
 1. Open the plugin in napari.
-2. Select **Bounding-box detection** or **Instance segmentation**, then click **New Project** and select an empty folder. A project's task is fixed. Use **Open Project** to reopen one.
+2. Select **Bounding-box detection** or **Instance segmentation**, then click **New Project** and select an empty folder. A project's task is fixed, and its packaged starter checkpoint is copied into `models/` automatically. Use **Open Project** to reopen one.
 3. Use **Edit Classes** to append or rename project classes when needed.
 4. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
 5. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
@@ -24,7 +24,7 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 13. Click **Return to Source**, move the selection to another failure, and repeat. The full-size inference image is not added to the training pool.
 14. Use **Validate Project** to check image/label pairing, fixed image dimensions, and label contents.
 15. Use **Review saved annotations** to load previous/next project pairs, make corrections, and save the updated annotation.
-16. In **Dataset building and retraining**, choose the base `yolo26n.pt`, a model in the project, or the currently loaded fine-tuned model, preview the stable split, then start retraining.
+16. In **Dataset building and retraining**, choose the copied starter model, another model in the project, or the currently loaded fine-tuned model, preview the stable split, then start retraining.
 17. When training finishes, explicitly keep the current model, load the promoted model, or open the immutable run folder.
 
 Automatic label discovery checks, in order:
@@ -41,7 +41,9 @@ Selecting an empty folder with **New Project** initializes:
 project/
 ├── project.yaml
 ├── models/
-│   └── retrain_YYYYMMDD_HHMMSS.pt
+│   ├── yolo26n.pt                  # detection project, or
+│   ├── yolo26n-seg.pt              # segmentation project
+│   └── retrain_YYYYMMDD_HHMMSS.pt  # after successful retraining
 └── annotations/
     ├── images/
     ├── labels/
@@ -172,7 +174,7 @@ Then enter one grouping level in the GUI—for example `metadata.patient`. Every
 
 Metadata records are merged per sample in append order. A later metadata record can update one field without repeating the others, and later annotation saves do not erase previously appended metadata. Keep `sample_id` spelling exact. Malformed JSON lines are ignored, so validate the dataset after editing. When **Group metadata** is left empty, the plugin groups by the original audited `source_path`, falling back to the canonical sample ID when no source path is available.
 
-The **Starting model** control offers the task-compatible repository-root base (`yolo26n.pt` for detection or `yolo26n-seg.pt` for segmentation), every `.pt` checkpoint in the project's `models/` folder, and a compatible externally loaded model. The segmentation base is deliberately not substituted with detection weights: if `yolo26n-seg.pt` is absent, load a compatible segmentation checkpoint first. This choice affects only the new run; successful training never silently replaces the prediction model.
+The wheel contains both starter checkpoints. **New Project** copies only the task-compatible one into the project: `models/yolo26n.pt` for detection or `models/yolo26n-seg.pt` for segmentation. The **Starting model** control offers that starter, every other `.pt` checkpoint in the project's `models/` folder, and a compatible externally loaded model. Detection and segmentation weights are never substituted for each other. This choice affects only the new run; successful training never silently replaces the prediction model.
 
 Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Each canonical image already matches the locked project patch size, so it becomes one training item without resizing or further spatial subdivision. The dataset validator rejects mismatched dimensions. Reviewed-negative crops remain first-class empty-label samples.
 

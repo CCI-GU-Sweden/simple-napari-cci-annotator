@@ -177,11 +177,6 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_dirty = False
         self._crop_discarded_count = 0
         self._crop_invalid_indices: tuple[int, ...] = ()
-        self._base_model_path = Path(__file__).resolve().parents[2] / "yolo26n.pt"
-        self._base_segmentation_model_path = (
-            Path(__file__).resolve().parents[2] / "yolo26n-seg.pt"
-        )
-
         self._project_path_label = QLabel("No project selected")
         self._project_path_label.setWordWrap(True)
         self._project_status_label = QLabel(
@@ -3875,17 +3870,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         previous = preferred or self._training_model_combo.currentData()
         self._training_model_combo.clear()
         added: set[Path] = set()
-        base_model = (
-            self._base_segmentation_model_path
-            if self._project is not None and self._project.config.task == "segment"
-            else self._base_model_path
-        )
-        if base_model.is_file():
-            self._training_model_combo.addItem(
-                f"Base · {base_model.name}", str(base_model)
-            )
-            added.add(base_model.resolve())
         if self._project is not None:
+            starter_name = (
+                "yolo26n-seg.pt"
+                if self._project.config.task == "segment"
+                else "yolo26n.pt"
+            )
             for path in sorted(
                 self._project.paths.models.glob("*.pt"), reverse=True
             ):
@@ -3893,7 +3883,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 if resolved in added:
                     continue
                 self._training_model_combo.addItem(
-                    f"Project · {path.name}", str(path)
+                    f"{'Starter' if path.name == starter_name else 'Project'} · {path.name}",
+                    str(path),
                 )
                 added.add(resolved)
         if (
@@ -3914,8 +3905,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and self._training_model_combo.count() == 0
         ):
             self._training_status_label.setText(
-                "Retraining: add yolo26n-seg.pt, a project segmentation model, "
-                "or load a compatible segmentation checkpoint"
+                "Retraining: restore yolo26n-seg.pt in project/models or load "
+                "a compatible segmentation checkpoint"
             )
 
     def _on_choose_destination(self) -> None:
@@ -4052,8 +4043,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 else "yolo26n.pt"
             )
             raise DatasetBuildError(
-                f"No training model is available. Add {base_name} at the repository "
-                "root or load a compatible fine-tuned model."
+                f"No training model is available. Restore {base_name} in the "
+                "project models folder or load a compatible fine-tuned model."
             )
         destination_text = self._destination_input.text().strip()
         destination = (

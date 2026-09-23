@@ -60,7 +60,11 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml"]
+"simple_napari_cci_annotator" = [
+    "*.yaml",
+    "models/yolo26n.pt",
+    "models/yolo26n-seg.pt",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "simple_napari_cci_annotator.__init__.__version__"}

@@ -83,16 +83,16 @@ Suggested consolidation sequence:
 
 The **project root can be selected independently from the model path**. For convenience, the model's parent can still be proposed as the initial default, but the UI must expose a separate Project field and must not force that relationship. The selected project owns the growing annotation pool and project configuration. Retraining produces immutable snapshots; it must not rearrange or delete the canonical annotation pool.
 
-When the user selects an empty directory, show what will be created and initialize it as a project by creating `project.yaml`, `models/`, `annotations/images/`, and `annotations/labels/`. Initialization must be idempotent and atomic enough that a failure is reported as an incomplete project rather than a valid empty project. A non-empty directory without `project.yaml` must not be silently adopted: offer an explicit **Initialize here** action after checking for path conflicts.
+When the user selects an empty directory, show what will be created and initialize it as a project by creating `project.yaml`, `models/`, `annotations/images/`, and the task-specific annotation folders. Initialization also atomically copies the packaged task-compatible starter checkpoint: `yolo26n.pt` for detection or `yolo26n-seg.pt` for segmentation. Initialization must be idempotent and atomic enough that a missing/corrupt package resource or other failure rolls back instead of leaving a valid-looking partial project. A non-empty directory without `project.yaml` must not be silently adopted: offer an explicit **Initialize here** action after checking for path conflicts.
 
-Model selection remains independent after initialization. A selected external checkpoint may be referenced in project metadata or explicitly copied into `project_root/models/`; copying is recommended for reproducibility, but should be confirmed because model files can be large. An empty project is valid before a model is selected. Prediction requires a compatible project model, while retraining may explicitly start from the prototype's repository-root `yolo26n.pt` base or from the currently loaded fine-tuned model.
+Model selection remains independent after initialization. Both starter weights are distributed as package data, but only the correct task model is copied into each new project. A selected external checkpoint may still be loaded explicitly, while successful retraining promotes `best.pt` into `project_root/models/`. Prediction and retraining require a checkpoint whose Ultralytics task and class IDs match the project.
 
 Suggested structure:
 
 ```text
 my_model_project/
 ├── models/
-│   ├── initial.pt
+│   ├── yolo26n.pt or yolo26n-seg.pt
 │   └── current.pt                  # optional explicit copy or pointer policy
 ├── annotations/
 │   ├── images/
