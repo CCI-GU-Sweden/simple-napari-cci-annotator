@@ -71,7 +71,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.9.0"
+    assert simple_napari_cci_annotator.__version__ == "0.10.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -1108,7 +1108,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.9.0" in text
+    assert "plugin_version: 0.10.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1584,3 +1584,56 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     reloaded = widget._segmentation_layer()
     assert int(reloaded.data[12, 32]) == instance_id
     assert widget._segment_instances[instance_id].class_id == 0
+
+
+def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-crop", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((300, 800, 3), dtype=np.uint8),
+        name="large",
+        path=tmp_path / "large.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    source_labels = widget._segmentation_layer()
+    widget._on_new_mask_instance()
+    instance_id = source_labels.selected_label
+    data = source_labels.data.copy()
+    data[100:180, 300:420] = instance_id
+    source_labels.data = data
+    widget._on_labels_data_changed()
+    widget._patch_size_combo.setCurrentIndex(
+        widget._patch_size_combo.findData(512)
+    )
+
+    widget._on_select_training_crop()
+    widget._on_create_training_crop()
+
+    crop_labels = widget._crop_segmentation_layer()
+    assert crop_labels is not None
+    assert crop_labels.data.shape == (512, 512)
+    assert set(np.unique(crop_labels.data)) == {0, 1}
+    assert widget._crop_segment_instances[1].lineage == (instance_id,)
+    assert widget._save_crop_button.isEnabled()
+
+    invalid = crop_labels.data.copy()
+    invalid[400, 10] = 1
+    crop_labels.data = invalid
+    widget._on_labels_data_changed()
+    assert not widget._save_crop_button.isEnabled()
+    assert "synthetic padding" in widget._label_status_label.text()
+    assert crop_labels.color[1] == "red"
+
+    invalid[400, 10] = 0
+    crop_labels.data = invalid
+    widget._on_labels_data_changed()
+    assert widget._save_training_crop(show_message=False)
+    assert len(list(project.paths.images.glob("*.png"))) == 1
+    assert len(list(project.paths.masks.glob("*.tif"))) == 1
+    assert len(list(project.paths.instances.glob("*.json"))) == 1

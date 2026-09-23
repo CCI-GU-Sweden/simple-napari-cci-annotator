@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -22,6 +24,14 @@ from simple_napari_cci_annotator._segmentation_io import (
     SegmentationError,
     SegmentationIO,
 )
+from simple_napari_cci_annotator._segmentation_crop import (
+    crop_instance_mask,
+    mask_ids_in_padding,
+)
+from simple_napari_cci_annotator._segmentation_dataset import (
+    SegmentationDatasetBuilder,
+    mask_to_yolo_polygon,
+)
 from simple_napari_cci_annotator._segmentation_tiling import (
     TiledSegmentationEngine,
     _canonical_relabel,
@@ -32,6 +42,11 @@ from simple_napari_cci_annotator._tiled_inference import (
     InferenceError,
     InferenceSettings,
 )
+from simple_napari_cci_annotator._dataset_builder import DatasetBuildSettings
+from simple_napari_cci_annotator._image_adapter import ImageProcessingSettings
+from simple_napari_cci_annotator._training_crop import CropBounds
+from simple_napari_cci_annotator._training import TrainingService, TrainingSettings
+from simple_napari_cci_annotator import _training as training_module
 from simple_napari_cci_annotator._yolo_segmentation import YoloSegmentationModel
 
 
@@ -116,6 +131,135 @@ def test_segmentation_io_rejects_metadata_drift_and_wrong_dtype(tmp_path):
             instances={},
         )
 
+
+def test_segmentation_crop_reindexes_retains_lineage_and_flags_padding():
+    mask = np.zeros((8, 10), dtype=np.uint32)
+    mask[1:5, 1:4] = 7
+    mask[5:8, 7:10] = 12
+    bounds = CropBounds(2, 2, 8, 8, 10)
+
+    cropped = crop_instance_mask(
+        mask,
+        {7: _record(7), 12: _record(12, 1)},
+        {0: "Cell", 1: "Debris"},
+        bounds,
+    )
+
+    assert set(np.unique(cropped.mask)) == {0, 1, 2}
+    assert cropped.instances[1].lineage == (7,)
+    assert cropped.instances[2].lineage == (12,)
+    assert cropped.instances[2].class_id == 1
+    assert cropped.partial_instance_ids == (1,)
+    edited = cropped.mask.copy()
+    edited[7, 0] = 1
+    assert mask_ids_in_padding(edited, bounds) == (1,)
+
+
+def test_mask_polygon_round_trip_preserves_class_independent_geometry():
+    mask = np.zeros((64, 80), dtype=bool)
+    mask[5:25, 9:31] = True
+    points, iou = mask_to_yolo_polygon(mask)
+
+    assert points.shape[1] == 2
+    assert np.all((0 <= points) & (points <= 1))
+    assert iou >= 0.90
+
+
+def test_segmentation_dataset_snapshot_keeps_triples_and_empty_masks(tmp_path):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-dataset", task="segment", classes={0: "Cell", 1: "Debris"}
+    )
+    settings = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(settings)
+    project.lock_training_patch(512, padding_value=114)
+    io = SegmentationIO(project)
+    image = np.zeros((512, 512, 3), dtype=np.uint8)
+    positive = np.zeros((512, 512), dtype=np.uint32)
+    positive[30:90, 40:110] = 1
+    io.save(
+        image_data=image,
+        sample_id="positive",
+        mask=positive,
+        instances={1: _record(1, 1)},
+        source_path=tmp_path / "source-positive.tif",
+        conversion_metadata={"settings": settings},
+    )
+    io.save(
+        image_data=image,
+        sample_id="negative",
+        mask=np.zeros((512, 512), dtype=np.uint32),
+        instances={},
+        source_path=tmp_path / "source-negative.tif",
+        conversion_metadata={"settings": settings},
+    )
+    build_settings = DatasetBuildSettings(tile_size=512, overlap=100)
+    builder = SegmentationDatasetBuilder(project)
+    preview = builder.preview(build_settings)
+    assert preview.is_valid
+    assert preview.positive_count == preview.negative_count == 1
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    snapshot = builder.create_snapshot(run_root, preview, build_settings)
+    assert snapshot.image_count == 2
+    for split in ("train", "val"):
+        stems = {
+            path.stem for path in (snapshot.dataset_root / "images" / split).glob("*.png")
+        }
+        assert stems == {
+            path.stem for path in (snapshot.dataset_root / "labels" / split).glob("*.txt")
+        }
+        assert stems == {
+            path.stem for path in (snapshot.dataset_root / "masks" / split).glob("*.tif")
+        }
+        assert stems == {
+            path.stem for path in (snapshot.dataset_root / "instances" / split).glob("*.json")
+        }
+    assert "minimum_round_trip_iou" in snapshot.tile_manifest.read_text(encoding="utf-8")
+
+    base_model = tmp_path / "yolo26n-seg.pt"
+    base_model.write_bytes(b"segment-weights")
+
+    class FakeSegmentModel:
+        task = "segment"
+
+        def add_callback(self, name, callback):
+            if name == "on_train_epoch_end":
+                self.epoch_callback = callback
+
+        def train(self, **kwargs):
+            weights = Path(kwargs["project"]) / kwargs["name"] / "weights"
+            weights.mkdir(parents=True)
+            (weights / "best.pt").write_bytes(b"best-segment")
+            self.epoch_callback(SimpleNamespace(epoch=0, metrics={}))
+
+    training_settings = TrainingSettings(
+        model_path=base_model,
+        destination=tmp_path / "training-runs",
+        dataset=build_settings,
+        epochs=1,
+        batch=1,
+        patience=0,
+    )
+    with patch.object(
+        training_module,
+        "_load_ultralytics_model",
+        return_value=FakeSegmentModel(),
+    ):
+        run = TrainingService(project).run(training_settings, preview)
+    assert run.promoted_model is not None
+    assert run.promoted_model.read_bytes() == b"best-segment"
+    metadata = training_module.yaml.safe_load(
+        (run.run_root / "run.yaml").read_text(encoding="utf-8")
+    )
+    assert metadata["task"] == "segment"
+    assert metadata["classes"] == {0: "Cell", 1: "Debris"}
 
 def test_largest_component_uses_bbox_area_not_pixel_area():
     mask = np.zeros((12, 20), dtype=bool)

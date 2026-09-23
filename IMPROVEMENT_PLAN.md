@@ -4,7 +4,7 @@
 
 Turn the plugin from a single-image demo into a dependable, repeatable annotation and retraining workflow for large microscopy images.
 
-The current scope is multi-class YOLO object detection. YOLO segmentation is a later, separate milestone and should reuse the project, tiling, device, and training infrastructure without complicating the detection workflow.
+The current scope includes multi-class YOLO object detection and a mask-first instance-segmentation workflow. The two tasks share project, conversion, tiling, device, split, and training orchestration while retaining separate annotation geometry and merge logic.
 
 The intended workflow is:
 
@@ -566,7 +566,7 @@ Ultralytics instance-segmentation training requires polygon rows, even though us
 
 ### Phase 7 — Segmentation adapter
 
-**Status: in progress. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. Phase 7A contracts, the Phase 7B mask-first workflow, and Phase 7C Dask tiling/fusion are implemented; segmentation crops and retraining remain separate later phases. Backward compatibility with projects from the personal plugin is intentionally out of scope because it did not define project storage. Existing segmentation model weights may be reused when their task and class IDs match.**
+**Status: in progress. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. Phases 7A–7E now have usable implementations: project contracts, mask-first editing, Dask tiling/fusion, movable mask crops, and mask-derived YOLO segmentation retraining. Phase 7F and real-data/golden-model testing remain. Backward compatibility with projects from the personal plugin is intentionally out of scope because it did not define project storage. Existing segmentation model weights may be reused when their task and class IDs match.**
 
 Recommended decisions to confirm before implementation:
 
@@ -582,7 +582,7 @@ Recommended decisions to confirm before implementation:
 
 #### Phase 7A — Contracts, migration inventory, and fixtures
 
-**Implementation status: contract implemented; fixture migration remains in progress.** A project is initialized as immutable task `detect` or `segment`. Canonical segmentation storage is RGB `uint8` PNG + lossless 2D `uint32` TIFF + versioned JSON instance metadata under `annotations/images`, `annotations/masks`, and `annotations/instances`. Updates use temporary files, rollback backups, and an append-only audit event. The instance schema stores class ID/name, confidence, status, source, bbox, pixel area, and lineage. Detection/segmentation weight mismatch is rejected by separate adapters. Contract, round-trip, component-policy, overlap, split, and adapter fixtures are present; pinned seam/fusion and training golden fixtures will be brought over with Phases 7C and 7E respectively.
+**Implementation status: contract implemented; fixture migration remains in progress.** A project is initialized as immutable task `detect` or `segment`. Canonical segmentation storage is RGB `uint8` PNG + lossless 2D `uint32` TIFF + versioned JSON instance metadata under `annotations/images`, `annotations/masks`, and `annotations/instances`. Updates use temporary files, rollback backups, and an append-only audit event. The instance schema stores class ID/name, confidence, status, source, bbox, pixel area, and lineage. Detection/segmentation weight mismatch is rejected by separate adapters. Contract, round-trip, component-policy, overlap, split, adapter, crop, polygon-export, and mocked-training fixtures are present; pinned real-model golden fixtures still need to be migrated.
 
 Pinned-repository inventory:
 
@@ -607,7 +607,7 @@ Pinned-repository inventory:
 
 #### Phase 7B — Single-image segmentation and mask-first editing
 
-**Implementation status: first usable path complete.** The Ultralytics segmentation adapter returns source-resolution binary masks and bbox/class/confidence metadata, prediction composition uses stable instance IDs and confidence ownership, and automatic model cleanup follows largest connected-component bbox area. The GUI provides one Labels layer with new/delete/class/merge/split/keep-largest actions, counts, selected-instance details, live validation, atomic save/review/reload, and task-aware model rejection. Manual disconnected instances are reported rather than silently changed. Direct canonical save is intentionally limited to the locked 512/1024 size until Phase 7D adds segmentation crops.
+**Implementation status: first usable path complete.** The Ultralytics segmentation adapter returns source-resolution binary masks and bbox/class/confidence metadata, prediction composition uses stable instance IDs and confidence ownership, and automatic model cleanup follows largest connected-component bbox area. The GUI provides one Labels layer with new/delete/class/merge/split/keep-largest actions, counts, selected-instance details, live validation, atomic save/review/reload, and task-aware model rejection. Manual disconnected instances are reported rather than silently changed. Direct canonical save remains limited to the locked 512/1024 size; arbitrary-size sources now use the Phase 7D movable mask crop.
 
 - Add an Ultralytics segmentation adapter returning per-instance `{mask, bbox, class_id, confidence}` records in source-image coordinates.
 - Reuse the locked project RGB conversion exactly as bbox inference does. Request full-resolution/retina masks where supported and resize binary masks with nearest-neighbor only.
@@ -641,6 +641,8 @@ The one-pixel seam rule can incorrectly join two distinct touching objects or fa
 
 #### Phase 7D — Movable mask crops and correction accumulation
 
+**Implementation status: implemented; broad real-image testing remains.** The shared movable 512/1024 selector now crops normalized RGB and the current instance map together. Crop-local IDs are deterministically compacted while retaining class and source-ID lineage. Partial boundary objects are retained and reported; disconnected IDs or pixels painted into synthetic padding block saving. All mask editing actions target the crop layer during a crop session. Atomic same-stem triples, deterministic overwrite, review refresh, and source return are wired into the existing workflow.
+
 - Reuse the fixed 512/1024 movable crop workflow, but crop the normalized RGB image plus the instance map and instance table.
 - Translate/reindex crop-local instance IDs deterministically while retaining source instance lineage and class.
 - Define boundary policy separately from bbox: a cropped mask may be intentionally partial, but disconnected slivers and instances entering synthetic padding must be highlighted. Do not infer class from pixel ID.
@@ -650,6 +652,8 @@ The one-pixel seam rule can incorrectly join two distinct touching objects or fa
 **Exit criteria:** users can move a crop over a segmentation failure, paint/erase/split/merge instances, assign classes, save it, return to the source, and repeat without mask-coordinate or metadata drift.
 
 #### Phase 7E — Mask-to-YOLO dataset construction and retraining
+
+**Implementation status: first usable path implemented; real Ultralytics CPU smoke and pinned-repository golden comparison remain.** A task-aware builder validates canonical triples, uses the stable audited source-group split, preserves empty reviewed masks, and copies paired RGB/mask/instance artifacts into the immutable run. Exterior polygons are derived per instance only inside that run and must pass a `0.90` raster round-trip IoU threshold. The export manifest records per-class counts, checksums, discarded-component count, and IoU summaries. Training rejects a non-segmentation checkpoint, records task/class lineage, preserves Ultralytics outputs, and promotes `best.pt` to the project model folder. Synthetic multi-class, empty-mask, polygon, grouping, and widget crop fixtures are present.
 
 - Split by audited source group before deriving tiles, preserving the existing stable train/validation contract and reviewed-negative masks.
 - Tile canonical image/mask pairs only inside the immutable run. Keep related masks, instance metadata, and image tiles paired by stem.

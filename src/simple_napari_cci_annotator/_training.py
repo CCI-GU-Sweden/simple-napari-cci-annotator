@@ -21,6 +21,10 @@ from ._dataset_builder import (
     DatasetPreview,
 )
 from ._project_store import ProjectStore
+from ._segmentation_dataset import (
+    SegmentationDatasetBuilder,
+    SegmentationDatasetPreview,
+)
 from ._version import __version__
 
 
@@ -75,7 +79,7 @@ class TrainingService:
     def run(
         self,
         settings: TrainingSettings,
-        preview: DatasetPreview,
+        preview: DatasetPreview | SegmentationDatasetPreview,
         *,
         progress: Callable[[int, int, str], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
@@ -95,7 +99,12 @@ class TrainingService:
             newline="\n",
         )
         try:
-            snapshot = DatasetBuilder(self.project).create_snapshot(
+            builder = (
+                SegmentationDatasetBuilder(self.project)
+                if self.project.config.task == "segment"
+                else DatasetBuilder(self.project)
+            )
+            snapshot = builder.create_snapshot(
                 run_root,
                 preview,
                 settings.dataset,
@@ -116,9 +125,10 @@ class TrainingService:
                 raise TrainingCancelled("Retraining cancelled before model startup.")
             model = _load_ultralytics_model(settings.model_path)
             task = str(getattr(model, "task", "detect") or "detect")
-            if task != "detect":
+            expected_task = self.project.config.task
+            if task != expected_task:
                 raise TrainingError(
-                    f"Retraining currently supports detection models, not task {task!r}."
+                    f"Project task is {expected_task!r}, but the selected model task is {task!r}."
                 )
 
             def on_train_epoch_end(trainer) -> None:
@@ -217,7 +227,7 @@ class TrainingService:
     def _initial_metadata(
         self,
         settings: TrainingSettings,
-        preview: DatasetPreview,
+        preview: DatasetPreview | SegmentationDatasetPreview,
         started: str,
     ) -> dict[str, Any]:
         model_path = Path(settings.model_path).resolve()
@@ -226,6 +236,8 @@ class TrainingService:
             "status": "preparing_dataset",
             "started_at": started,
             "project_root": str(self.project.paths.root),
+            "task": self.project.config.task,
+            "classes": dict(sorted(self.project.config.classes.items())),
             "image_processing": dict(self.project.config.image_processing),
             "plugin_version": _package_version(),
             "packages": _runtime_versions(),

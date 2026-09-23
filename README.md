@@ -103,13 +103,15 @@ The **Review saved annotations** section lists every canonical image/label pair 
 
 Short tooltips on the image-processing, prediction, crop, review, split, and retraining controls explain what each parameter changes and highlight important speed, memory, and validation tradeoffs.
 
-## Instance segmentation (Phases 7A–7C)
+## Instance segmentation (Phases 7A–7E)
 
 For a segmentation project, loading an image creates or reloads one editable `yolo_instances` napari Labels layer. Polygons are not shown. Select a project class, then use **New Mask Instance** to allocate an ID and paint it. The nearby actions apply a class, delete an instance, merge entered IDs into the selected ID, split a disconnected ID into 4-connected objects, or explicitly keep only the component with the largest bounding-box area. Per-class counts and selected-instance details remain visible.
 
 A loaded checkpoint must report Ultralytics task `segment` and the same class IDs as the project. Prediction uses the locked RGB conversion, requests retina masks, resizes masks back with nearest-neighbor interpolation when required, removes detached prediction contamination using the original plugin's largest-bbox-component rule, and resolves pixel overlaps by confidence. That cleanup is automatic only for model output; manual disconnected masks are flagged and require an explicit split or keep-largest action.
 
-The save and review controls atomically overwrite the same-stem image/mask/metadata triple and append an audit record. Saving is blocked for unknown IDs, missing or empty metadata, invalid classes, disconnected instances, shape mismatch, or non-integer IDs. Direct saving currently requires the converted source to be exactly the project's fixed 512 or 1024 training size. Movable segmentation crops, mask-to-polygon dataset construction, and segmentation retraining remain Phases 7D–7E.
+The save and review controls atomically overwrite the same-stem image/mask/metadata triple and append an audit record. Saving is blocked for unknown IDs, missing or empty metadata, invalid classes, disconnected instances, shape mismatch, or non-integer IDs. Direct saving requires the converted source to be exactly the project's fixed 512 or 1024 training size; arbitrary-size segmentation sources use the movable crop workflow below.
+
+Segmentation crops extract the normalized RGB image and the matching instance map together. Present IDs are deterministically compacted to `1..N`, while class metadata and source-ID lineage are retained. An object cut by the human-positioned crop boundary is allowed and marked as partial. Painting any instance into synthetic bottom/right padding is not allowed and disables saving. The standard new/delete/class/merge/split/keep-largest tools operate on the crop Labels layer, and saving writes a deterministic same-stem image/mask/JSON triple.
 
 ### Large-image segmentation tiling and fusion
 
@@ -132,13 +134,13 @@ The output `yolo_bboxes` layer preserves `class_id`, project class name, confide
 The crop workflow turns a local inference failure into one immediately retrainable sample:
 
 1. **Select Training Crop** creates a cyan square centered on the current view. The square can be moved freely. If it is resized, **Create / Refresh Crop** snaps it back to the configured project size around its new center.
-2. **Create / Refresh Crop** extracts the already-previewed RGB conversion, translates intersecting source boxes into crop coordinates, and opens `training_crop_rgb` plus `training_crop_bboxes` layers.
-3. Correct the local boxes, including their classes, and click **Add Crop + Corrections**. The image and YOLO label are stored with one deterministic stem such as `field__t000__z002__crop_y001024_x002048_s1024`. Saving the same source location again updates that pair instead of creating a duplicate.
+2. **Create / Refresh Crop** extracts the already-previewed RGB conversion and the task geometry. Detection opens `training_crop_rgb` plus `training_crop_bboxes`; segmentation opens `training_crop_rgb` plus `training_crop_instances`.
+3. Correct the local boxes or instance mask, including classes, and click **Add Crop + Corrections**. Detection stores an image/YOLO-label pair; segmentation stores an image/TIFF-mask/JSON-instance triple. Both use one deterministic stem such as `field__t000__z002__crop_y001024_x002048_s1024`, so saving the same location updates it instead of creating a duplicate.
 4. **Return to Source** restores the inference image and its boxes. The crop selection remains available to move to the next failure location.
 
 No crop is resized. When the source runs out at its bottom or right edge, missing pixels are filled with RGB value `114`; the audit record stores the source bounds, valid extent, and padding. Boxes are forbidden in padded pixels. Any edited box that enters padding is shown with a translucent red face while its class-colored edge remains unchanged; **Add Crop + Corrections** stays disabled until every red box is moved, resized, or deleted. Save-time validation repeats the same check as a final safeguard.
 
-Fully contained boxes are copied directly. Every bbox intersecting a manually reviewed crop is clipped to the crop boundary and retained as a valid YOLO annotation, even when only part of the object is visible. Boundary clipping is reported but never blocks saving. Only degenerate remnants narrower or shorter than 2 pixels are omitted with a warning; boxes entirely outside the crop are ignored. This permissive manual-crop policy is intentionally separate from the stricter clipping policy used by automatic dataset tiling.
+Fully contained boxes are copied directly. Every bbox intersecting a manually reviewed crop is clipped to the crop boundary and retained as a valid YOLO annotation, even when only part of the object is visible. For segmentation, cropped instances are similarly allowed to be partial, but retain explicit lineage rather than silently pretending to be complete source objects. Boundary clipping is reported but never blocks saving. Detection remnants narrower or shorter than 2 pixels are omitted with a warning; boxes entirely outside the crop are ignored. This permissive manual-crop policy is intentionally separate from automatic dataset validation.
 
 The project stores this immutable contract in `project.yaml`:
 
@@ -170,7 +172,7 @@ Then enter one grouping level in the GUI—for example `metadata.patient`. Every
 
 Metadata records are merged per sample in append order. A later metadata record can update one field without repeating the others, and later annotation saves do not erase previously appended metadata. Keep `sample_id` spelling exact. Malformed JSON lines are ignored, so validate the dataset after editing. When **Group metadata** is left empty, the plugin groups by the original audited `source_path`, falling back to the canonical sample ID when no source path is available.
 
-The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base, every `.pt` checkpoint in the project's `models/` folder, and a compatible externally loaded model. This choice affects only the new run; successful training never silently replaces the prediction model.
+The **Starting model** control offers the task-compatible repository-root base (`yolo26n.pt` for detection or `yolo26n-seg.pt` for segmentation), every `.pt` checkpoint in the project's `models/` folder, and a compatible externally loaded model. The segmentation base is deliberately not substituted with detection weights: if `yolo26n-seg.pt` is absent, load a compatible segmentation checkpoint first. This choice affects only the new run; successful training never silently replaces the prediction model.
 
 Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Each canonical image already matches the locked project patch size, so it becomes one training item without resizing or further spatial subdivision. The dataset validator rejects mismatched dimensions. Reviewed-negative crops remain first-class empty-label samples.
 
@@ -181,14 +183,18 @@ retrain_YYYYMMDD_HHMMSS/
 ├── dataset/
 │   ├── images/train/ and images/val/
 │   ├── labels/train/ and labels/val/
+│   ├── masks/train/ and masks/val/       # segmentation runs
+│   ├── instances/train/ and instances/val/ # segmentation runs
 │   ├── dataset.yaml
 │   ├── split_manifest.csv
-│   └── tile_manifest.csv
+│   └── tile_manifest.csv or segmentation_export_manifest.csv
 ├── training/
 │   └── weights/best.pt and last.pt (train-only runs may have only last.pt)
 ├── run.yaml
 └── README.txt
 ```
+
+For segmentation, the canonical TIFF mask remains authoritative. YOLO polygon rows are generated invisibly only inside the run snapshot. Validation rejects disconnected IDs, missing/cross-class metadata, invalid or degenerate contours, polygon round-trip IoU below `0.90`, objects in synthetic padding, size/provenance mismatches, and source-group leakage. The export manifest records per-class counts, image/label/mask checksums, and minimum/mean mask→polygon→mask IoU. Empty reviewed masks produce valid empty `.txt` labels. Ultralytics must report task `segment`; a successful `best.pt` is copied to `project/models/<run-name>.pt` like detection training.
 
 `dataset.yaml` derives its complete `names` map from the project classes. `run.yaml` records the input model and checksum, package versions, dataset and training settings, split assignments, device, timestamps, warnings, outputs, and final status. Failed and cancelled runs remain on disk with their status and diagnostic information.
 

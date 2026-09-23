@@ -6,6 +6,7 @@ from qtpy.QtCore import QThread, Signal
 
 from ._dataset_builder import DatasetPreview
 from ._project_store import ProjectStore
+from ._segmentation_dataset import SegmentationDatasetPreview
 from ._training import TrainingCancelled, TrainingService, TrainingSettings
 
 
@@ -19,7 +20,7 @@ class TrainingWorker(QThread):
         self,
         project: ProjectStore,
         settings: TrainingSettings,
-        preview: DatasetPreview,
+        preview: DatasetPreview | SegmentationDatasetPreview,
     ):
         super().__init__()
         self._project = project
