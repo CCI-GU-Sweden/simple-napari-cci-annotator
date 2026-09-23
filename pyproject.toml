@@ -28,6 +28,8 @@ dependencies = [
     "pyyaml",
     "ultralytics",
     "pillow",
+    "scikit-image",
+    "tifffile",
 ]
 
 [project.optional-dependencies]

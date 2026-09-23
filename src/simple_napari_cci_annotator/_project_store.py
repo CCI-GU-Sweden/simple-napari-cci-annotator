@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import yaml
 
 PROJECT_FILENAME = "project.yaml"
 PROJECT_SCHEMA_VERSION = 1
+PROJECT_TASKS = {"detect", "segment"}
 
 
 class ProjectError(RuntimeError):
@@ -46,6 +48,8 @@ class ProjectPaths:
     annotations: Path
     images: Path
     labels: Path
+    masks: Path
+    instances: Path
     audit: Path
 
     @classmethod
@@ -59,6 +63,8 @@ class ProjectPaths:
             annotations=annotations,
             images=annotations / "images",
             labels=annotations / "labels",
+            masks=annotations / "masks",
+            instances=annotations / "instances",
             audit=annotations / "audit.jsonl",
         )
 
@@ -68,6 +74,7 @@ class ProjectConfig:
     schema_version: int
     name: str
     created_at: str
+    task: str
     classes: dict[int, str]
     image_processing: dict[str, Any]
     training_patch: dict[str, Any]
@@ -87,6 +94,7 @@ class ProjectConfig:
 
         name = value.get("name")
         created_at = value.get("created_at")
+        task = str(value.get("task", "detect"))
         raw_classes = value.get("classes")
         image_processing = value.get("image_processing")
         training_patch = value.get(
@@ -106,6 +114,10 @@ class ProjectConfig:
             raise InvalidProjectError("Project name must be a non-empty string.")
         if not isinstance(created_at, str) or not created_at.strip():
             raise InvalidProjectError("Project created_at must be a string.")
+        if task not in PROJECT_TASKS:
+            raise InvalidProjectError(
+                f"Project task must be one of {sorted(PROJECT_TASKS)}."
+            )
         if not isinstance(raw_classes, dict) or not raw_classes:
             raise InvalidProjectError("Project classes must be a non-empty mapping.")
 
@@ -135,6 +147,7 @@ class ProjectConfig:
             schema_version=schema_version,
             name=name.strip(),
             created_at=created_at,
+            task=task,
             classes=classes,
             image_processing=dict(image_processing),
             training_patch=training_patch,
@@ -146,6 +159,7 @@ class ProjectConfig:
             "schema_version": self.schema_version,
             "name": self.name,
             "created_at": self.created_at,
+            "task": self.task,
             "classes": dict(sorted(self.classes.items())),
             "image_processing": self.image_processing,
             "training_patch": self.training_patch,
@@ -167,6 +181,7 @@ class ProjectStore:
         *,
         name: str | None = None,
         classes: dict[int, str] | None = None,
+        task: str = "detect",
     ) -> ProjectStore:
         paths = ProjectPaths.from_root(root)
         paths.root.mkdir(parents=True, exist_ok=True)
@@ -188,10 +203,15 @@ class ProjectStore:
 
         class_map = dict(classes) if classes is not None else {0: "LABEL"}
         _validate_class_map(class_map)
+        if task not in PROJECT_TASKS:
+            raise ProjectConflictError(
+                f"Project task must be one of {sorted(PROJECT_TASKS)}."
+            )
         config = ProjectConfig(
             schema_version=PROJECT_SCHEMA_VERSION,
             name=project_name,
             created_at=datetime.now(timezone.utc).isoformat(),
+            task=task,
             classes=dict(class_map),
             image_processing={
                 "channels": "unset",
@@ -217,6 +237,8 @@ class ProjectStore:
                 paths.annotations,
                 paths.images,
                 paths.labels,
+                paths.masks,
+                paths.instances,
             ):
                 directory.mkdir(parents=True, exist_ok=True)
                 created_directories.append(directory)
@@ -250,7 +272,11 @@ class ProjectStore:
             raise InvalidProjectError(f"Could not read project.yaml: {exc}") from exc
 
         config = ProjectConfig.from_mapping(raw_config)
-        required_directories = (paths.models, paths.images, paths.labels)
+        required_directories = [paths.models, paths.images]
+        if config.task == "detect":
+            required_directories.append(paths.labels)
+        else:
+            required_directories.extend((paths.masks, paths.instances))
         missing = [
             str(path.relative_to(paths.root))
             for path in required_directories
@@ -289,6 +315,7 @@ class ProjectStore:
             schema_version=self.config.schema_version,
             name=self.config.name,
             created_at=self.config.created_at,
+            task=self.config.task,
             classes=dict(self.config.classes),
             image_processing=requested,
             training_patch=dict(self.config.training_patch),
@@ -314,6 +341,7 @@ class ProjectStore:
             schema_version=self.config.schema_version,
             name=self.config.name,
             created_at=self.config.created_at,
+            task=self.config.task,
             classes=dict(self.config.classes),
             image_processing=dict(self.config.image_processing),
             training_patch=dict(self.config.training_patch),
@@ -327,7 +355,11 @@ class ProjectStore:
         normalized = {
             class_id: name.strip() for class_id, name in classes.items()
         }
-        used_ids = _used_label_class_ids(self.paths.labels)
+        used_ids = (
+            _used_label_class_ids(self.paths.labels)
+            if self.config.task == "detect"
+            else _used_instance_class_ids(self.paths.instances)
+        )
         removed_used_ids = sorted(used_ids - set(normalized))
         if removed_used_ids:
             raise ClassMapError(
@@ -338,6 +370,7 @@ class ProjectStore:
             schema_version=self.config.schema_version,
             name=self.config.name,
             created_at=self.config.created_at,
+            task=self.config.task,
             classes=normalized,
             image_processing=dict(self.config.image_processing),
             training_patch=dict(self.config.training_patch),
@@ -360,6 +393,7 @@ class ProjectStore:
             schema_version=self.config.schema_version,
             name=self.config.name,
             created_at=self.config.created_at,
+            task=self.config.task,
             classes=dict(self.config.classes),
             image_processing=dict(self.config.image_processing),
             training_patch=requested,
@@ -439,6 +473,25 @@ def _used_label_class_ids(labels_path: Path) -> set[int]:
                     f"Cannot edit classes while {label_path.name}, line "
                     f"{line_number} has an invalid class ID."
                 ) from exc
+    return used
+
+
+def _used_instance_class_ids(instances_path: Path) -> set[int]:
+    used: set[int] = set()
+    for metadata_path in instances_path.glob("*.json"):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            instances = payload.get("instances", {})
+            if not isinstance(instances, dict):
+                raise ValueError("instances must be a mapping")
+            for value in instances.values():
+                if not isinstance(value, dict):
+                    raise ValueError("instance records must be mappings")
+                used.add(int(value["class_id"]))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ClassMapError(
+                f"Could not inspect segmentation metadata {metadata_path.name}: {exc}"
+            ) from exc
     return used
 
 

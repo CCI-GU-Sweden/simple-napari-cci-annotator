@@ -2,6 +2,7 @@ from ._annotation_io import AnnotationIO
 from ._dataset_builder import DatasetBuildSettings, DatasetBuilder
 from ._image_adapter import ImageAdapter, ImageProcessingSettings
 from ._project_store import ProjectStore
+from ._segmentation_io import InstanceRecord, SegmentationIO
 from ._tiled_inference import (
     Detection,
     InferenceSettings,
@@ -20,7 +21,9 @@ __all__ = [
     "ImageAdapter",
     "ImageProcessingSettings",
     "InferenceSettings",
+    "InstanceRecord",
     "ProjectStore",
+    "SegmentationIO",
     "SimpleCciAnnotatorQWidget",
     "TiledInferenceEngine",
     "TrainingService",

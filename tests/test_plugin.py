@@ -70,7 +70,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.7.1"
+    assert simple_napari_cci_annotator.__version__ == "0.8.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -987,7 +987,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.7.1" in text
+    assert "plugin_version: 0.8.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1059,6 +1059,21 @@ class _Shapes:
         self.mode = "select"
 
 
+class _Labels:
+    def __init__(self, data, name, metadata=None, **kwargs):
+        self.data = np.asarray(data)
+        self.name = name
+        self.metadata = metadata or {}
+        self.selected_label = 0
+        self.mode = "pan_zoom"
+        self.color = {}
+        self.visible = True
+        self.events = SimpleNamespace(data=_Signal(), selected_label=_Signal())
+
+    def refresh(self):
+        pass
+
+
 class _Layers(list):
     def __init__(self):
         super().__init__()
@@ -1084,6 +1099,11 @@ class _Viewer:
 
     def add_image(self, data, *, name, metadata=None, **kwargs):
         layer = _Image(data, name=name, metadata=metadata, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_labels(self, data, *, name, metadata=None, **kwargs):
+        layer = _Labels(data, name, metadata, **kwargs)
         self.layers.append(layer)
         return layer
 
@@ -1376,3 +1396,40 @@ def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
     }
     assert len(list(project.paths.images.iterdir())) == 1
     assert len(list(project.paths.labels.iterdir())) == 1
+
+
+def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-project", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((1024, 1024, 3), dtype=np.uint8),
+        name="sample",
+        path=tmp_path / "sample.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+    assert labels is not None
+    assert labels.data.dtype == np.uint32
+
+    widget._on_new_mask_instance()
+    instance_id = labels.selected_label
+    data = labels.data.copy()
+    data[10:20, 30:40] = instance_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    with patch.object(widget, "_show_info"):
+        widget._on_save_annotation()
+
+    assert (project.paths.masks / "sample.tif").is_file()
+    assert (project.paths.instances / "sample.json").is_file()
+    widget._load_annotations_for_image(image, force=True)
+    reloaded = widget._segmentation_layer()
+    assert int(reloaded.data[12, 32]) == instance_id
+    assert widget._segment_instances[instance_id].class_id == 0

@@ -566,7 +566,7 @@ Ultralytics instance-segmentation training requires polygon rows, even though us
 
 ### Phase 7 — Segmentation adapter
 
-**Status: planned. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. No segmentation implementation should begin until the storage choices in Phase 7A are resolved in code-facing design records.**
+**Status: in progress. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. Phase 7A contracts and the first single-image Phase 7B workflow are implemented; tiled fusion, segmentation crops, and retraining remain separate later phases. Backward compatibility with projects from the personal plugin is intentionally out of scope because it did not define project storage. Existing segmentation model weights may be reused when their task and class IDs match.**
 
 Recommended decisions to confirm before implementation:
 
@@ -582,6 +582,18 @@ Recommended decisions to confirm before implementation:
 
 #### Phase 7A — Contracts, migration inventory, and fixtures
 
+**Implementation status: contract implemented; fixture migration remains in progress.** A project is initialized as immutable task `detect` or `segment`. Canonical segmentation storage is RGB `uint8` PNG + lossless 2D `uint32` TIFF + versioned JSON instance metadata under `annotations/images`, `annotations/masks`, and `annotations/instances`. Updates use temporary files, rollback backups, and an append-only audit event. The instance schema stores class ID/name, confidence, status, source, bbox, pixel area, and lineage. Detection/segmentation weight mismatch is rejected by separate adapters. Contract, round-trip, component-policy, overlap, split, and adapter fixtures are present; pinned seam/fusion and training golden fixtures will be brought over with Phases 7C and 7E respectively.
+
+Pinned-repository inventory:
+
+| Original part | Decision for this plugin |
+|---|---|
+| `yolo_tiling_segmentation.py` | **Adapt** in Phase 7C: reflected Dask halos, unique temporary IDs, confidence ownership, seam equivalence, and union/find; add class-aware fusion and deterministic final IDs. |
+| `_gui.py` | **Rewrite**: retain the mask-first interaction, but use the project/task contract, one Labels layer, instance metadata, shared conversion, and current review UI. |
+| `_segmentation_training.py` | **Adapt** in Phase 7E: retain relevant mask tiling/export behavior inside immutable run snapshots; replace path/config handling with the current dataset builder and audit contracts. |
+| Old segmentation tests/fixtures | **Reuse as attributed golden inputs/outputs** for seam fusion and largest-bbox filtering; wrap them in the current task-aware APIs. |
+| Old standalone configuration and implicit folder workflow | **Retire**: there is no backward-compatible project format to preserve. |
+
 - Inventory the pinned repository modules and tests as `reuse`, `adapt`, `rewrite`, or `retire`. At minimum cover `yolo_tiling_segmentation.py`, `_gui.py`, `_segmentation_training.py`, and both segmentation test modules.
 - Add a project task contract: initially one project is either `detect` or `segment`, fixed after the first canonical annotation. Do not put bbox `.txt` files and masks under an ambiguous shared annotation type.
 - Finalize canonical segmentation paths, for example `annotations/images/`, `annotations/masks/`, and `annotations/instances/`, with same-stem triples and atomic update/rollback.
@@ -594,6 +606,8 @@ Recommended decisions to confirm before implementation:
 **Exit criteria:** a versioned mask/instance contract exists; old fixtures run locally; task mismatch and unsupported mask dtype fail clearly; no GUI or model code needs to guess what a pixel value means.
 
 #### Phase 7B — Single-image segmentation and mask-first editing
+
+**Implementation status: first usable path complete.** The Ultralytics segmentation adapter returns source-resolution binary masks and bbox/class/confidence metadata, prediction composition uses stable instance IDs and confidence ownership, and automatic model cleanup follows largest connected-component bbox area. The GUI provides one Labels layer with new/delete/class/merge/split/keep-largest actions, counts, selected-instance details, live validation, atomic save/review/reload, and task-aware model rejection. Manual disconnected instances are reported rather than silently changed. Direct canonical save is intentionally limited to the locked 512/1024 size until Phase 7D adds segmentation crops.
 
 - Add an Ultralytics segmentation adapter returning per-instance `{mask, bbox, class_id, confidence}` records in source-image coordinates.
 - Reuse the locked project RGB conversion exactly as bbox inference does. Request full-resolution/retina masks where supported and resize binary masks with nearest-neighbor only.

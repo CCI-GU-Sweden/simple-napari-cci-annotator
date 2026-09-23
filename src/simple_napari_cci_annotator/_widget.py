@@ -14,6 +14,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -47,7 +48,21 @@ from ._image_adapter import (
     PlaneSelection,
 )
 from ._inference_worker import InferenceWorker
+from ._instance_mask import (
+    ComposedInstances,
+    disconnected_instance_ids,
+    keep_largest_component_by_bbox,
+    split_instance,
+)
 from ._project_store import ProjectError, ProjectStore
+from ._segmentation_io import (
+    InstanceRecord,
+    SegmentationError,
+    SegmentationIO,
+    SegmentationReviewEntry,
+    refresh_instance_records,
+)
+from ._segmentation_worker import SegmentationWorker
 from ._tiled_inference import Detection, InferenceError, InferenceSettings
 from ._training import TrainingError, TrainingRun, TrainingSettings
 from ._training_crop import (
@@ -63,6 +78,7 @@ from ._training_crop import (
 )
 from ._training_worker import TrainingWorker
 from ._yolo_inference import YoloDetectionModel, available_devices
+from ._yolo_segmentation import YoloSegmentationModel
 
 
 class CollapsibleSection(QWidget):
@@ -105,6 +121,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
     """Project-based YOLO bbox annotation and tiled inference UI."""
 
     ANNOTATION_LAYER_NAME = "yolo_bboxes"
+    SEGMENTATION_LAYER_NAME = "yolo_instances"
     CROP_SELECTION_LAYER_NAME = "training_crop_selection"
     CROP_IMAGE_LAYER_NAME = "training_crop_rgb"
     CROP_BBOX_LAYER_NAME = "training_crop_bboxes"
@@ -117,21 +134,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
         self._project: ProjectStore | None = None
         self._annotation_io: AnnotationIO | None = None
+        self._segmentation_io: SegmentationIO | None = None
+        self._segment_instances: dict[int, InstanceRecord] = {}
+        self._segmentation_errors: tuple[str, ...] = ()
         self._image_adapter = ImageAdapter()
         self._annotation_image_layer = None
         self._converted_image: ConvertedImage | None = None
         self._current_sample_id: str | None = None
         self._annotation_dirty = False
         self._annotation_invalid_indices: tuple[int, ...] = ()
-        self._review_entries: tuple[AnnotationReviewEntry, ...] = ()
+        self._review_entries: tuple[
+            AnnotationReviewEntry | SegmentationReviewEntry, ...
+        ] = ()
         self._updating_review_combo = False
         self._locked_processing_settings: ImageProcessingSettings | None = None
         self._updating_processing_controls = False
         self._updating_class_controls = False
         self._updating_patch_controls = False
         self._last_normalization_method: str | None = None
-        self._model: YoloDetectionModel | None = None
-        self._inference_worker: InferenceWorker | None = None
+        self._model: YoloDetectionModel | YoloSegmentationModel | None = None
+        self._inference_worker: InferenceWorker | SegmentationWorker | None = None
         self._inference_sample_id: str | None = None
         self._inference_converted: ConvertedImage | None = None
         self._training_worker: TrainingWorker | None = None
@@ -160,6 +182,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._open_project_button.clicked.connect(self._on_open_project)
         self._edit_classes_button = QPushButton("Edit Classes")
         self._edit_classes_button.clicked.connect(self._on_edit_classes)
+        self._new_project_task_combo = QComboBox()
+        self._new_project_task_combo.addItem("Bounding-box detection", "detect")
+        self._new_project_task_combo.addItem("Instance segmentation", "segment")
+        self._new_project_task_combo.setToolTip(
+            "Task for a new project. It cannot be changed after initialization."
+        )
 
         self._image_status_label = QLabel("Select an image layer in napari.")
         self._image_status_label.setWordWrap(True)
@@ -246,6 +274,35 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._reload_labels_button = QPushButton("Reload Labels")
         self._reload_labels_button.clicked.connect(self._on_reload_labels)
         self._save_annotation_button = QPushButton("Save Converted Image + BBoxes")
+        self._new_instance_button = QPushButton("New Mask Instance")
+        self._new_instance_button.setToolTip(
+            "Allocate a new instance ID, select it, and enter napari paint mode."
+        )
+        self._new_instance_button.clicked.connect(self._on_new_mask_instance)
+        self._delete_instance_button = QPushButton("Delete Selected Instance")
+        self._delete_instance_button.setToolTip(
+            "Clear every pixel belonging to the selected instance ID."
+        )
+        self._delete_instance_button.clicked.connect(self._on_delete_mask_instance)
+        self._split_instance_button = QPushButton("Split Disconnected Instance")
+        self._split_instance_button.setToolTip(
+            "Give each 4-connected component of the selected ID its own instance ID."
+        )
+        self._split_instance_button.clicked.connect(self._on_split_mask_instance)
+        self._merge_instance_button = QPushButton("Merge Instance IDs")
+        self._merge_instance_button.setToolTip(
+            "Merge comma-separated instance IDs into the currently selected ID."
+        )
+        self._merge_instance_button.clicked.connect(self._on_merge_mask_instances)
+        self._largest_instance_button = QPushButton("Keep Largest by BBox")
+        self._largest_instance_button.setToolTip(
+            "Explicitly discard all but the component with the largest bounding box."
+        )
+        self._largest_instance_button.clicked.connect(
+            self._on_keep_largest_mask_component
+        )
+        self._instance_details_label = QLabel("Selected instance: unavailable")
+        self._instance_details_label.setWordWrap(True)
         self._save_annotation_button.clicked.connect(self._on_save_annotation)
         self._validate_project_button = QPushButton("Validate Project")
         self._validate_project_button.clicked.connect(self._on_validate_project)
@@ -494,6 +551,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         project_layout = QVBoxLayout()
         project_layout.addWidget(self._project_path_label)
         project_layout.addWidget(self._project_status_label)
+        project_layout.addWidget(QLabel("Task for new project"))
+        project_layout.addWidget(self._new_project_task_combo)
         project_layout.addLayout(project_buttons)
         project_layout.addWidget(self._edit_classes_button)
         self._project_section = CollapsibleSection(
@@ -521,12 +580,22 @@ class SimpleCciAnnotatorQWidget(QWidget):
         class_form.addRow("Current class", self._class_combo)
         annotation_layout.addLayout(class_form)
         annotation_layout.addWidget(self._apply_class_button)
+        mask_buttons = QHBoxLayout()
+        mask_buttons.addWidget(self._new_instance_button)
+        mask_buttons.addWidget(self._delete_instance_button)
+        annotation_layout.addLayout(mask_buttons)
+        mask_cleanup_buttons = QHBoxLayout()
+        mask_cleanup_buttons.addWidget(self._split_instance_button)
+        mask_cleanup_buttons.addWidget(self._merge_instance_button)
+        mask_cleanup_buttons.addWidget(self._largest_instance_button)
+        annotation_layout.addLayout(mask_cleanup_buttons)
+        annotation_layout.addWidget(self._instance_details_label)
         annotation_layout.addWidget(self._class_counts_label)
         annotation_layout.addWidget(self._label_status_label)
         annotation_layout.addLayout(annotation_buttons)
         annotation_layout.addWidget(self._validate_project_button)
         self._annotation_section = CollapsibleSection(
-            "Image and YOLO bounding boxes",
+            "Image and annotations",
             annotation_layout,
             expanded=True,
         )
@@ -703,7 +772,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if not selected:
             return
         try:
-            project = ProjectStore.initialize(Path(selected))
+            project = ProjectStore.initialize(
+                Path(selected), task=str(self._new_project_task_combo.currentData())
+            )
         except ProjectError as exc:
             self._show_error(str(exc))
             return
@@ -741,6 +812,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         patch_status = "locked" if patch.get("locked") else "not locked"
         self._project_status_label.setText(
             f"Project loaded · schema {self._project.config.schema_version} · "
+            f"task {self._project.config.task} · "
             f"classes [{class_summary}] · training patch {patch['size']} "
             f"({patch_status})"
         )
@@ -758,6 +830,15 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         classes = dialog.classes()
         shapes = self._annotation_layer()
+        if self._project.config.task == "segment":
+            active_ids = {record.class_id for record in self._segment_instances.values()}
+            removed_active = sorted(active_ids - set(classes))
+            if removed_active:
+                self._show_error(
+                    "Cannot remove class ID(s) used by the current instance mask: "
+                    + ", ".join(str(value) for value in removed_active)
+                )
+                return
         if shapes is not None:
             try:
                 active_ids = set(self._class_ids(shapes, len(shapes.data)))
@@ -788,6 +869,18 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._apply_class_colors(shapes)
             self._set_default_current_properties(shapes)
             self._update_class_counts(shapes)
+        elif self._project.config.task == "segment":
+            self._segment_instances = {
+                instance_id: InstanceRecord(
+                    **{
+                        **record.__dict__,
+                        "class_name": classes[record.class_id],
+                    }
+                )
+                for instance_id, record in self._segment_instances.items()
+            }
+            self._apply_instance_colors(self._segmentation_layer())
+            self._update_class_counts()
 
         if self._model is not None and set(self._model.names) != set(classes):
             self._model = None
@@ -810,12 +903,22 @@ class SimpleCciAnnotatorQWidget(QWidget):
         previous_annotation = self._annotation_layer()
         if previous_annotation is not None:
             self.napari_viewer.layers.remove(previous_annotation)
+        previous_mask = self._segmentation_layer()
+        if previous_mask is not None:
+            self.napari_viewer.layers.remove(previous_mask)
         self._annotation_image_layer = None
         self._annotation_invalid_indices = ()
         self._project = project
-        self._annotation_io = AnnotationIO(project)
+        self._annotation_io = AnnotationIO(project) if project.config.task == "detect" else None
+        self._segmentation_io = (
+            SegmentationIO(project) if project.config.task == "segment" else None
+        )
+        self._segment_instances = {}
+        task_index = self._new_project_task_combo.findData(project.config.task)
+        if task_index >= 0:
+            self._new_project_task_combo.setCurrentIndex(task_index)
         self._model = None
-        self._model_path_label.setText("No detection model loaded")
+        self._model_path_label.setText(f"No {project.config.task} model loaded")
         self._model_status_label.setText("Model: unavailable")
         self._training_preview = None
         self._dataset_status_label.setText(
@@ -849,6 +952,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _is_shapes_layer(layer) -> bool:
         return layer is not None and layer.__class__.__name__.lower().endswith("shapes")
 
+    @staticmethod
+    def _is_labels_layer(layer) -> bool:
+        return layer is not None and layer.__class__.__name__.lower().endswith("labels")
+
     def _on_active_layer_changed(self, event=None) -> None:
         active = self._active_layer()
         if self._is_annotation_review_image(active):
@@ -869,7 +976,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _on_current_step_changed(self, event=None) -> None:
         image_layer = self._annotation_image_layer
-        if image_layer is None or self._annotation_io is None:
+        if image_layer is None or (
+            self._annotation_io is None and self._segmentation_io is None
+        ):
             return
         if self._crop_bounds is not None:
             if not self._resolve_crop_unsaved_changes():
@@ -919,7 +1028,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
 
     def _image_stem(self, image_layer) -> str:
-        assert self._annotation_io is not None
+        assert self._project is not None
         metadata = getattr(image_layer, "metadata", {}) or {}
         review_sample = metadata.get("cci_sample_id")
         if isinstance(review_sample, str) and review_sample:
@@ -928,7 +1037,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         value = source_path.stem if source_path is not None else getattr(
             image_layer, "name", "image"
         )
-        base_stem = self._annotation_io.safe_stem(str(value))
+        base_stem = AnnotationIO.safe_stem(str(value))
         try:
             settings = self._effective_processing_settings()
             plane = self._image_adapter.plane_selection(
@@ -941,6 +1050,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return base_stem
 
     def _load_annotations_for_image(self, image_layer, *, force: bool = False) -> None:
+        if self._project is not None and self._project.config.task == "segment":
+            self._load_segmentation_for_image(image_layer, force=force)
+            return
         if self._annotation_io is None or not self._is_image_layer(image_layer):
             return
         try:
@@ -1044,6 +1156,76 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         self._update_action_state()
 
+    def _load_segmentation_for_image(self, image_layer, *, force: bool = False) -> None:
+        if self._segmentation_io is None or not self._is_image_layer(image_layer):
+            return
+        stem = self._image_stem(image_layer)
+        existing = self._segmentation_layer()
+        if (
+            not force
+            and existing is not None
+            and getattr(existing, "metadata", {}).get("cci_image_stem") == stem
+        ):
+            self._annotation_image_layer = image_layer
+            self._update_image_status(image_layer)
+            return
+        if existing is not None and self._annotation_dirty:
+            if not self._resolve_unsaved_changes():
+                return
+        try:
+            converted = self._convert_current_image(image_layer)
+            pair = self._segmentation_io.find_mask(stem)
+            if pair is None:
+                mask = np.zeros(converted.data.shape[:2], dtype=np.uint32)
+                instances: dict[int, InstanceRecord] = {}
+            else:
+                loaded = self._segmentation_io.load(stem, converted.data.shape[:2])
+                mask = loaded.mask
+                instances = loaded.instances
+        except (ImageConversionError, SegmentationError, OSError) as exc:
+            self._show_error(f"Could not load instance segmentation:\n{exc}")
+            return
+        bbox_layer = self._annotation_layer()
+        if bbox_layer is not None:
+            self.napari_viewer.layers.remove(bbox_layer)
+        if existing is not None:
+            self.napari_viewer.layers.remove(existing)
+        labels = self.napari_viewer.add_labels(
+            mask,
+            name=self.SEGMENTATION_LAYER_NAME,
+            metadata={
+                "cci_image_stem": stem,
+                "cci_project_root": str(self._project.paths.root),
+                "cci_mask_path": str(pair[0]) if pair else None,
+            },
+        )
+        self._segment_instances = instances
+        self._apply_instance_colors(labels)
+        try:
+            labels.events.data.connect(self._on_labels_data_changed)
+            labels.events.selected_label.connect(self._on_selected_instance_changed)
+        except (AttributeError, TypeError):
+            pass
+        self._annotation_image_layer = image_layer
+        self._converted_image = converted
+        self._current_sample_id = stem
+        self._annotation_dirty = False
+        self._update_image_status(image_layer)
+        if pair is None:
+            self._label_status_label.setText(
+                f"Instances: none found for {stem}; an empty editable mask was created."
+            )
+            self._save_annotation_button.setText("Add Image + Instance Mask")
+        else:
+            self._label_status_label.setText(
+                f"Instances: loaded {len(instances)} object(s) from {pair[0]}"
+            )
+            self._save_annotation_button.setText("Update Image + Instance Mask")
+        self._refresh_segmentation_validation()
+        self._update_class_counts()
+        self._on_selected_instance_changed()
+        self._update_action_state()
+
     @staticmethod
     def _empty_properties() -> dict[str, np.ndarray]:
         return {
@@ -1114,6 +1296,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if self._project is None:
             self._class_counts_label.setText("Class counts: unavailable")
             return
+        if self._project.config.task == "segment":
+            counts = {
+                class_id: sum(
+                    record.class_id == class_id
+                    for record in self._segment_instances.values()
+                )
+                for class_id in self._project.config.classes
+            }
+            summary = " · ".join(
+                f"{class_id} {name}: {counts[class_id]}"
+                for class_id, name in sorted(self._project.config.classes.items())
+            )
+            self._class_counts_label.setText(f"Class counts: {summary}")
+            return
         shapes_layer = shapes_layer or self._editable_bbox_layer()
         class_ids: tuple[int, ...] = ()
         if shapes_layer is not None:
@@ -1137,6 +1333,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._class_counts_label.setText(f"Class counts: {summary}")
 
     def _on_apply_class_to_selected(self) -> None:
+        if self._project is not None and self._project.config.task == "segment":
+            self._apply_class_to_selected_instance()
+            return
         shapes = self._editable_bbox_layer()
         class_id = self._current_class_id()
         if shapes is None or self._project is None or class_id is None:
@@ -1240,6 +1439,251 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         return None
 
+    def _segmentation_layer(self):
+        try:
+            for layer in self.napari_viewer.layers:
+                if (
+                    getattr(layer, "name", None) == self.SEGMENTATION_LAYER_NAME
+                    and self._is_labels_layer(layer)
+                ):
+                    return layer
+        except TypeError:
+            pass
+        return None
+
+    def _selected_instance_id(self) -> int:
+        layer = self._segmentation_layer()
+        try:
+            return int(layer.selected_label) if layer is not None else 0
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def _apply_instance_colors(self, labels_layer=None) -> None:
+        labels_layer = labels_layer or self._segmentation_layer()
+        if labels_layer is None:
+            return
+        colors = {0: "transparent"}
+        colors.update(
+            {
+                instance_id: class_color(record.class_id)
+                for instance_id, record in self._segment_instances.items()
+            }
+        )
+        try:
+            labels_layer.color = colors
+            labels_layer.refresh()
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def _on_selected_instance_changed(self, event=None) -> None:
+        del event
+        instance_id = self._selected_instance_id()
+        record = self._segment_instances.get(instance_id)
+        if record is None:
+            self._instance_details_label.setText(
+                f"Selected instance: {instance_id or 'background'} · no metadata"
+            )
+        else:
+            confidence = (
+                "manual" if record.confidence is None else f"{record.confidence:.3f}"
+            )
+            self._instance_details_label.setText(
+                f"Selected instance: {instance_id} · class {record.class_id} "
+                f"{record.class_name} · area {record.area} px · confidence {confidence}"
+            )
+        self._update_action_state()
+
+    def _on_new_mask_instance(self) -> None:
+        layer = self._segmentation_layer()
+        class_id = self._current_class_id()
+        if layer is None or self._project is None or class_id is None:
+            self._show_error("Open a segmentation project and image first.")
+            return
+        instance_id = int(np.asarray(layer.data).max(initial=0)) + 1
+        self._segment_instances[instance_id] = InstanceRecord(
+            instance_id=instance_id,
+            class_id=class_id,
+            class_name=self._project.config.classes[class_id],
+            confidence=None,
+            source="manual",
+            status="corrected",
+            bbox=(0, 0, 0, 0),
+            area=0,
+        )
+        try:
+            layer.selected_label = instance_id
+            layer.mode = "paint"
+        except (AttributeError, ValueError):
+            pass
+        self._annotation_dirty = True
+        self._label_status_label.setText(
+            f"Instances: allocated ID {instance_id}; paint its pixels in the Labels layer."
+        )
+        self._on_selected_instance_changed()
+
+    def _on_delete_mask_instance(self) -> None:
+        layer = self._segmentation_layer()
+        instance_id = self._selected_instance_id()
+        if layer is None or not instance_id:
+            self._show_info("Select a non-background instance first.")
+            return
+        data = np.asarray(layer.data, dtype=np.uint32).copy()
+        data[data == instance_id] = 0
+        self._segment_instances.pop(instance_id, None)
+        layer.data = data
+        self._on_labels_data_changed()
+
+    def _on_split_mask_instance(self) -> None:
+        layer = self._segmentation_layer()
+        instance_id = self._selected_instance_id()
+        if layer is None or self._project is None or not instance_id:
+            self._show_info("Select a non-background instance first.")
+            return
+        try:
+            data, records = split_instance(
+                layer.data,
+                instance_id,
+                self._segment_instances,
+                self._project.config.classes,
+            )
+        except SegmentationError as exc:
+            self._show_error(str(exc))
+            return
+        layer.data = data
+        self._segment_instances = records
+        self._on_labels_data_changed()
+
+    def _on_merge_mask_instances(self) -> None:
+        layer = self._segmentation_layer()
+        target = self._selected_instance_id()
+        if layer is None or self._project is None or not target:
+            self._show_info("Select the target instance first.")
+            return
+        text, accepted = QInputDialog.getText(
+            self,
+            "Merge instance IDs",
+            f"Comma-separated IDs to merge into {target}:",
+        )
+        if not accepted:
+            return
+        try:
+            source_ids = {int(value.strip()) for value in text.split(",") if value.strip()}
+        except ValueError:
+            self._show_error("Instance IDs must be comma-separated integers.")
+            return
+        source_ids.discard(target)
+        missing = sorted(source_ids - set(self._segment_instances))
+        if not source_ids or missing:
+            self._show_error(
+                "Enter at least one existing source ID."
+                + (f" Missing: {missing}" if missing else "")
+            )
+            return
+        data = np.asarray(layer.data, dtype=np.uint32).copy()
+        for source_id in source_ids:
+            data[data == source_id] = target
+            self._segment_instances.pop(source_id, None)
+        layer.data = data
+        self._on_labels_data_changed()
+
+    def _on_keep_largest_mask_component(self) -> None:
+        layer = self._segmentation_layer()
+        instance_id = self._selected_instance_id()
+        if layer is None or not instance_id:
+            self._show_info("Select a non-background instance first.")
+            return
+        kept, report = keep_largest_component_by_bbox(layer.data == instance_id)
+        data = np.asarray(layer.data, dtype=np.uint32).copy()
+        data[data == instance_id] = 0
+        data[kept] = instance_id
+        layer.data = data
+        self._label_status_label.setText(
+            f"Instances: removed {report.removed_components} component(s), "
+            f"{report.removed_pixels} pixel(s); save to keep this correction."
+        )
+        self._on_labels_data_changed()
+
+    def _apply_class_to_selected_instance(self) -> None:
+        instance_id = self._selected_instance_id()
+        class_id = self._current_class_id()
+        if self._project is None or not instance_id or class_id is None:
+            self._show_info("Select a non-background instance first.")
+            return
+        record = self._segment_instances.get(instance_id)
+        if record is None:
+            self._show_error(f"Instance {instance_id} has no metadata.")
+            return
+        self._segment_instances[instance_id] = InstanceRecord(
+            **{
+                **record.__dict__,
+                "class_id": class_id,
+                "class_name": self._project.config.classes[class_id],
+                "confidence": None,
+                "source": "manual",
+                "status": "corrected",
+            }
+        )
+        self._annotation_dirty = True
+        self._apply_instance_colors()
+        self._update_class_counts()
+        self._on_selected_instance_changed()
+
+    def _on_labels_data_changed(self, event=None) -> None:
+        del event
+        self._annotation_dirty = True
+        self._refresh_segmentation_validation()
+        self._update_class_counts()
+        self._on_selected_instance_changed()
+
+    def _refresh_segmentation_validation(self) -> None:
+        layer = self._segmentation_layer()
+        if layer is None or self._project is None:
+            self._segmentation_errors = ()
+            return
+        data = np.asarray(layer.data)
+        errors: list[str] = []
+        if data.ndim != 2:
+            errors.append(f"mask must be 2D, found {data.ndim}D")
+        elif self._converted_image is not None and data.shape != self._converted_image.data.shape[:2]:
+            errors.append(
+                f"mask shape {data.shape} differs from image {self._converted_image.data.shape[:2]}"
+            )
+        if not np.issubdtype(data.dtype, np.integer) or np.any(data < 0):
+            errors.append("mask IDs must be non-negative integers")
+        elif np.any(data > np.iinfo(np.uint32).max):
+            errors.append("mask IDs exceed uint32 storage capacity")
+        else:
+            present = {int(value) for value in np.unique(data) if value}
+            known = set(self._segment_instances)
+            if present - known:
+                errors.append(f"IDs missing metadata: {sorted(present - known)}")
+            if known - present:
+                errors.append(f"empty metadata IDs: {sorted(known - present)}")
+            invalid_classes = sorted(
+                instance_id
+                for instance_id, record in self._segment_instances.items()
+                if record.class_id not in self._project.config.classes
+            )
+            if invalid_classes:
+                errors.append(f"instances with invalid classes: {invalid_classes}")
+            disconnected = disconnected_instance_ids(data)
+            if disconnected:
+                errors.append(
+                    f"disconnected instance IDs {list(disconnected)}; split or explicitly keep largest"
+                )
+            if not errors:
+                self._segment_instances = refresh_instance_records(
+                    data, self._segment_instances, self._project.config.classes
+                )
+        self._segmentation_errors = tuple(errors)
+        if errors:
+            self._label_status_label.setText("Instances invalid: " + " · ".join(errors))
+        elif self._annotation_dirty:
+            self._label_status_label.setText(
+                "Instances: unsaved edits. Save before changing image or Z/T plane."
+            )
+        self._apply_instance_colors(layer)
+
     def _crop_bbox_layer(self):
         layer = self._get_layer_by_name(self.CROP_BBOX_LAYER_NAME)
         return layer if self._is_shapes_layer(layer) else None
@@ -1259,6 +1703,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._load_annotations_for_image(image_layer, force=True)
 
     def _on_save_annotation(self) -> None:
+        if self._project is not None and self._project.config.task == "segment":
+            self._on_save_segmentation()
+            return
         if self._annotation_io is None:
             self._show_error("Create or open a project first.")
             return
@@ -1281,6 +1728,73 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
         if result is not None:
             self._update_action_state()
+
+    def _on_save_segmentation(self) -> None:
+        image_layer = self._image_for_annotation()
+        labels_layer = self._segmentation_layer()
+        if image_layer is None or labels_layer is None:
+            self._show_error("Select an image and its instance Labels layer first.")
+            return
+        try:
+            converted = self._convert_current_image(image_layer)
+            result = self._save_converted_segmentation(
+                converted, labels_layer=labels_layer, show_message=True
+            )
+        except (SegmentationError, ImageConversionError, ProjectError, OSError) as exc:
+            self._show_error(f"Could not save segmentation:\n{exc}")
+            return
+        if result is not None:
+            self._update_action_state()
+
+    def _save_converted_segmentation(
+        self, converted: ConvertedImage, *, labels_layer, show_message: bool
+    ):
+        if self._segmentation_io is None or self._project is None:
+            raise SegmentationError("Create or open a segmentation project first.")
+        patch_size = self._training_patch_size()
+        if tuple(converted.data.shape[:2]) != (patch_size, patch_size):
+            raise SegmentationError(
+                f"Canonical training images must be {patch_size}×{patch_size}. "
+                "Segmentation crop saving arrives in Phase 7D."
+            )
+        self._refresh_segmentation_validation()
+        if self._segmentation_errors:
+            raise SegmentationError("; ".join(self._segmentation_errors))
+        conversion_metadata = {
+            "settings": converted.settings.to_mapping(),
+            "plane_indices": converted.plane.non_spatial_indices,
+            "axis_labels": list(converted.plane.axis_labels),
+            "normalization_stats": list(converted.normalization_stats),
+            "prediction": getattr(labels_layer, "metadata", {}).get("cci_prediction"),
+        }
+        result = self._segmentation_io.save(
+            image_data=converted.data,
+            sample_id=converted.sample_id,
+            mask=np.asarray(labels_layer.data),
+            instances=self._segment_instances,
+            source_path=self._source_path(self._annotation_image_layer),
+            conversion_metadata=conversion_metadata,
+        )
+        self._project.lock_image_processing(converted.settings.to_mapping())
+        self._project.lock_training_patch(patch_size, padding_value=114)
+        self._converted_image = converted
+        self._current_sample_id = converted.sample_id
+        self._annotation_dirty = False
+        labels_layer.metadata["cci_mask_path"] = str(result.mask_path)
+        self._label_status_label.setText(
+            f"Instances: {result.operation} {result.instance_count} object(s) · {result.mask_path}"
+        )
+        self._save_annotation_button.setText("Update Image + Instance Mask")
+        if show_message:
+            self._show_info(
+                f"Segmentation {result.operation}:\n{result.image_path.name}\n"
+                f"{result.mask_path.name}\n{result.instances_path.name}"
+            )
+        self._apply_project_processing_settings()
+        self._apply_project_patch_settings()
+        self._update_project_status()
+        self._refresh_annotation_browser(preferred=converted.sample_id)
+        return result
 
     def _save_converted_annotation(
         self,
@@ -1415,6 +1929,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _resolve_unsaved_changes(self) -> bool:
         if not self._annotation_dirty:
             return True
+        if self._project is not None and self._project.config.task == "segment":
+            return self._resolve_unsaved_segmentation()
         if (
             self._converted_image is not None
             and tuple(self._converted_image.data.shape[:2])
@@ -1463,6 +1979,47 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return False
         return True
 
+    def _resolve_unsaved_segmentation(self) -> bool:
+        if (
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            != (self._training_patch_size(),) * 2
+        ):
+            response = QMessageBox.warning(
+                self,
+                "Discard full-size working mask",
+                "This image is not the fixed training size. Segmentation crop saving "
+                "arrives in Phase 7D. Discard the current mask edits?",
+                QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response == QMessageBox.Discard:
+                self._annotation_dirty = False
+                return True
+            return False
+        response = QMessageBox.warning(
+            self,
+            "Unsaved instance mask",
+            "Save the current instance-mask edits before switching?",
+            QMessageBox.Save | QMessageBox.Discard,
+            QMessageBox.Save,
+        )
+        if response == QMessageBox.Discard:
+            self._annotation_dirty = False
+            return True
+        layer = self._segmentation_layer()
+        if layer is None or self._converted_image is None:
+            self._show_error("The current segmentation cannot be reconstructed safely.")
+            return False
+        try:
+            self._save_converted_segmentation(
+                self._converted_image, labels_layer=layer, show_message=False
+            )
+        except (SegmentationError, ImageConversionError, ProjectError, OSError) as exc:
+            self._show_error(f"Could not save the previous segmentation:\n{exc}")
+            return False
+        return True
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         if self._training_worker is not None and self._training_worker.isRunning():
             self._training_worker.request_cancel()
@@ -1487,6 +2044,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             )
         if not self._annotation_dirty:
             event.accept()
+            return
+        if self._project is not None and self._project.config.task == "segment":
+            if self._resolve_unsaved_segmentation():
+                event.accept()
+            else:
+                event.ignore()
             return
         if (
             self._converted_image is not None
@@ -2423,14 +2986,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     "Review: open a project to browse saved annotations."
                 )
                 return
-            self._review_entries = AnnotationBrowser(self._project).entries()
+            is_segment = self._project.config.task == "segment"
+            self._review_entries = (
+                SegmentationIO(self._project).entries()
+                if is_segment
+                else AnnotationBrowser(self._project).entries()
+            )
             invalid_count = 0
             for entry in self._review_entries:
                 if entry.errors:
                     invalid_count += 1
                 prefix = "⚠ " if entry.errors else ""
                 self._review_sample_combo.addItem(
-                    f"{prefix}{entry.sample_id} · {entry.box_count} box(es)",
+                    f"{prefix}{entry.sample_id} · {entry.box_count} "
+                    f"{'instance(s)' if is_segment else 'box(es)'}",
                     entry.sample_id,
                 )
             if previous:
@@ -2448,7 +3017,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._updating_review_combo = False
             self._update_action_state()
 
-    def _selected_review_entry(self) -> AnnotationReviewEntry | None:
+    def _selected_review_entry(
+        self,
+    ) -> AnnotationReviewEntry | SegmentationReviewEntry | None:
         sample_id = self._review_sample_combo.currentData()
         return next(
             (
@@ -2519,8 +3090,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             pass
         self._load_annotations_for_image(image_layer, force=True)
         self._review_status_label.setText(
-            f"Review: loaded {entry.sample_id} · {entry.box_count} box(es). "
-            "Edit the bbox layer, save, then use Previous or Next."
+            f"Review: loaded {entry.sample_id} · {entry.box_count} "
+            f"{'instance(s)' if self._project and self._project.config.task == 'segment' else 'box(es)'}. "
+            "Edit the annotation layer, save, then use Previous or Next."
         )
         try:
             self.napari_viewer.reset_view()
@@ -2545,7 +3117,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "Select a YOLO detection model",
+            f"Select a YOLO {self._project.config.task} model",
             str(self._project.paths.models),
             "YOLO models (*.pt *.onnx *.engine);;All files (*)",
         )
@@ -2557,7 +3129,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if self._project is None:
             return False
         try:
-            model = YoloDetectionModel(path)
+            model = (
+                YoloSegmentationModel(path)
+                if self._project.config.task == "segment"
+                else YoloDetectionModel(path)
+            )
             project_ids = set(self._project.config.classes)
             model_ids = set(model.names)
             if model_ids and model_ids != project_ids:
@@ -2608,7 +3184,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _on_predict(self) -> None:
         if self._project is None or self._model is None:
-            self._show_error("Open a project and choose a detection model first.")
+            self._show_error("Open a project and choose a matching YOLO model first.")
             return
         if self._inference_worker is not None and self._inference_worker.isRunning():
             return
@@ -2618,12 +3194,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         if not self._resolve_unsaved_changes():
             return
-        existing = self._annotation_layer()
+        existing = (
+            self._segmentation_layer()
+            if self._project.config.task == "segment"
+            else self._annotation_layer()
+        )
         if existing is not None and len(getattr(existing, "data", ())) > 0:
             response = QMessageBox.warning(
                 self,
-                "Replace bounding boxes",
-                "Prediction will replace the current bbox layer. Continue?",
+                "Replace annotations",
+                "Prediction will replace the current annotation layer. Continue?",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Cancel,
             )
@@ -2637,8 +3217,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._show_error(f"Could not start inference:\n{exc}")
             return
 
-        worker = InferenceWorker(self._model, converted.data, settings)
-        worker.progress.connect(self._on_inference_progress)
+        if self._project.config.task == "segment":
+            worker = SegmentationWorker(
+                self._model, converted.data, settings, self._project.config.classes
+            )
+        else:
+            worker = InferenceWorker(self._model, converted.data, settings)
+            worker.progress.connect(self._on_inference_progress)
         worker.succeeded.connect(self._on_inference_succeeded)
         worker.failed.connect(self._on_inference_failed)
         worker.cancelled.connect(self._on_inference_cancelled)
@@ -2648,7 +3233,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._inference_converted = converted
         self._inference_progress.setRange(0, 1)
         self._inference_progress.setValue(0)
-        self._inference_status_label.setText("Inference: preparing tiles")
+        self._inference_status_label.setText(
+            "Inference: predicting one image"
+            if self._project.config.task == "segment"
+            else "Inference: preparing tiles"
+        )
         self._update_action_state()
         worker.start()
 
@@ -2668,6 +3257,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._inference_status_label.setText(f"Inference: {text}")
 
     def _on_inference_succeeded(self, detections: object) -> None:
+        if isinstance(detections, ComposedInstances):
+            self._on_segmentation_inference_succeeded(detections)
+            return
         result = tuple(detections)
         image_layer = self._annotation_image_layer
         if image_layer is None or self._inference_sample_id is None:
@@ -2775,6 +3367,72 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._inference_status_label.setText(
             f"Inference: complete · {len(typed_result)} merged detection(s)"
         )
+
+    def _on_segmentation_inference_succeeded(
+        self, result: ComposedInstances
+    ) -> None:
+        image_layer = self._annotation_image_layer
+        if image_layer is None or self._inference_sample_id is None:
+            self._inference_status_label.setText(
+                "Inference: result discarded because the source image was closed"
+            )
+            return
+        if self._image_stem(image_layer) != self._inference_sample_id:
+            self._inference_status_label.setText(
+                "Inference: result discarded because the active Z/T plane changed"
+            )
+            return
+        existing = self._segmentation_layer()
+        if existing is not None:
+            self.napari_viewer.layers.remove(existing)
+        labels = self.napari_viewer.add_labels(
+            result.mask,
+            name=self.SEGMENTATION_LAYER_NAME,
+            metadata={
+                "cci_image_stem": self._inference_sample_id,
+                "cci_project_root": str(self._project.paths.root),
+                "cci_mask_path": None,
+                "cci_prediction": {
+                    "model_path": str(self._model.path) if self._model else None,
+                    "retina_masks": True,
+                    "largest_component_policy": "bbox_area",
+                },
+            },
+        )
+        self._segment_instances = result.instances
+        self._apply_instance_colors(labels)
+        try:
+            labels.events.data.connect(self._on_labels_data_changed)
+            labels.events.selected_label.connect(self._on_selected_instance_changed)
+        except (AttributeError, TypeError):
+            pass
+        self._converted_image = self._inference_converted
+        self._current_sample_id = self._inference_sample_id
+        direct_save = bool(
+            self._converted_image is not None
+            and tuple(self._converted_image.data.shape[:2])
+            == (self._training_patch_size(),) * 2
+        )
+        self._annotation_dirty = direct_save
+        removed_components = sum(item.removed_components for item in result.cleanup)
+        removed_pixels = sum(item.removed_pixels for item in result.cleanup)
+        self._label_status_label.setText(
+            f"Instances: {len(result.instances)} prediction(s), not yet saved. "
+            f"Cleanup removed {removed_components} component(s) / {removed_pixels} px."
+        )
+        self._save_annotation_button.setText(
+            "Save Prediction + Corrections"
+            if direct_save
+            else "Segmentation Crops Arrive in Phase 7D"
+        )
+        self._inference_progress.setRange(0, 1)
+        self._inference_progress.setValue(1)
+        self._inference_status_label.setText(
+            f"Inference: complete · {len(result.instances)} instance(s)"
+        )
+        self._refresh_segmentation_validation()
+        self._update_class_counts()
+        self._on_selected_instance_changed()
 
     def _on_inference_failed(self, message: str) -> None:
         self._inference_status_label.setText("Inference: failed")
@@ -3093,9 +3751,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _update_action_state(self) -> None:
         has_project = self._project is not None
+        is_segment = bool(has_project and self._project.config.task == "segment")
         image_layer = self._image_for_annotation()
         has_image = self._is_image_layer(image_layer)
         has_shapes = self._annotation_layer() is not None
+        has_mask = self._segmentation_layer() is not None
         has_editable_shapes = self._editable_bbox_layer() is not None
         has_crop = self._crop_bounds is not None
         has_crop_selection = (
@@ -3116,13 +3776,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         running = inference_running or training_running
         self._new_project_button.setEnabled(not running and not has_crop)
+        self._new_project_task_combo.setEnabled(not running and not has_crop)
         self._open_project_button.setEnabled(not running and not has_crop)
         self._edit_classes_button.setEnabled(
             has_project and not running and not has_crop
         )
         self._class_combo.setEnabled(has_project and not running)
         self._apply_class_button.setEnabled(
-            has_project and has_editable_shapes and not running
+            has_project
+            and (has_mask if is_segment else has_editable_shapes)
+            and not running
         )
         self._reload_labels_button.setEnabled(
             has_project and has_image and not running and not has_crop
@@ -3130,14 +3793,18 @@ class SimpleCciAnnotatorQWidget(QWidget):
         can_save_annotation = (
             has_project
             and has_image
-            and has_shapes
+            and (has_mask if is_segment else has_shapes)
             and direct_save_size
-            and not self._annotation_invalid_indices
+            and not (
+                self._segmentation_errors if is_segment else self._annotation_invalid_indices
+            )
             and not running
             and not has_crop
         )
         self._save_annotation_button.setEnabled(can_save_annotation)
-        self._validate_project_button.setEnabled(has_project and not running)
+        self._validate_project_button.setEnabled(
+            has_project and not is_segment and not running
+        )
         self._preview_button.setEnabled(
             has_project and has_image and not running and not has_crop
         )
@@ -3157,10 +3824,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
             has_project and not patch_locked and not running and not has_crop
         )
         self._select_crop_button.setEnabled(
-            has_project and has_image and not running
+            has_project and not is_segment and has_image and not running
         )
         self._create_crop_button.setEnabled(
-            has_project and has_crop_selection and not running
+            has_project and not is_segment and has_crop_selection and not running
         )
         self._save_crop_button.setEnabled(
             has_crop and not self._crop_invalid_indices and not running
@@ -3184,6 +3851,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and self._is_annotation_review_image(image_layer)
         )
         self._cancel_inference_button.setEnabled(inference_running)
+        selected_instance = self._selected_instance_id()
+        for control in (
+            self._new_instance_button,
+            self._delete_instance_button,
+            self._split_instance_button,
+            self._merge_instance_button,
+            self._largest_instance_button,
+        ):
+            control.setVisible(is_segment)
+        self._instance_details_label.setVisible(is_segment)
+        self._new_instance_button.setEnabled(is_segment and has_mask and not running)
+        for control in (
+            self._delete_instance_button,
+            self._split_instance_button,
+            self._merge_instance_button,
+            self._largest_instance_button,
+        ):
+            control.setEnabled(
+                is_segment and has_mask and selected_instance > 0 and not running
+            )
         for control in (
             self._device_combo,
             self._confidence_spin,
@@ -3196,20 +3883,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
             control.setEnabled(not running)
         has_training_model = self._training_model_combo.count() > 0
         self._validate_dataset_button.setEnabled(
-            has_project and not running and not has_crop
+            has_project and not is_segment and not running and not has_crop
         )
         self._preview_split_button.setEnabled(
-            has_project and not running and not has_crop
+            has_project and not is_segment and not running and not has_crop
         )
         self._regenerate_split_button.setEnabled(
-            has_project and not running and not has_crop
+            has_project and not is_segment and not running and not has_crop
         )
         self._retrain_button.setEnabled(
-            has_project and has_training_model and not running and not has_crop
+            has_project and not is_segment and has_training_model and not running and not has_crop
         )
         self._cancel_training_button.setEnabled(training_running)
         self._destination_button.setEnabled(
-            has_project and not running and not has_crop
+            has_project and not is_segment and not running and not has_crop
         )
         for control in (
             self._training_model_combo,
@@ -3225,7 +3912,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._training_device_combo,
             self._train_only_checkbox,
         ):
-            control.setEnabled(has_project and not running and not has_crop)
+            control.setEnabled(
+                has_project and not is_segment and not running and not has_crop
+            )
         self._training_tile_size_spin.setEnabled(False)
         self._set_processing_controls_enabled(
             has_project

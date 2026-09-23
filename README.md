@@ -3,14 +3,14 @@
 
 # Simple napari CCI annotator
 
-A project-based napari plugin for tiled YOLO bounding-box prediction, review, and annotation storage.
+A project-based napari plugin for YOLO bounding-box and instance-segmentation prediction, review, and annotation storage.
 
 The plugin is being rebuilt in milestones. Project persistence, multidimensional RGB conversion, multi-class annotation, large-image detection inference, movable failure crops, reproducible dataset building, and YOLO retraining are available.
 
 ## Current workflow
 
 1. Open the plugin in napari.
-2. Click **New Project** and select an empty folder, or click **Open Project** to reopen an initialized project.
+2. Select **Bounding-box detection** or **Instance segmentation**, then click **New Project** and select an empty folder. A project's task is fixed. Use **Open Project** to reopen one.
 3. Use **Edit Classes** to append or rename project classes when needed.
 4. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
 5. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
@@ -45,8 +45,20 @@ project/
 └── annotations/
     ├── images/
     ├── labels/
+    ├── masks/
+    ├── instances/
     └── audit.jsonl
 ```
+
+Detection projects use same-stem `images/*.png` + `labels/*.txt` pairs. Segmentation projects use same-stem triples:
+
+```text
+annotations/images/field_001.png
+annotations/masks/field_001.tif
+annotations/instances/field_001.json
+```
+
+Segmentation masks are lossless 2D `uint32` TIFF instance maps: `0` is background and every positive value is an instance ID. JSON metadata maps each ID to its class, confidence, review status, source, bounding box, pixel area, and merge/split lineage. Detection and segmentation annotations are never mixed in one project. Data from the retired segmentation plugin is not treated as a project and is not imported automatically; compatible YOLO segmentation checkpoints can still be selected.
 
 Images and labels are stored with the same stem:
 
@@ -90,6 +102,14 @@ Every shape stores `class_id` and `class_name`. The current-class selector sets 
 The **Review saved annotations** section lists every canonical image/label pair and provides **Previous**, **Load Selected**, **Next**, and **Save Corrections** controls in one place. **Save Corrections** uses the same atomic image/YOLO update path as the main annotation section. Invalid stored pairs receive a warning marker and an explanation instead of being loaded silently. During editing, malformed boxes or boxes extending outside the image receive a translucent red face while retaining their class-colored edge; both save buttons are disabled until every red box is corrected or deleted.
 
 Short tooltips on the image-processing, prediction, crop, review, split, and retraining controls explain what each parameter changes and highlight important speed, memory, and validation tradeoffs.
+
+## Instance segmentation (Phase 7A/7B)
+
+For a segmentation project, loading an image creates or reloads one editable `yolo_instances` napari Labels layer. Polygons are not shown. Select a project class, then use **New Mask Instance** to allocate an ID and paint it. The nearby actions apply a class, delete an instance, merge entered IDs into the selected ID, split a disconnected ID into 4-connected objects, or explicitly keep only the component with the largest bounding-box area. Per-class counts and selected-instance details remain visible.
+
+A loaded checkpoint must report Ultralytics task `segment` and the same class IDs as the project. Prediction uses the locked RGB conversion, requests retina masks, resizes masks back with nearest-neighbor interpolation when required, removes detached prediction contamination using the original plugin's largest-bbox-component rule, and resolves pixel overlaps by confidence. That cleanup is automatic only for model output; manual disconnected masks are flagged and require an explicit split or keep-largest action.
+
+The save and review controls atomically overwrite the same-stem image/mask/metadata triple and append an audit record. Saving is blocked for unknown IDs, missing or empty metadata, invalid classes, disconnected instances, shape mismatch, or non-integer IDs. Phase 7B currently supports direct saving only when the converted source is exactly the project's fixed 512 or 1024 training size. Large-image Dask tiling/fusion, movable segmentation crops, mask-to-polygon dataset construction, and segmentation retraining remain Phases 7C–7E.
 
 ## Large-image prediction and merging
 
