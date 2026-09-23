@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from skimage.measure import label, regionprops
@@ -29,6 +29,7 @@ class ComposedInstances:
     mask: np.ndarray
     instances: dict[int, InstanceRecord]
     cleanup: tuple[ComponentCleanup, ...]
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 def keep_largest_component_by_bbox(

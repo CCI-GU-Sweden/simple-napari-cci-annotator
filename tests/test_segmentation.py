@@ -9,6 +9,7 @@ import pytest
 import tifffile
 
 from simple_napari_cci_annotator._instance_mask import (
+    ComposedInstances,
     PredictedInstance,
     compose_predictions,
     disconnected_instance_ids,
@@ -21,7 +22,16 @@ from simple_napari_cci_annotator._segmentation_io import (
     SegmentationError,
     SegmentationIO,
 )
-from simple_napari_cci_annotator._tiled_inference import InferenceError, InferenceSettings
+from simple_napari_cci_annotator._segmentation_tiling import (
+    TiledSegmentationEngine,
+    _canonical_relabel,
+    _seam_equivalences,
+)
+from simple_napari_cci_annotator._tiled_inference import (
+    InferenceCancelled,
+    InferenceError,
+    InferenceSettings,
+)
 from simple_napari_cci_annotator._yolo_segmentation import YoloSegmentationModel
 
 
@@ -208,3 +218,110 @@ def test_segmentation_adapter_restores_source_resolution(tmp_path, monkeypatch):
     assert result.mask.shape == (4, 8)
     assert result.mask.dtype == np.uint32
     assert len(result.instances) == 1
+    assert result.provenance == {"mode": "direct"}
+
+
+class _FullTilePredictor:
+    def predict_image(self, image, settings, classes):
+        height, width = image.shape[:2]
+        mask = np.ones((height, width), dtype=np.uint32)
+        return ComposedInstances(
+            mask=mask,
+            instances={
+                1: InstanceRecord(
+                    instance_id=1,
+                    class_id=0,
+                    class_name=classes[0],
+                    confidence=0.8,
+                    source="prediction",
+                    status="predicted",
+                    bbox=(0, 0, height, width),
+                    area=height * width,
+                )
+            },
+            cleanup=(),
+        )
+
+
+def test_dask_tiling_pads_merges_and_relabels_deterministically():
+    image = np.zeros((100, 130, 3), dtype=np.uint8)
+    settings = InferenceSettings(
+        tile_size=64, overlap=16, max_detections=10
+    )
+    engine = TiledSegmentationEngine(_FullTilePredictor())
+
+    first = engine.predict(image, settings, {0: "Cell"})
+    second = engine.predict(image, settings, {0: "Cell"})
+
+    np.testing.assert_array_equal(first.mask, second.mask)
+    assert first.mask.shape == image.shape[:2]
+    assert set(np.unique(first.mask)) == {1}
+    assert len(first.instances) == 1
+    assert first.provenance["mode"] == "dask_tiled"
+    assert first.provenance["grid"] == [4, 5]
+    assert first.provenance["padding"] == {"bottom": 28, "right": 30}
+    assert first.provenance["equivalence_pairs"]
+
+
+def test_seam_fusion_is_class_aware_and_reports_ambiguity():
+    mask = np.asarray(
+        [
+            [1, 1, 2, 2],
+            [1, 1, 2, 2],
+            [3, 4, 5, 5],
+            [3, 4, 5, 5],
+        ],
+        dtype=np.uint32,
+    )
+    records = {
+        1: _record(1, 0),
+        2: _record(2, 1),
+        3: _record(3, 0),
+        4: _record(4, 0),
+        5: _record(5, 1),
+    }
+
+    pairs, conflicts, ambiguous = _seam_equivalences(mask, 2, records)
+
+    assert pairs == ((1, 3), (1, 4), (2, 5))
+    assert any(item["ids"] == [1, 2] for item in conflicts)
+    assert 1 in ambiguous
+    fused, fused_records, mapping = _canonical_relabel(
+        mask, records, {0: "Cell", 1: "Debris"}, pairs
+    )
+    assert mapping[1] == mapping[3] == mapping[4]
+    assert mapping[2] == mapping[5]
+    assert len(fused_records) == 2
+    assert set(np.unique(fused)) == {1, 2}
+
+
+def test_tiled_segmentation_rejects_nonpositive_core():
+    with pytest.raises(InferenceError, match="smaller than half"):
+        TiledSegmentationEngine(_FullTilePredictor()).predict(
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            InferenceSettings(tile_size=64, overlap=32),
+            {0: "Cell"},
+        )
+
+
+def test_tiled_segmentation_can_clear_source_border_instances():
+    result = TiledSegmentationEngine(_FullTilePredictor()).predict(
+        np.zeros((80, 90, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=16, max_detections=10),
+        {0: "Cell"},
+        clear_border_instances=True,
+    )
+
+    assert not np.any(result.mask)
+    assert result.instances == {}
+    assert result.provenance["cleared_border_ids"] == [1]
+
+
+def test_tiled_segmentation_honours_cancellation():
+    with pytest.raises(InferenceCancelled):
+        TiledSegmentationEngine(_FullTilePredictor()).predict(
+            np.zeros((80, 90, 3), dtype=np.uint8),
+            InferenceSettings(tile_size=64, overlap=16, max_detections=10),
+            {0: "Cell"},
+            cancelled=lambda: True,
+        )

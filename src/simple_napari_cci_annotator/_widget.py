@@ -123,6 +123,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     ANNOTATION_LAYER_NAME = "yolo_bboxes"
     SEGMENTATION_LAYER_NAME = "yolo_instances"
+    SEGMENTATION_TILE_LAYER_NAME = "segmentation_tile_grid"
     CROP_SELECTION_LAYER_NAME = "training_crop_selection"
     CROP_IMAGE_LAYER_NAME = "training_crop_rgb"
     CROP_BBOX_LAYER_NAME = "training_crop_bboxes"
@@ -420,6 +421,19 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._max_detections_spin.setToolTip(
             "Maximum detections YOLO may return from one prediction tile."
         )
+        self._clear_border_instances_checkbox = QCheckBox(
+            "Clear instances touching image border"
+        )
+        self._clear_border_instances_checkbox.setToolTip(
+            "Segmentation only: remove final merged instances that touch the source "
+            "image border. This can delete valid edge objects."
+        )
+        self._show_segmentation_grid_checkbox = QCheckBox(
+            "Show segmentation core grid"
+        )
+        self._show_segmentation_grid_checkbox.setToolTip(
+            "Segmentation only: show the Dask core-tile boundaries used for seam fusion."
+        )
         self._predict_button = QPushButton("Predict Current RGB Plane")
         self._predict_button.clicked.connect(self._on_predict)
         self._cancel_inference_button = QPushButton("Cancel")
@@ -654,6 +668,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         inference_form.addRow("Tile overlap", self._overlap_percent_spin)
         inference_form.addRow("Merge IoU", self._merge_iou_spin)
         inference_form.addRow("Max detections/tile", self._max_detections_spin)
+        inference_form.addRow(self._clear_border_instances_checkbox)
+        inference_form.addRow(self._show_segmentation_grid_checkbox)
         inference_buttons = QHBoxLayout()
         inference_buttons.addWidget(self._predict_button)
         inference_buttons.addWidget(self._cancel_inference_button)
@@ -937,6 +953,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         previous_mask = self._segmentation_layer()
         if previous_mask is not None:
             self.napari_viewer.layers.remove(previous_mask)
+        previous_grid = self._get_layer_by_name(self.SEGMENTATION_TILE_LAYER_NAME)
+        if previous_grid is not None:
+            self.napari_viewer.layers.remove(previous_grid)
         self._annotation_image_layer = None
         self._annotation_invalid_indices = ()
         self._project = project
@@ -1221,6 +1240,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self.napari_viewer.layers.remove(bbox_layer)
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
+        previous_grid = self._get_layer_by_name(self.SEGMENTATION_TILE_LAYER_NAME)
+        if previous_grid is not None:
+            self.napari_viewer.layers.remove(previous_grid)
         labels = self.napari_viewer.add_labels(
             mask,
             name=self.SEGMENTATION_LAYER_NAME,
@@ -3274,17 +3296,31 @@ class SimpleCciAnnotatorQWidget(QWidget):
             converted = self._convert_current_image(image_layer)
             settings = self._inference_settings()
             settings.validate()
+            if (
+                self._project.config.task == "segment"
+                and any(size > settings.tile_size for size in converted.data.shape[:2])
+                and settings.overlap * 2 >= settings.tile_size
+            ):
+                raise InferenceError(
+                    "Segmentation tiling requires overlap below half the tile size."
+                )
         except (ImageConversionError, InferenceError) as exc:
             self._show_error(f"Could not start inference:\n{exc}")
             return
 
         if self._project.config.task == "segment":
             worker = SegmentationWorker(
-                self._model, converted.data, settings, self._project.config.classes
+                self._model,
+                converted.data,
+                settings,
+                self._project.config.classes,
+                clear_border_instances=(
+                    self._clear_border_instances_checkbox.isChecked()
+                ),
             )
         else:
             worker = InferenceWorker(self._model, converted.data, settings)
-            worker.progress.connect(self._on_inference_progress)
+        worker.progress.connect(self._on_inference_progress)
         worker.succeeded.connect(self._on_inference_succeeded)
         worker.failed.connect(self._on_inference_failed)
         worker.cancelled.connect(self._on_inference_cancelled)
@@ -3446,6 +3482,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         existing = self._segmentation_layer()
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
+        settings = self._inference_settings()
         labels = self.napari_viewer.add_labels(
             result.mask,
             name=self.SEGMENTATION_LAYER_NAME,
@@ -3457,9 +3494,17 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     "model_path": str(self._model.path) if self._model else None,
                     "retina_masks": True,
                     "largest_component_policy": "bbox_area",
+                    "tile_size": settings.tile_size,
+                    "tile_overlap": settings.overlap,
+                    "confidence": settings.confidence,
+                    "model_iou": settings.model_iou,
+                    "max_detections": settings.max_detections,
+                    "device": str(settings.device),
+                    "tiling": result.provenance,
                 },
             },
         )
+        self._update_segmentation_tile_grid(result.provenance, result.mask.shape)
         self._segment_instances = result.instances
         self._apply_instance_colors(labels)
         try:
@@ -3490,10 +3535,49 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._inference_progress.setValue(1)
         self._inference_status_label.setText(
             f"Inference: complete · {len(result.instances)} instance(s)"
+            + (
+                f" · {len(result.provenance.get('equivalence_pairs', ()))} seam pair(s)"
+                if result.provenance.get("mode") == "dask_tiled"
+                else " · direct"
+            )
         )
         self._refresh_segmentation_validation()
         self._update_class_counts()
         self._on_selected_instance_changed()
+
+    def _update_segmentation_tile_grid(
+        self, provenance: dict, image_shape: tuple[int, int]
+    ) -> None:
+        previous = self._get_layer_by_name(self.SEGMENTATION_TILE_LAYER_NAME)
+        if previous is not None:
+            self.napari_viewer.layers.remove(previous)
+        if (
+            not self._show_segmentation_grid_checkbox.isChecked()
+            or provenance.get("mode") != "dask_tiled"
+        ):
+            return
+        core_size = int(provenance["core_size"])
+        height, width = image_shape
+        rectangles = []
+        for y0 in range(0, height, core_size):
+            for x0 in range(0, width, core_size):
+                y1 = min(y0 + core_size, height)
+                x1 = min(x0 + core_size, width)
+                rectangles.append(
+                    np.asarray(
+                        [[y0, x0], [y0, x1], [y1, x1], [y1, x0]],
+                        dtype=float,
+                    )
+                )
+        grid = self.napari_viewer.add_shapes(
+            rectangles,
+            name=self.SEGMENTATION_TILE_LAYER_NAME,
+            shape_type="rectangle",
+            edge_width=1,
+            edge_color="cyan",
+            face_color="transparent",
+        )
+        grid.metadata["cci_segmentation_tile_grid"] = provenance
 
     def _on_inference_failed(self, message: str) -> None:
         self._inference_status_label.setText("Inference: failed")
@@ -3940,8 +4024,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._tile_size_spin,
             self._overlap_percent_spin,
             self._max_detections_spin,
+            self._clear_border_instances_checkbox,
+            self._show_segmentation_grid_checkbox,
         ):
             control.setEnabled(not running)
+        self._clear_border_instances_checkbox.setVisible(is_segment)
+        self._show_segmentation_grid_checkbox.setVisible(is_segment)
         has_training_model = self._training_model_combo.count() > 0
         self._validate_dataset_button.setEnabled(
             has_project and not is_segment and not running and not has_crop

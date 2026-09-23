@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 from PIL import Image
@@ -33,6 +34,7 @@ class YoloSegmentationModel:
             )
         self.path = path
         self.names = _normalise_names(getattr(self.model, "names", {}))
+        self._prediction_lock = Lock()
 
     def predict_image(
         self,
@@ -45,25 +47,26 @@ class YoloSegmentationModel:
             raise InferenceError("Segmentation inference requires an RGB uint8 image.")
         bgr = np.ascontiguousarray(array[..., ::-1])
         try:
-            results = self.model.predict(
-                source=bgr,
-                imgsz=settings.tile_size,
-                conf=settings.confidence,
-                iou=settings.model_iou,
-                max_det=settings.max_detections,
-                device=settings.device,
-                retina_masks=True,
-                verbose=False,
-            )
+            with self._prediction_lock:
+                results = self.model.predict(
+                    source=bgr,
+                    imgsz=settings.tile_size,
+                    conf=settings.confidence,
+                    iou=settings.model_iou,
+                    max_det=settings.max_detections,
+                    device=settings.device,
+                    retina_masks=True,
+                    verbose=False,
+                )
         except Exception as exc:
             raise InferenceError(f"YOLO segmentation prediction failed: {exc}") from exc
         if not results:
-            return compose_predictions((), array.shape[:2], classes)
+            return _direct_result((), array.shape[:2], classes)
         result = results[0]
         boxes = getattr(result, "boxes", None)
         masks = getattr(result, "masks", None)
         if boxes is None or masks is None or len(boxes) == 0:
-            return compose_predictions((), array.shape[:2], classes)
+            return _direct_result((), array.shape[:2], classes)
         mask_data = _to_numpy(masks.data)
         xyxy = _to_numpy(boxes.xyxy)
         confidence = _to_numpy(boxes.conf).reshape(-1)
@@ -91,4 +94,10 @@ class YoloSegmentationModel:
                     confidence=float(score),
                 )
             )
-        return compose_predictions(predictions, (height, width), classes)
+        return _direct_result(predictions, (height, width), classes)
+
+
+def _direct_result(predictions, image_shape, classes) -> ComposedInstances:
+    result = compose_predictions(predictions, image_shape, classes)
+    result.provenance.update({"mode": "direct"})
+    return result

@@ -103,15 +103,23 @@ The **Review saved annotations** section lists every canonical image/label pair 
 
 Short tooltips on the image-processing, prediction, crop, review, split, and retraining controls explain what each parameter changes and highlight important speed, memory, and validation tradeoffs.
 
-## Instance segmentation (Phase 7A/7B)
+## Instance segmentation (Phases 7A–7C)
 
 For a segmentation project, loading an image creates or reloads one editable `yolo_instances` napari Labels layer. Polygons are not shown. Select a project class, then use **New Mask Instance** to allocate an ID and paint it. The nearby actions apply a class, delete an instance, merge entered IDs into the selected ID, split a disconnected ID into 4-connected objects, or explicitly keep only the component with the largest bounding-box area. Per-class counts and selected-instance details remain visible.
 
 A loaded checkpoint must report Ultralytics task `segment` and the same class IDs as the project. Prediction uses the locked RGB conversion, requests retina masks, resizes masks back with nearest-neighbor interpolation when required, removes detached prediction contamination using the original plugin's largest-bbox-component rule, and resolves pixel overlaps by confidence. That cleanup is automatic only for model output; manual disconnected masks are flagged and require an explicit split or keep-largest action.
 
-The save and review controls atomically overwrite the same-stem image/mask/metadata triple and append an audit record. Saving is blocked for unknown IDs, missing or empty metadata, invalid classes, disconnected instances, shape mismatch, or non-integer IDs. Phase 7B currently supports direct saving only when the converted source is exactly the project's fixed 512 or 1024 training size. Large-image Dask tiling/fusion, movable segmentation crops, mask-to-polygon dataset construction, and segmentation retraining remain Phases 7C–7E.
+The save and review controls atomically overwrite the same-stem image/mask/metadata triple and append an audit record. Saving is blocked for unknown IDs, missing or empty metadata, invalid classes, disconnected instances, shape mismatch, or non-integer IDs. Direct saving currently requires the converted source to be exactly the project's fixed 512 or 1024 training size. Movable segmentation crops, mask-to-polygon dataset construction, and segmentation retraining remain Phases 7D–7E.
 
-## Large-image prediction and merging
+### Large-image segmentation tiling and fusion
+
+Segmentation images larger than the configured tile size automatically use the Phase 7C Dask path. The core size is `tile_size − 2 × overlap`; overlap must therefore remain below half the tile size. The source is reflection-padded to a complete core grid, each core receives reflected inference halos, and model calls remain mutex-serialized for GPU safety. Temporary IDs are allocated from deterministic per-tile ranges, while confidence determines pixel ownership inside each tile.
+
+After inference, directly adjacent IDs across every one-pixel core seam are fused only when their project classes match. A deterministic union/find pass handles transitive groups and compacts them into stable final IDs. Cross-class contacts are retained separately and reported as conflicts. One-to-many seam contacts are also recorded as ambiguous because the compatibility rule may join touching objects. Tile size, overlap, core grid, padding, temporary-to-final mapping, seam pairs, conflicts, ambiguities, component cleanup, and optional border removals are attached to prediction provenance and enter the audit record when saved.
+
+The optional **Show segmentation core grid** control adds a cyan debug Shapes layer. **Clear instances touching image border** removes merged edge objects and should only be enabled when border objects are known contaminants.
+
+## Large-image bbox prediction and merging
 
 Inference always uses the same converted RGB `uint8` pixels shown by **Preview RGB Conversion** and stored for training. Images are covered by deterministic square tiles (1024 pixels and 20% overlap by default). Images smaller than a tile are reflection-padded for inference; detections centered in padding are discarded.
 

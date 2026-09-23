@@ -566,7 +566,7 @@ Ultralytics instance-segmentation training requires polygon rows, even though us
 
 ### Phase 7 — Segmentation adapter
 
-**Status: in progress. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. Phase 7A contracts and the first single-image Phase 7B workflow are implemented; tiled fusion, segmentation crops, and retraining remain separate later phases. Backward compatibility with projects from the personal plugin is intentionally out of scope because it did not define project storage. Existing segmentation model weights may be reused when their task and class IDs match.**
+**Status: in progress. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. Phase 7A contracts, the Phase 7B mask-first workflow, and Phase 7C Dask tiling/fusion are implemented; segmentation crops and retraining remain separate later phases. Backward compatibility with projects from the personal plugin is intentionally out of scope because it did not define project storage. Existing segmentation model weights may be reused when their task and class IDs match.**
 
 Recommended decisions to confirm before implementation:
 
@@ -620,6 +620,8 @@ Pinned-repository inventory:
 **Exit criteria:** a small image can be predicted, corrected entirely as a Labels layer, saved, closed, and reloaded with identical pixels, instance IDs, classes, and metadata. No polygon is shown to the user.
 
 #### Phase 7C — Large-image Dask tiling and old-strategy fusion
+
+**Implementation status: baseline path implemented; pinned real-model golden comparison remains.** Large segmentation inputs are padded to a deterministic core grid and evaluated with Dask `map_overlap`, reflected halos, serialized model access, deterministic per-tile temporary ID ranges, per-tile confidence ownership, and largest-bbox component cleanup. One-pixel seams feed a same-class deterministic union/find relabeler; cross-class contacts and one-to-many ambiguity are reported rather than merged. The Labels layer stores full tiling provenance, optional source-border clearing is available, and a cyan core-grid debug overlay can be enabled from the inference UI. Deterministic synthetic parity fixtures pass; comparison against the pinned repository's real-model golden images remains before declaring the full exit criterion complete. Hardened seam metrics remain a future comparison mode rather than silently replacing parity behavior.
 
 Port the original strategy as the first parity implementation:
 

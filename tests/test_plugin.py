@@ -71,7 +71,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.8.3"
+    assert simple_napari_cci_annotator.__version__ == "0.9.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -1108,7 +1108,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.8.3" in text
+    assert "plugin_version: 0.9.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1255,6 +1255,8 @@ def test_parameter_controls_have_tooltips(qtbot):
         widget._merge_iou_spin,
         widget._tile_size_spin,
         widget._overlap_percent_spin,
+        widget._clear_border_instances_checkbox,
+        widget._show_segmentation_grid_checkbox,
         widget._patch_size_combo,
         widget._training_model_combo,
         widget._validation_fraction_spin,
@@ -1553,6 +1555,14 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     labels = widget._segmentation_layer()
     assert labels is not None
     assert labels.data.dtype == np.uint32
+    widget._show_segmentation_grid_checkbox.setChecked(True)
+    widget._update_segmentation_tile_grid(
+        {"mode": "dask_tiled", "core_size": 400},
+        labels.data.shape,
+    )
+    grid = widget._get_layer_by_name(widget.SEGMENTATION_TILE_LAYER_NAME)
+    assert grid is not None
+    assert len(grid.data) == 9
 
     widget._invert_checkbox.setChecked(True)
     widget._on_new_mask_instance()
