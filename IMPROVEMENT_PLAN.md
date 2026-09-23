@@ -45,7 +45,7 @@ The main limitations observed in the current repository are:
 
 ### 3.1 Related segmentation repository and consolidation strategy
 
-There is already a useful experimental base in Simon Leclerc's public [napari-cci-yolo-segmentation repository](https://github.com/leclercsimon74/napari-cci-yolo-segmentation). It is not distributed on PyPI and is intended to remain on the personal GitHub account, then be discontinued once the useful work has been consolidated here. This repository should therefore be treated as a **migration source and design reference**, not as a runtime dependency, Git submodule, or separately maintained companion plugin.
+There is already a useful experimental base in Simon Leclerc's public [napari-cci-yolo-segmentation repository](https://github.com/leclercsimon74/napari-cci-yolo-segmentation). The migration baseline is pinned to commit [`b0b14ca1048449008495e7e8e972e3c13479668c`](https://github.com/leclercsimon74/napari-cci-yolo-segmentation/tree/b0b14ca1048449008495e7e8e972e3c13479668c). It is not distributed on PyPI and is intended to remain on the personal GitHub account, then be discontinued once the useful work has been consolidated here. This repository should therefore be treated as a **migration source and design reference**, not as a runtime dependency, Git submodule, or separately maintained companion plugin.
 
 The segmentation repository is MIT-licensed. If substantial code is copied or adapted, retain its copyright and MIT notice as required, preserve use
 ful commit provenance in the migration commit/PR, and document the source module in comments or release notes. After parity is reached and the relevant behavior is covered here, archive the personal repository as read-only and update its README to point users to this plugin. Do not delete it: its history is useful for provenance and regression investigation.
@@ -53,9 +53,9 @@ ful commit provenance in the migration commit/PR, and document the source module
 Repository review found several concrete pieces worth carrying forward:
 
 - `yolo_tiling_segmentation.py` uses Dask `map_overlap` to run inference on overlapped chunks, with a core/chunk size of `tile_size - 2 × overlap`, reflected padding at the image boundary, trimming back to the original dimensions, and threaded computation.
-- It assigns thread-safe, globally unique instance IDs and retains YOLO confidence per instance.
+- It assigns thread-safe, globally unique instance IDs and retains YOLO confidence per instance. When predicted masks overlap, the higher-confidence instance owns the pixel.
 - It reconciles instance IDs at horizontal and vertical chunk seams using an equivalence table and union/find-style grouping, then relabels equivalent objects consistently.
-- It includes a largest-connected-component cleanup and optional clearing of image-border objects.
+- It filters every predicted instance to one connected component, selecting the component with the **largest bounding-box area** rather than the greatest pixel area. This is the required parity behavior for removing detached bbox/mask contamination. It also supports optional clearing of image-border objects.
 - The GUI records tiling metadata on the napari layer and can display the tile grid, which is valuable for debugging and user trust.
 - Its training pipeline pairs images and masks by stem, splits source pairs deterministically at 80/20 **before** tiling, produces fixed 1024-pixel training tiles without resizing, pads edge tiles, retains a controlled sample of empty tiles, and verifies that retraining produced a segmentation checkpoint.
 - Its tests already contain seam-equivalence, chunk-size, component filtering, tiling, pairing, split, and segmentation-training fixtures that can guide equivalent tests here.
@@ -409,9 +409,57 @@ Projects begin with one configured class for the simplest workflow, but detectio
 - Write all dataset names from the project class map and reject unknown IDs.
 - Avoid function signatures that accept a hard-coded class `0` or `[(0, "LABEL")]`.
 
-For future YOLO segmentation, use [napari-cci-yolo-segmentation](https://github.com/leclercsimon74/napari-cci-yolo-segmentation) as the migration baseline rather than starting again. Define an `AnnotationGeometry` boundary: bbox uses `xywh` lines and rectangle shapes; segmentation uses polygon coordinates and polygon/labels layers. Project storage, pairing, device reporting, splitting, Dask-capable tiling provenance, workers, and run metadata can be shared. Do not mix bbox and segmentation rows in one label file or one annotation layer. Model task compatibility must be checked when a model is loaded.
+For future YOLO segmentation, use [napari-cci-yolo-segmentation](https://github.com/leclercsimon74/napari-cci-yolo-segmentation) as the migration baseline rather than starting again. Define an `AnnotationGeometry` boundary: bbox uses `xywh` rows and rectangle Shapes layers; segmentation is edited and persisted as dense instance masks in napari Labels layers. YOLO polygon rows are an **export/training adapter only** and are never the primary user-facing editor. Project storage, pairing, device reporting, splitting, Dask-capable tiling provenance, workers, and run metadata can be shared. Do not mix bbox and segmentation annotations in one canonical label file or napari layer. Model task compatibility must be checked when a model is loaded.
 
 The old repository's Dask label fusion belongs specifically on the segmentation side of this boundary: its overlapped label chunks, unique IDs, seam-equivalence graph, relabeling, and confidence metadata should become a tested `SegmentationMerger`. Bounding-box fusion remains a separate `DetectionMerger`. Both can share tile bounds and provenance, but trying to force masks and boxes through one merge algorithm would make both less reliable.
+
+### 10.1 Proposed segmentation annotation contract
+
+The primary segmentation representation should be a dense **instance-ID image**, not one binary mask per class and not visible polygons:
+
+- Pixel value `0` is background; every non-zero value is a project/sample-local instance ID.
+- A companion instance table maps `instance_id → class_id, class_name, confidence, source, review status, bbox, area`, plus optional tile/model provenance. Class is metadata on an instance, not encoded directly in the pixel value.
+- One napari Labels layer can therefore contain all classes and all instances. Use the project class color as the base display color, with an optional deterministic brightness variation per instance so touching instances remain visible.
+- Brush/fill/erase edits operate on instance IDs. The GUI needs **Current class**, **New instance**, **Select instance**, **Delete instance**, **Split disconnected components**, and **Merge selected instances** actions. Repainting an existing ID preserves its class; creating a new ID uses the selected class.
+- Saving writes a same-stem normalized RGB image, lossless integer instance mask, and instance metadata sidecar atomically. The exact on-disk mask type must be selected deliberately: `uint16` PNG is compact but limited to 65,535 IDs; `uint32` TIFF or a lossless compressed array avoids that ceiling. Never use a palette/color image as the canonical mask.
+- Audit events record mask checksum, instance count, per-class instance/pixel counts, conversion settings, model and tiling settings, discarded components, and all automatic repairs. Empty masks are valid reviewed negatives.
+
+Using `skimage.measure.label` on one binary mask per class is acceptable only as an import/convenience operation. It requires distinct same-class objects to be separated by at least one background pixel (and its diagonal behavior depends on connectivity); touching objects collapse into one instance and cannot be recovered automatically. The canonical instance-ID map avoids this limitation because adjacent objects may retain different integer IDs even with no background pixel between them. A semantic class map alone is therefore insufficient for YOLO instance-segmentation retraining.
+
+### 10.2 Mask cleanup and bbox-contamination rule
+
+Preserve the old repository's `keep_largest_component_per_label` semantics as the default compatibility filter:
+
+1. Threshold each YOLO instance mask.
+2. Label its connected components with four-connectivity (`connectivity=1`).
+3. Compute each component's enclosing bbox area `(height × width)`.
+4. Retain only the component with the largest bbox area and discard the others before it enters the shared label image.
+5. Record how many pixels/components were removed and expose an optional debug overlay; never silently alter a manually edited canonical mask during save.
+
+Apply this filter to raw per-detection model output before overlap composition, and make the same check available as an explicit repair/validation action after tile merging or manual editing. Do not automatically apply it to user corrections: a biologically valid instance may genuinely have disconnected parts. Validation should instead flag multi-component instances and offer **Keep largest by bbox**, **Split into instances**, or **Keep as-is**.
+
+The bbox-area choice is intentionally retained for parity and contamination removal, but it can prefer a sparse elongated artifact over a compact object. Record both bbox area and pixel area so a later project option can compare `largest_bbox`, `largest_pixel_area`, or model/bbox-constrained selection without changing old-project behavior.
+
+### 10.3 Multi-class overlap policy
+
+Extend the old single-class merger without changing its geometric strategy:
+
+- Carry `class_id` alongside every temporary/global instance ID.
+- Only create seam equivalences between IDs of the same class. Different classes may touch but must never be unioned.
+- Where masks overlap in a tile or halo, the higher-confidence instance owns the pixel, matching the old implementation. Use a deterministic tie-breaker (confidence, then stable tile/order ID) and audit ties.
+- After union/find, assign one canonical ID per equivalence group, preserve its class, and aggregate confidence explicitly (initial parity: maximum member confidence).
+- If one equivalence group somehow contains multiple classes, treat it as a merge error, show the relevant seam/tile IDs, and keep the instances separate.
+- Keep instance ID and class ID as separate concepts throughout storage, display, export, and training. A label pixel value must never be assumed to equal a YOLO class ID.
+
+### 10.4 Invisible polygon export boundary
+
+Ultralytics instance-segmentation training requires polygon rows, even though users edit masks. Generate those polygons only inside an immutable retrain snapshot:
+
+- For each instance ID, retrieve its class from the instance table, apply the selected component policy, trace the exterior contour, simplify it within a configured pixel tolerance, normalize coordinates, and write one YOLO segmentation row.
+- Validate at least three distinct points, finite coordinates, in-range normalized values, non-zero polygon area, class existence, and contour/bbox agreement.
+- Quantify raster-mask → polygon → raster round-trip IoU and reject or warn below a configured threshold. Record simplification tolerance and round-trip metrics in the tile manifest.
+- Define behavior for holes and multiple contours explicitly. YOLO's simple polygon row cannot faithfully encode every topology; initial compatibility mode keeps the largest bbox component and exterior contour, with a warning when holes or discarded islands exist.
+- Never overwrite the canonical mask with its simplified polygon reconstruction. Retraining output is derived data and remains reproducible from the run snapshot.
 
 ## 11. Implementation phases
 
@@ -516,14 +564,94 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 **Exit criteria:** a user can infer an arbitrary-size image, move a fixed crop over a failure, correct local boxes, save an exact-size YOLO pair, repeat at other locations, retrain, and restart the loop without coordinate drift or source leakage.
 
-### Later — Segmentation adapter
+### Phase 7 — Segmentation adapter
 
-- Migrate from the personal segmentation repository at the pinned baseline rather than reimplementing from memory.
-- Detect YOLO model task and route to bbox or polygon annotation layers.
-- Port and harden its Dask `map_overlap` prediction, reflected padding, instance-confidence tracking, seam-equivalence/union-find relabeling, and relevant tests into task-specific modules.
-- Add polygon label I/O, tiled polygon clipping/merging, ambiguous-seam handling, and segmentation-specific validation.
-- Reuse project/run/device/split infrastructure while keeping task-specific formats separate.
-- Compare old and new outputs on golden large-image fixtures, publish migration instructions, then mark the personal repository discontinued and archive it with a pointer to this project.
+**Status: planned. Baseline pinned to segmentation repository commit `b0b14ca1048449008495e7e8e972e3c13479668c`. No segmentation implementation should begin until the storage choices in Phase 7A are resolved in code-facing design records.**
+
+Recommended decisions to confirm before implementation:
+
+| Question | Recommended default | Reason |
+|---|---|---|
+| User-facing geometry | One napari Labels instance map | Matches the original mask-first workflow; no visible polygons. |
+| Multi-class representation | Instance ID pixels plus a separate instance→class table | Supports many classes and touching instances in one layer without encoding class into pixel IDs. |
+| Binary class-mask conversion | Optional import/split tool using `skimage.measure.label(connectivity=1)` | Convenient when objects are separated, but touching same-class objects cannot be recovered. |
+| Detached mask contamination | Keep the connected component with the largest bbox area for model output | Exact compatibility with the original repository; report every removal. |
+| Manual disconnected instance | Warn and offer keep/split/largest; do not silently filter | User corrections must not be destroyed by an automatic prediction cleanup rule. |
+| Initial tile fusion | Original one-pixel seam equivalence plus union/find, extended to require equal class | Preserves the known strategy while preventing cross-class fusion. |
+| Training representation | Derive YOLO polygons invisibly inside each run | Keeps masks canonical and the GUI simple while remaining compatible with Ultralytics. |
+
+#### Phase 7A — Contracts, migration inventory, and fixtures
+
+- Inventory the pinned repository modules and tests as `reuse`, `adapt`, `rewrite`, or `retire`. At minimum cover `yolo_tiling_segmentation.py`, `_gui.py`, `_segmentation_training.py`, and both segmentation test modules.
+- Add a project task contract: initially one project is either `detect` or `segment`, fixed after the first canonical annotation. Do not put bbox `.txt` files and masks under an ambiguous shared annotation type.
+- Finalize canonical segmentation paths, for example `annotations/images/`, `annotations/masks/`, and `annotations/instances/`, with same-stem triples and atomic update/rollback.
+- Decide the canonical integer mask format after testing napari, Pillow/tifffile, Windows, and maximum-instance behavior. Prefer a lossless `uint32` format unless interoperability requirements justify a guarded `uint16` limit.
+- Define and version the instance metadata schema, including class, confidence, review status, bbox, area, source, and lineage after merge/split.
+- Copy the old seam, component-filtering, tile, and training fixtures with attribution. Add golden outputs generated by the pinned commit before changing algorithms.
+- Add task-aware model inspection and reject detection weights in a segmentation project (and vice versa) before prediction or retraining.
+- Ignore backward compatibility
+
+**Exit criteria:** a versioned mask/instance contract exists; old fixtures run locally; task mismatch and unsupported mask dtype fail clearly; no GUI or model code needs to guess what a pixel value means.
+
+#### Phase 7B — Single-image segmentation and mask-first editing
+
+- Add an Ultralytics segmentation adapter returning per-instance `{mask, bbox, class_id, confidence}` records in source-image coordinates.
+- Reuse the locked project RGB conversion exactly as bbox inference does. Request full-resolution/retina masks where supported and resize binary masks with nearest-neighbor only.
+- Before composition, apply the pinned largest-connected-component-by-bbox filter to every predicted mask and record removed contamination.
+- Compose predictions into one `uint32` instance map using confidence ownership for overlapping pixels, stable instance IDs, and a companion instance table.
+- Show one editable napari Labels layer, not polygons. Provide class-aware instance selection, new/delete/merge/split actions, per-class counts, and confidence/details for the selected instance.
+- Add live validation for unknown instance IDs, missing metadata, invalid classes, disconnected instances, empty metadata entries, out-of-image shape mismatch, and mask values exceeding the chosen storage type.
+- Save, review, navigate, overwrite, audit, close, and reload segmentation triples without instance-ID or class drift.
+
+**Exit criteria:** a small image can be predicted, corrected entirely as a Labels layer, saved, closed, and reloaded with identical pixels, instance IDs, classes, and metadata. No polygon is shown to the user.
+
+#### Phase 7C — Large-image Dask tiling and old-strategy fusion
+
+Port the original strategy as the first parity implementation:
+
+1. Compute `chunk_size = tile_size - 2 × overlap` and reject non-positive cores.
+2. Pad the source to a complete core grid; use reflected image halos for inference and constant-zero padding for label-equivalence passes.
+3. Run per-chunk segmentation through Dask `map_overlap(..., depth=overlap, boundary="reflect", trim=True)`. Keep the model mutex initially because the old code serializes model calls safely; benchmark controlled GPU batching later.
+4. Allocate globally unique temporary IDs thread-safely and store class/confidence metadata for every ID.
+5. Apply largest-component-by-bbox filtering per predicted mask, then resolve overlapping pixels by confidence.
+6. Scan one-pixel horizontal and vertical core seams, collect **same-class** neighboring ID pairs, group transitive equivalences with union/find, and relabel every group to one deterministic canonical ID.
+7. Remap class/confidence/provenance tables to canonical IDs, trim to the original image extent, and optionally clear image-border instances.
+
+Keep the tile-grid/debug overlay and store `tile_size`, overlap, core size, padding, temporary-to-final ID mapping, equivalence pairs, class conflicts, and component removals in layer/run provenance. Prediction and merge may remain separate debug buttons during parity work; combine them only after golden comparisons pass.
+
+The one-pixel seam rule can incorrectly join two distinct touching objects or fail when fragments do not touch exactly after thresholding. Preserve it for baseline parity, but flag ambiguous one-to-many and many-to-one seam groups. A later hardened mode may require a minimum seam-contact length, halo IoU, bbox compatibility, or confidence agreement; it must be compared against the pinned output rather than silently replacing it.
+
+**Exit criteria:** golden large-image fixtures match the old repository for single-class output, multi-class fragments merge only within class, IDs are deterministic after canonical relabeling, and memory remains bounded for images much larger than one tile.
+
+#### Phase 7D — Movable mask crops and correction accumulation
+
+- Reuse the fixed 512/1024 movable crop workflow, but crop the normalized RGB image plus the instance map and instance table.
+- Translate/reindex crop-local instance IDs deterministically while retaining source instance lineage and class.
+- Define boundary policy separately from bbox: a cropped mask may be intentionally partial, but disconnected slivers and instances entering synthetic padding must be highlighted. Do not infer class from pixel ID.
+- Save same-stem image/mask/instance triples into the persistent annotation pool. Saving the same source/crop updates it rather than creating a timestamp duplicate.
+- Extend **Review saved annotations** to task-aware bbox or mask correction while keeping one-click save and previous/next navigation.
+
+**Exit criteria:** users can move a crop over a segmentation failure, paint/erase/split/merge instances, assign classes, save it, return to the source, and repeat without mask-coordinate or metadata drift.
+
+#### Phase 7E — Mask-to-YOLO dataset construction and retraining
+
+- Split by audited source group before deriving tiles, preserving the existing stable train/validation contract and reviewed-negative masks.
+- Tile canonical image/mask pairs only inside the immutable run. Keep related masks, instance metadata, and image tiles paired by stem.
+- Apply the explicit component policy and invisible polygon exporter from §10.4. Store derived polygon labels, mask tiles for inspection, round-trip IoU, discarded components, and per-class counts in the run snapshot.
+- Reject cross-class instance metadata errors, invalid polygons, topology loss beyond threshold, masks in synthetic padding, and train/validation source leakage before starting Ultralytics.
+- Train only a segmentation checkpoint, retain all artifacts, promote `best.pt` into `project/models/<run-name>.pt`, and record the task/class map in model lineage.
+- Add a CPU smoke fixture plus mocked multi-class and empty-mask runs. Compare a small retrain snapshot with the pinned repository where contracts overlap.
+
+**Exit criteria:** mask-only user annotations produce a standard YOLO segmentation dataset without manual polygons; a retrained segmentation model can be loaded and used to restart the correction loop reproducibly.
+
+#### Phase 7F — Consolidation and retirement of the personal plugin
+
+- Run golden-image comparisons covering small prediction, large tiled prediction, seam fusion, largest-bbox filtering, optional border clearing, crop save, and retraining export.
+- Document intentional differences, especially class-aware merging, canonical mask metadata, deterministic final IDs, and stricter project/audit behavior.
+- Publish migration instructions for old `images/` + `masks/` datasets and checkpoints. Import non-destructively into a new segmentation project; never rewrite the old dataset in place.
+- Update the personal repository README to point here, tag its final migration baseline, and archive it read-only after the required workflows reach parity. Keep it available for provenance and regression investigation.
+
+**Exit criteria:** this plugin covers the old supported workflow plus multi-class instance metadata; migration is documented and tested; the personal repository can be discontinued without losing reproducibility.
 
 ## 12. Testing and acceptance strategy
 
@@ -539,6 +667,11 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 - Box clipping/retained-area rules for generated training tiles.
 - Stable grouped splitting, seed reproducibility, incremental additions, positive/negative balance, and no group leakage.
 - Device/config validation and config schema migration.
+- Instance-map and instance-table round trips, including touching same-class and different-class instances, empty masks, large IDs, and missing/orphan metadata.
+- Largest-component-by-bbox selection where bbox area and pixel area choose different components, plus explicit verification that manual masks are never filtered silently.
+- Mask overlap ownership by confidence, deterministic ties, class-aware seam equivalence, transitive union/find groups, ID canonicalization, and metadata remapping.
+- `skimage.label` import behavior for one-pixel gaps, direct/diagonal contacts, and configurable connectivity.
+- Mask→polygon→mask round-trip IoU, simplification, holes, multiple contours, tiny/degenerate contours, and class-ID preservation.
 
 ### Integration tests
 
@@ -548,6 +681,10 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 - Verify that custom destination creates `destination/retrain_<timestamp>/...` while canonical annotations remain under the model project.
 - Simulate prediction/training exception and cancellation; confirm UI controls recover and partial runs are marked failed/cancelled rather than presented as successful.
 - Run a tiny CPU-only training smoke test separately from normal fast tests when dependencies permit.
+- Compare direct single-image segmentation and Dask-tiled output against golden masks from the pinned segmentation repository.
+- Predict a multi-class large image, merge seams, edit touching instances in one Labels layer, save/reload, build a YOLO segmentation snapshot, and verify instance/class consistency at every boundary.
+- Exercise ambiguous one-to-many and many-to-one seam contacts and confirm they are reported rather than silently cross-class merged.
+- Import an old same-stem `images/` + `masks/` dataset non-destructively and verify that disconnected/touching-object warnings are preserved in the migration report.
 
 ### Manual validation set
 
