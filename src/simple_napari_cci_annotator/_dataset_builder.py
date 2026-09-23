@@ -396,6 +396,7 @@ class DatasetBuilder:
             try:
                 with Image.open(image_path) as image_file:
                     width, height = image_file.size
+                    image_mode = image_file.mode
                     image_file.verify()
                 patch_contract = self.project.config.training_patch
                 if patch_contract.get("locked"):
@@ -413,6 +414,12 @@ class DatasetBuilder:
                 errors.append(f"Invalid sample {stem!r}: {exc}")
                 continue
             event = audit.get(stem, {})
+            processing_error = self._processing_provenance_error(
+                stem, event, image_mode
+            )
+            if processing_error is not None:
+                errors.append(processing_error)
+                continue
             padding_errors = _crop_padding_errors(boxes, event)
             if padding_errors:
                 errors.extend(
@@ -446,6 +453,27 @@ class DatasetBuilder:
                 )
             )
         return tuple(samples), warnings, errors
+
+    def _processing_provenance_error(
+        self, stem: str, event: dict[str, Any], image_mode: str
+    ) -> str | None:
+        expected = self.project.config.image_processing
+        if not expected.get("locked"):
+            return None
+        if image_mode != "RGB":
+            return (
+                f"Invalid sample {stem!r}: canonical image mode is "
+                f"{image_mode!r}; expected normalized RGB uint8 pixels."
+            )
+        conversion = event.get("conversion", {})
+        actual = conversion.get("settings") if isinstance(conversion, dict) else None
+        if actual != expected:
+            return (
+                f"Invalid sample {stem!r}: audit conversion settings do not "
+                "match the locked project image-processing settings. Re-save "
+                "the sample from its source image before retraining."
+            )
+        return None
 
     def _latest_audit_events(self) -> dict[str, dict[str, Any]]:
         events: dict[str, dict[str, Any]] = {}

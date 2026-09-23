@@ -25,6 +25,11 @@ from qtpy.QtWidgets import (
 )
 
 from ._annotation_io import AnnotationError, AnnotationIO, LabelValidationError
+from ._annotation_browser import (
+    AnnotationBrowser,
+    AnnotationReviewEntry,
+    invalid_rectangle_indices,
+)
 from ._class_editor import ClassMapDialog
 from ._class_map import class_color, class_display_name
 from ._dataset_builder import (
@@ -39,6 +44,7 @@ from ._image_adapter import (
     ImageAdapter,
     ImageConversionError,
     ImageProcessingSettings,
+    PlaneSelection,
 )
 from ._inference_worker import InferenceWorker
 from ._project_store import ProjectError, ProjectStore
@@ -102,6 +108,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
     CROP_SELECTION_LAYER_NAME = "training_crop_selection"
     CROP_IMAGE_LAYER_NAME = "training_crop_rgb"
     CROP_BBOX_LAYER_NAME = "training_crop_bboxes"
+    REVIEW_IMAGE_LAYER_NAME = "annotation_review_rgb"
 
     def __init__(self, napari_viewer):
         super().__init__()
@@ -115,6 +122,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._converted_image: ConvertedImage | None = None
         self._current_sample_id: str | None = None
         self._annotation_dirty = False
+        self._annotation_invalid_indices: tuple[int, ...] = ()
+        self._review_entries: tuple[AnnotationReviewEntry, ...] = ()
+        self._updating_review_combo = False
         self._locked_processing_settings: ImageProcessingSettings | None = None
         self._updating_processing_controls = False
         self._updating_class_controls = False
@@ -235,6 +245,27 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._save_annotation_button.clicked.connect(self._on_save_annotation)
         self._validate_project_button = QPushButton("Validate Project")
         self._validate_project_button.clicked.connect(self._on_validate_project)
+
+        self._review_sample_combo = QComboBox()
+        self._review_sample_combo.setToolTip(
+            "Saved project annotations. A warning prefix marks an invalid pair."
+        )
+        self._review_refresh_button = QPushButton("Refresh")
+        self._review_refresh_button.clicked.connect(self._refresh_annotation_browser)
+        self._review_previous_button = QPushButton("Previous")
+        self._review_previous_button.clicked.connect(
+            lambda: self._navigate_annotation(-1)
+        )
+        self._review_load_button = QPushButton("Load Selected")
+        self._review_load_button.clicked.connect(self._on_load_review_annotation)
+        self._review_next_button = QPushButton("Next")
+        self._review_next_button.clicked.connect(
+            lambda: self._navigate_annotation(1)
+        )
+        self._review_status_label = QLabel(
+            "Review: open a project to browse saved annotations."
+        )
+        self._review_status_label.setWordWrap(True)
 
         self._model_path_label = QLabel("No detection model loaded")
         self._model_path_label.setWordWrap(True)
@@ -413,6 +444,21 @@ class SimpleCciAnnotatorQWidget(QWidget):
             expanded=True,
         )
 
+        review_top = QHBoxLayout()
+        review_top.addWidget(self._review_sample_combo)
+        review_top.addWidget(self._review_refresh_button)
+        review_buttons = QHBoxLayout()
+        review_buttons.addWidget(self._review_previous_button)
+        review_buttons.addWidget(self._review_load_button)
+        review_buttons.addWidget(self._review_next_button)
+        review_layout = QVBoxLayout()
+        review_layout.addLayout(review_top)
+        review_layout.addLayout(review_buttons)
+        review_layout.addWidget(self._review_status_label)
+        self._review_section = CollapsibleSection(
+            "Review saved annotations", review_layout, expanded=False
+        )
+
         inference_form = QFormLayout()
         inference_form.addRow("Device", self._device_combo)
         inference_form.addRow("Confidence", self._confidence_spin)
@@ -502,6 +548,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         content_layout.setContentsMargins(4, 4, 4, 4)
         content_layout.addWidget(self._project_section)
         content_layout.addWidget(self._annotation_section)
+        content_layout.addWidget(self._review_section)
         content_layout.addWidget(self._inference_section)
         content_layout.addWidget(self._crop_section)
         content_layout.addWidget(self._retrain_section)
@@ -676,6 +723,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if previous_annotation is not None:
             self.napari_viewer.layers.remove(previous_annotation)
         self._annotation_image_layer = None
+        self._annotation_invalid_indices = ()
         self._project = project
         self._annotation_io = AnnotationIO(project)
         self._model = None
@@ -692,6 +740,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_class_counts()
         self._apply_project_processing_settings()
         self._apply_project_patch_settings()
+        self._refresh_annotation_browser()
         self._update_action_state()
         active = self._active_layer()
         if self._is_source_image_layer(active):
@@ -714,7 +763,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _on_active_layer_changed(self, event=None) -> None:
         active = self._active_layer()
-        if self._is_source_image_layer(active):
+        if self._is_annotation_review_image(active):
+            self._load_annotations_for_image(active)
+        elif self._is_source_image_layer(active):
             if (
                 self._crop_bounds is not None
                 and active is not self._crop_source_image_layer
@@ -751,6 +802,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_action_state()
 
     def _source_path(self, image_layer) -> Path | None:
+        metadata = getattr(image_layer, "metadata", {}) or {}
+        original_source = metadata.get("cci_original_source_path")
+        if isinstance(original_source, str) and original_source:
+            return Path(original_source)
         source = getattr(image_layer, "source", None)
         raw_path = getattr(source, "path", None)
         if raw_path:
@@ -765,17 +820,29 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return cls._is_image_layer(layer) and not bool(
             metadata.get("cci_rgb_preview")
             or metadata.get("cci_training_crop")
+            or metadata.get("cci_annotation_review")
+        )
+
+    @classmethod
+    def _is_annotation_review_image(cls, layer) -> bool:
+        metadata = getattr(layer, "metadata", {}) or {}
+        return cls._is_image_layer(layer) and bool(
+            metadata.get("cci_annotation_review")
         )
 
     def _image_stem(self, image_layer) -> str:
         assert self._annotation_io is not None
+        metadata = getattr(image_layer, "metadata", {}) or {}
+        review_sample = metadata.get("cci_sample_id")
+        if isinstance(review_sample, str) and review_sample:
+            return review_sample
         source_path = self._source_path(image_layer)
         value = source_path.stem if source_path is not None else getattr(
             image_layer, "name", "image"
         )
         base_stem = self._annotation_io.safe_stem(str(value))
         try:
-            settings = self._settings_from_ui()
+            settings = self._effective_processing_settings()
             plane = self._image_adapter.plane_selection(
                 image_layer, self.napari_viewer, settings
             )
@@ -819,14 +886,17 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 rectangles: tuple[np.ndarray, ...] = ()
                 properties = self._empty_properties()
             else:
-                settings = self._settings_from_ui()
-                spatial_axes = self._image_adapter.spatial_axes(
-                    image_layer, settings.channel_axis
-                )
-                spatial_shape = (
-                    image_shape[spatial_axes[0]],
-                    image_shape[spatial_axes[1]],
-                )
+                if self._is_annotation_review_image(image_layer):
+                    spatial_shape = image_shape[:2]
+                else:
+                    settings = self._effective_processing_settings()
+                    spatial_axes = self._image_adapter.spatial_axes(
+                        image_layer, settings.channel_axis
+                    )
+                    spatial_shape = (
+                        image_shape[spatial_axes[0]],
+                        image_shape[spatial_axes[1]],
+                    )
                 loaded = self._annotation_io.load_label(label_path, spatial_shape)
                 rectangles = loaded.rectangles
                 properties = loaded.properties
@@ -881,6 +951,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 if canonical
                 else "Import Converted Image + BBoxes"
             )
+        self._refresh_annotation_validation(
+            valid_message=self._label_status_label.text()
+        )
         self._update_action_state()
 
     @staticmethod
@@ -1031,10 +1104,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._update_action_state()
         else:
             self._annotation_dirty = True
-            self._label_status_label.setText(
+            message = (
                 f"Labels: assigned class {class_id} to "
                 f"{len(selected)} selected box(es); changes are not saved."
             )
+            self._refresh_annotation_validation(valid_message=message)
+            self._update_action_state()
 
     @staticmethod
     def _property_values(
@@ -1138,6 +1213,32 @@ class SimpleCciAnnotatorQWidget(QWidget):
             np.asarray(shape, dtype=float) for shape in shapes_layer.data
         )
         class_ids = self._class_ids(shapes_layer, len(rectangles))
+        conversion_metadata = {
+            "settings": converted.settings.to_mapping(),
+            "plane_indices": converted.plane.non_spatial_indices,
+            "axis_labels": list(converted.plane.axis_labels),
+            "normalization_stats": list(converted.normalization_stats),
+            "prediction": getattr(shapes_layer, "metadata", {}).get(
+                "cci_prediction"
+            ),
+        }
+        image_metadata = getattr(self._annotation_image_layer, "metadata", {}) or {}
+        prior_conversion = image_metadata.get("cci_conversion")
+        if isinstance(prior_conversion, dict):
+            current_prediction = conversion_metadata["prediction"]
+            conversion_metadata = dict(prior_conversion)
+            conversion_metadata["settings"] = converted.settings.to_mapping()
+            conversion_metadata.setdefault(
+                "plane_indices", converted.plane.non_spatial_indices
+            )
+            conversion_metadata.setdefault(
+                "axis_labels", list(converted.plane.axis_labels)
+            )
+            conversion_metadata.setdefault(
+                "normalization_stats", list(converted.normalization_stats)
+            )
+            if current_prediction is not None:
+                conversion_metadata["prediction"] = current_prediction
         result = self._annotation_io.save_pair(
             image_data=converted.data,
             image_name=converted.sample_id,
@@ -1145,15 +1246,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             sample_id=converted.sample_id,
             rectangles=rectangles,
             class_ids=class_ids,
-            conversion_metadata={
-                "settings": converted.settings.to_mapping(),
-                "plane_indices": converted.plane.non_spatial_indices,
-                "axis_labels": list(converted.plane.axis_labels),
-                "normalization_stats": list(converted.normalization_stats),
-                "prediction": getattr(shapes_layer, "metadata", {}).get(
-                    "cci_prediction"
-                ),
-            },
+            conversion_metadata=conversion_metadata,
         )
         self._project.lock_image_processing(converted.settings.to_mapping())
         self._project.lock_training_patch(patch_size, padding_value=114)
@@ -1177,9 +1270,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._apply_project_processing_settings()
         self._apply_project_patch_settings()
         self._update_project_status()
+        self._refresh_annotation_browser(preferred=converted.sample_id)
         return result
 
     def _on_shapes_data_changed(self, event=None) -> None:
+        del event
         self._annotation_dirty = True
         self._update_class_counts()
         image_layer = self._annotation_image_layer
@@ -1190,9 +1285,44 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     self._converted_image = self._convert_current_image(image_layer)
             except ImageConversionError:
                 pass
-        self._label_status_label.setText(
-            "Labels: unsaved edits. Save before changing image or Z/T plane."
+        self._refresh_annotation_validation(
+            valid_message=(
+                "Labels: unsaved edits. Save before changing image or Z/T plane."
+            )
         )
+        self._update_action_state()
+
+    def _refresh_annotation_validation(
+        self, *, valid_message: str | None = None
+    ) -> None:
+        shapes = self._annotation_layer()
+        converted = self._converted_image
+        if shapes is None or converted is None:
+            self._annotation_invalid_indices = ()
+            return
+        height, width = converted.data.shape[:2]
+        invalid = invalid_rectangle_indices(
+            shapes.data, height=height, width=width
+        )
+        self._annotation_invalid_indices = invalid
+        face_colors = np.zeros((len(shapes.data), 4), dtype=float)
+        if invalid:
+            face_colors[list(invalid)] = (1.0, 0.0, 0.0, 0.35)
+        try:
+            shapes.face_color = (
+                face_colors if len(shapes.data) else "transparent"
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
+        if invalid:
+            indices = ", ".join(str(index) for index in invalid)
+            self._label_status_label.setText(
+                f"Labels invalid: {len(invalid)} red-filled box(es) are outside "
+                f"the image bounds (zero-based indices: {indices}). Move, resize, "
+                "or delete them before saving."
+            )
+        elif valid_message is not None:
+            self._label_status_label.setText(valid_message)
 
     def _resolve_unsaved_changes(self) -> bool:
         if not self._annotation_dirty:
@@ -1351,7 +1481,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _image_for_annotation(self):
         active = self._active_layer()
-        if self._is_source_image_layer(active):
+        if self._is_source_image_layer(active) or self._is_annotation_review_image(
+            active
+        ):
             return active
         return self._annotation_image_layer
 
@@ -1572,6 +1704,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
         settings.validate()
         return settings
 
+    def _effective_processing_settings(self) -> ImageProcessingSettings:
+        if (
+            self._project is not None
+            and self._project.config.image_processing.get("locked")
+        ):
+            return ImageProcessingSettings.from_mapping(
+                self._project.config.image_processing
+            )
+        return self._settings_from_ui()
+
     def _set_processing_controls_enabled(self, enabled: bool) -> None:
         self._channel_axis_combo.setEnabled(enabled)
         has_channel_axis = self._channel_axis_combo.currentData() is not None
@@ -1597,15 +1739,52 @@ class SimpleCciAnnotatorQWidget(QWidget):
         combo.setCurrentIndex(index)
 
     def _convert_current_image(self, image_layer) -> ConvertedImage:
-        settings = self._settings_from_ui()
-        if (
-            self._project is not None
-            and self._project.config.image_processing.get("locked")
-            and settings.to_mapping() != self._project.config.image_processing
-        ):
-            raise ImageConversionError(
-                "The selected image does not match the project's locked conversion settings."
+        settings = self._effective_processing_settings()
+        if self._is_annotation_review_image(image_layer):
+            data = np.asarray(image_layer.data)
+            if data.dtype != np.uint8 or data.ndim != 3 or data.shape[2] != 3:
+                raise ImageConversionError(
+                    "Canonical review images must already be RGB uint8 data."
+                )
+            metadata = getattr(image_layer, "metadata", {}) or {}
+            sample_id = str(metadata.get("cci_sample_id") or image_layer.name)
+            conversion = metadata.get("cci_conversion", {})
+            raw_stats = (
+                conversion.get("normalization_stats", ())
+                if isinstance(conversion, dict)
+                else ()
             )
+            statistics = tuple(
+                dict(value) for value in raw_stats if isinstance(value, dict)
+            )
+            if len(statistics) != 3:
+                statistics = tuple(
+                    {
+                        "method": "already_normalized",
+                        "lower": None,
+                        "upper": None,
+                    }
+                    for _ in range(3)
+                )
+            converted = ConvertedImage(
+                data=np.ascontiguousarray(data),
+                sample_id=sample_id,
+                plane=PlaneSelection(
+                    axis_indices=(None, None, None),
+                    plane_axes=(0, 1),
+                    axis_labels=("Y", "X", "C"),
+                ),
+                settings=settings,
+                normalization_stats=statistics,
+            )
+            self._converted_image = converted
+            self._current_sample_id = sample_id
+            self._plane_status_label.setText(
+                f"Review sample: {sample_id} · canonical normalized RGB uint8"
+            )
+            return converted
+
+        settings.validate(tuple(int(size) for size in image_layer.data.shape))
         source_path = self._source_path(image_layer)
         base_stem = (
             source_path.stem
@@ -2143,6 +2322,123 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._crop_dirty = False
         self._update_class_counts()
 
+    def _refresh_annotation_browser(self, preferred=None) -> None:
+        if isinstance(preferred, bool):
+            preferred = None
+        previous = preferred or self._review_sample_combo.currentData()
+        self._updating_review_combo = True
+        try:
+            self._review_sample_combo.clear()
+            if self._project is None:
+                self._review_entries = ()
+                self._review_status_label.setText(
+                    "Review: open a project to browse saved annotations."
+                )
+                return
+            self._review_entries = AnnotationBrowser(self._project).entries()
+            invalid_count = 0
+            for entry in self._review_entries:
+                if entry.errors:
+                    invalid_count += 1
+                prefix = "⚠ " if entry.errors else ""
+                self._review_sample_combo.addItem(
+                    f"{prefix}{entry.sample_id} · {entry.box_count} box(es)",
+                    entry.sample_id,
+                )
+            if previous:
+                index = self._review_sample_combo.findData(str(previous))
+                if index >= 0:
+                    self._review_sample_combo.setCurrentIndex(index)
+            self._review_status_label.setText(
+                f"Review: {len(self._review_entries)} saved pair(s) · "
+                f"{invalid_count} invalid pair(s)."
+            )
+        except OSError as exc:
+            self._review_entries = ()
+            self._review_status_label.setText(f"Review: could not scan project: {exc}")
+        finally:
+            self._updating_review_combo = False
+            self._update_action_state()
+
+    def _selected_review_entry(self) -> AnnotationReviewEntry | None:
+        sample_id = self._review_sample_combo.currentData()
+        return next(
+            (
+                entry
+                for entry in self._review_entries
+                if entry.sample_id == sample_id
+            ),
+            None,
+        )
+
+    def _navigate_annotation(self, offset: int) -> None:
+        count = self._review_sample_combo.count()
+        if count == 0:
+            return
+        current = max(0, self._review_sample_combo.currentIndex())
+        self._review_sample_combo.setCurrentIndex((current + offset) % count)
+        self._on_load_review_annotation()
+
+    def _on_load_review_annotation(self) -> None:
+        entry = self._selected_review_entry()
+        if entry is None:
+            self._show_error("No saved annotation is selected.")
+            return
+        if entry.errors:
+            details = "\n".join(f"• {error}" for error in entry.errors)
+            self._review_status_label.setText(
+                f"Review: {entry.sample_id} is invalid. {entry.errors[0]}"
+            )
+            self._show_error(
+                f"Cannot load invalid annotation {entry.sample_id!r}.\n\n{details}"
+            )
+            return
+        if not self._resolve_unsaved_changes():
+            return
+        if self._crop_bounds is not None:
+            if not self._resolve_crop_unsaved_changes():
+                return
+            self._close_crop_session(
+                remove_selection=True, restore_sources=True
+            )
+        try:
+            data = AnnotationBrowser.load_rgb(entry)
+        except OSError as exc:
+            self._show_error(f"Could not load annotation image:\n{exc}")
+            return
+
+        previous = self._get_layer_by_name(self.REVIEW_IMAGE_LAYER_NAME)
+        if previous is not None:
+            self.napari_viewer.layers.remove(previous)
+        metadata = {
+            "cci_annotation_review": True,
+            "cci_sample_id": entry.sample_id,
+            "cci_canonical_path": str(entry.image_path),
+            "cci_original_source_path": (
+                str(entry.source_path) if entry.source_path is not None else None
+            ),
+            "cci_conversion": entry.conversion,
+        }
+        image_layer = self.napari_viewer.add_image(
+            data,
+            name=self.REVIEW_IMAGE_LAYER_NAME,
+            rgb=True,
+            metadata=metadata,
+        )
+        try:
+            self.napari_viewer.layers.selection.active = image_layer
+        except AttributeError:
+            pass
+        self._load_annotations_for_image(image_layer, force=True)
+        self._review_status_label.setText(
+            f"Review: loaded {entry.sample_id} · {entry.box_count} box(es). "
+            "Edit the bbox layer, save, then use Previous or Next."
+        )
+        try:
+            self.napari_viewer.reset_view()
+        except AttributeError:
+            pass
+
     def _current_view_center(
         self, image_layer, height: int, width: int
     ) -> tuple[float, float]:
@@ -2410,11 +2706,27 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _refresh_training_model_choices(self, preferred: Path | None = None) -> None:
         previous = preferred or self._training_model_combo.currentData()
         self._training_model_combo.clear()
+        added: set[Path] = set()
         if self._base_model_path.is_file():
             self._training_model_combo.addItem(
                 f"Base · {self._base_model_path.name}", str(self._base_model_path)
             )
-        if self._model is not None and self._model.path != self._base_model_path:
+            added.add(self._base_model_path.resolve())
+        if self._project is not None:
+            for path in sorted(
+                self._project.paths.models.glob("*.pt"), reverse=True
+            ):
+                resolved = path.resolve()
+                if resolved in added:
+                    continue
+                self._training_model_combo.addItem(
+                    f"Project · {path.name}", str(path)
+                )
+                added.add(resolved)
+        if (
+            self._model is not None
+            and self._model.path.resolve() not in added
+        ):
             self._training_model_combo.addItem(
                 f"Loaded fine-tuned · {self._model.path.name}",
                 str(self._model.path),
@@ -2624,6 +2936,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._training_progress.setValue(self._training_progress.maximum())
         self._training_status_label.setText(
             f"Retraining: completed · {run.run_root}"
+            + (
+                f" · model copied to {run.promoted_model}"
+                if run.promoted_model is not None
+                else ""
+            )
         )
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Retraining completed")
@@ -2632,7 +2949,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Keep Current Model", QMessageBox.AcceptRole
         )
         load_button = None
-        load_model = run.best_model or run.last_model
+        load_model = run.promoted_model or run.best_model or run.last_model
         if load_model is not None:
             label = (
                 "Load New Best Model"
@@ -2651,6 +2968,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(run.run_root)))
         elif clicked is keep_button:
             pass
+        self._refresh_training_model_choices(preferred=run.promoted_model)
 
     def _on_training_failed(self, message: str) -> None:
         self._training_status_label.setText("Retraining: failed")
@@ -2726,6 +3044,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and has_image
             and has_shapes
             and direct_save_size
+            and not self._annotation_invalid_indices
             and not running
             and not has_crop
         )
@@ -2758,6 +3077,19 @@ class SimpleCciAnnotatorQWidget(QWidget):
             has_crop and not self._crop_invalid_indices and not running
         )
         self._return_crop_button.setEnabled(has_crop and not running)
+        has_review_entries = bool(self._review_entries)
+        for control in (
+            self._review_sample_combo,
+            self._review_previous_button,
+            self._review_load_button,
+            self._review_next_button,
+        ):
+            control.setEnabled(
+                has_project and has_review_entries and not running and not has_crop
+            )
+        self._review_refresh_button.setEnabled(
+            has_project and not running and not has_crop
+        )
         self._cancel_inference_button.setEnabled(inference_running)
         for control in (
             self._device_combo,

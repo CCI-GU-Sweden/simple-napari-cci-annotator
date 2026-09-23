@@ -481,12 +481,14 @@ The old repository's Dask label fusion belongs specifically on the segmentation 
 
 ### Phase 5 — Quality, multi-class UI, and model lineage
 
-**Status: multi-class UI completed in `0.5.0`; remaining Phase 5 quality and lineage work is still planned.** Project class maps can be appended/renamed safely, bbox classes can be selected and reassigned, class colors and counts are visible, and the existing validation, tiling, dataset YAML, inference, save/reload, and retraining paths preserve all class IDs.
+**Status: multi-class UI completed in `0.5.0`; annotation navigation and automatic best-model promotion added in `0.7.0`; remaining Phase 5 quality and lineage work is still planned.** Project class maps can be appended/renamed safely, bbox classes can be selected and reassigned, class colors and counts are visible, and the existing validation, tiling, dataset YAML, inference, save/reload, and retraining paths preserve all class IDs.
 
-- Add dataset/project browser, filters, next/previous image, autosave preference, and annotation completion/review status.
+- Add dataset/project browser, filters, next/previous image, autosave preference, and annotation completion/review status. **Basic saved-pair browser and previous/next correction workflow completed in `0.7.0`; filters, autosave, and explicit review states remain.**
 - Add model comparison summaries and explicit `current` model lineage.
 - Expose multi-class selection, coloring, per-class counts, and class-map editing. **Completed in `0.5.0`.**
 - Add optional hard-negative and uncertainty-driven review queues.
+
+`0.7.0` also makes locked project normalization directly authoritative for inference, validates canonical training-image conversion provenance before dataset construction, highlights live out-of-bounds boxes, and atomically copies a successful run's `best.pt` to `models/<retrain-folder-name>.pt`.
 
 **Exit criteria:** multi-class detection works without changing storage or training architecture, and users can compare successive retrain runs.
 

@@ -31,6 +31,10 @@ from simple_napari_cci_annotator._annotation_io import (
     AnnotationError,
     LabelValidationError,
 )
+from simple_napari_cci_annotator._annotation_browser import (
+    AnnotationBrowser,
+    invalid_rectangle_indices,
+)
 from simple_napari_cci_annotator._image_adapter import (
     ImageConversionError,
     normalize_to_uint8,
@@ -66,7 +70,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.6.2"
+    assert simple_napari_cci_annotator.__version__ == "0.7.0"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -207,6 +211,39 @@ def test_find_label_prefers_canonical_then_source(annotation_io, tmp_path):
     canonical = annotation_io.project.paths.labels / "sample.txt"
     canonical.write_text("", encoding="utf-8")
     assert annotation_io.find_label("sample", source_path=source_image) == canonical.resolve()
+
+
+def test_annotation_browser_lists_pairs_and_reports_out_of_bounds(annotation_io):
+    result = annotation_io.save_pair(
+        image_data=np.zeros((64, 64, 3), dtype=np.uint8),
+        image_name="sample.png",
+        rectangles=(np.asarray([[10, 10], [10, 30], [30, 30], [30, 10]]),),
+        class_ids=(0,),
+    )
+    browser = AnnotationBrowser(annotation_io.project)
+
+    valid = browser.entries()
+
+    assert len(valid) == 1
+    assert valid[0].sample_id == "sample"
+    assert valid[0].box_count == 1
+    assert valid[0].is_valid
+
+    result.label_path.write_text("0 0.95 0.5 0.2 0.2\n", encoding="utf-8")
+    invalid = browser.entries()[0]
+    assert not invalid.is_valid
+    assert any("outside" in error for error in invalid.errors)
+
+
+def test_live_rectangle_validation_reports_zero_based_indices():
+    valid = np.asarray([[0, 0], [0, 10], [10, 10], [10, 0]], dtype=float)
+    outside = np.asarray(
+        [[20, 20], [20, 70], [40, 70], [40, 20]], dtype=float
+    )
+
+    assert invalid_rectangle_indices(
+        (valid, outside), height=64, width=64
+    ) == (1,)
 
 
 def test_save_empty_label_overwrites_and_audits(annotation_io):
@@ -834,6 +871,55 @@ def test_snapshot_has_matching_pairs_manifests_and_no_group_leakage(tmp_path):
     assert "label_sha256" in manifest
 
 
+def test_dataset_requires_locked_normalization_provenance(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    processing = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    rectangle = np.asarray(
+        [[10, 10], [10, 30], [30, 30], [30, 10]], dtype=float
+    )
+    save_kwargs = {
+        "image_data": np.zeros((64, 64, 3), dtype=np.uint8),
+        "image_name": "normalized.png",
+        "sample_id": "normalized",
+        "rectangles": (rectangle,),
+        "class_ids": (0,),
+    }
+    annotation_io.save_pair(
+        **save_kwargs, conversion_metadata={"settings": processing}
+    )
+    builder = DatasetBuilder(project)
+    settings = DatasetBuildSettings(tile_size=64, overlap=0)
+
+    matching = builder.preview(settings, train_only=True)
+
+    assert matching.is_valid
+
+    mismatched = dict(processing)
+    mismatched["normalization"] = {
+        "method": "simple_max",
+        "lower": None,
+        "upper": None,
+        "scope": "per_plane_per_channel",
+    }
+    annotation_io.save_pair(
+        **save_kwargs, conversion_metadata={"settings": mismatched}
+    )
+    rejected = builder.preview(settings, train_only=True)
+
+    assert not rejected.is_valid
+    assert any(
+        "do not match the locked project" in error for error in rejected.errors
+    )
+
+
 def test_large_bbox_rejected_when_tile_clipping_is_too_severe(tmp_path):
     project = ProjectStore.initialize(tmp_path / "project")
     annotation_io = AnnotationIO(project)
@@ -901,9 +987,16 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.6.2" in text
+    assert "plugin_version: 0.7.0" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
+    promoted = project.paths.models / f"{result.run_root.name}.pt"
+    assert result.promoted_model == promoted
+    assert promoted.read_bytes() == b"best"
+    run_metadata = training_module.yaml.safe_load(text)
+    assert run_metadata["outputs"]["project_model"] == str(
+        Path("models") / promoted.name
+    )
 
 
 def test_training_cancellation_marks_partial_run(tmp_path):
@@ -1066,6 +1159,44 @@ def test_widget_new_project_and_automatic_bbox_loading(tmp_path, qtbot):
     assert widget._save_annotation_button.text() == "Import Converted Image + BBoxes"
 
 
+def test_locked_project_normalization_is_authoritative_for_inference_input(
+    tmp_path, qtbot
+):
+    project = ProjectStore.initialize(tmp_path / "project")
+    processing = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=None,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    source_data = np.asarray(
+        [
+            [[10, 20], [30, 40]],
+            [[100, 200], [300, 400]],
+        ],
+        dtype=np.uint16,
+    )
+    viewer = _Viewer()
+    source = _Image(source_data, name="source")
+    viewer.layers.append(source)
+    viewer.layers.selection.active = source
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+
+    widget._normalization_combo.setCurrentIndex(
+        widget._normalization_combo.findData("simple_max")
+    )
+    converted = widget._convert_current_image(source)
+
+    assert converted.settings.normalization == "min_max"
+    np.testing.assert_array_equal(
+        converted.data[..., 0], np.asarray([[0, 85], [170, 255]])
+    )
+
+
 def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot):
     root = tmp_path / "project"
     root.mkdir()
@@ -1096,6 +1227,56 @@ def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot)
     assert np.isnan(shapes.properties["confidence"][0])
     assert "1 Debris: 1" in widget._class_counts_label.text()
     assert widget._annotation_dirty
+
+
+def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project")
+    processing = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    project.lock_training_patch(512)
+    AnnotationIO(project).save_pair(
+        image_data=np.zeros((512, 512, 3), dtype=np.uint8),
+        image_name="review_me.png",
+        sample_id="review_me",
+        rectangles=(
+            np.asarray([[10, 10], [10, 30], [30, 30], [30, 10]], dtype=float),
+        ),
+        class_ids=(0,),
+        conversion_metadata={"settings": processing},
+    )
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+
+    widget._set_project(project)
+    assert widget._review_sample_combo.count() == 1
+    widget._on_load_review_annotation()
+
+    shapes = widget._annotation_layer()
+    assert shapes is not None
+    assert len(shapes.data) == 1
+    assert widget._save_annotation_button.isEnabled()
+
+    valid = np.asarray(shapes.data[0]).copy()
+    shapes.data[0] = np.asarray(
+        [[10, 490], [10, 530], [30, 530], [30, 490]], dtype=float
+    )
+    widget._on_shapes_data_changed()
+    assert widget._annotation_invalid_indices == (0,)
+    assert not widget._save_annotation_button.isEnabled()
+    np.testing.assert_allclose(shapes.face_color[0], [1, 0, 0, 0.35])
+    assert "zero-based indices: 0" in widget._label_status_label.text()
+
+    shapes.data[0] = valid
+    widget._on_shapes_data_changed()
+    assert widget._annotation_invalid_indices == ()
+    assert widget._save_annotation_button.isEnabled()
 
 
 def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):

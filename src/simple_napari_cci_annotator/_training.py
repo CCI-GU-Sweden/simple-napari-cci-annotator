@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import os
+import shutil
 import tempfile
 import traceback
 from collections.abc import Callable
@@ -60,6 +61,7 @@ class TrainingRun:
     run_root: Path
     best_model: Path | None
     last_model: Path | None
+    promoted_model: Path | None
     status: str
     validation_mode: str
 
@@ -170,17 +172,27 @@ class TrainingService:
                 raise TrainingError(
                     "Ultralytics returned without producing best.pt or last.pt."
                 )
+            promoted = None
+            if best.is_file():
+                promoted = self.project.paths.models / f"{run_root.name}.pt"
+                _atomic_copy(best, promoted)
             metadata["status"] = "completed"
             metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
             metadata["outputs"] = {
                 "best_model": str(best.relative_to(run_root)) if best.is_file() else None,
                 "last_model": str(last.relative_to(run_root)) if last.is_file() else None,
+                "project_model": (
+                    str(promoted.relative_to(self.project.paths.root))
+                    if promoted is not None
+                    else None
+                ),
             }
             _atomic_write_yaml(run_root / "run.yaml", metadata)
             return TrainingRun(
                 run_root=run_root,
                 best_model=best if best.is_file() else None,
                 last_model=last if last.is_file() else None,
+                promoted_model=promoted,
                 status="completed",
                 validation_mode=preview.validation_mode,
             )
@@ -214,6 +226,7 @@ class TrainingService:
             "status": "preparing_dataset",
             "started_at": started,
             "project_root": str(self.project.paths.root),
+            "image_processing": dict(self.project.config.image_processing),
             "plugin_version": _package_version(),
             "packages": _runtime_versions(),
             "input_model": {
@@ -305,6 +318,25 @@ def _atomic_write_yaml(path: Path, value: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise TrainingError(
+            f"Refusing to overwrite an existing promoted model: {destination}"
+        )
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise

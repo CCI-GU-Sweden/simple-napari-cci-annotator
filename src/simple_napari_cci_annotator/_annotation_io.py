@@ -397,7 +397,12 @@ class AnnotationIO:
             try:
                 event = json.loads(raw_line)
                 sample_id = event.get("sample_id")
-                crop = event.get("conversion", {}).get("training_crop")
+                conversion = event.get("conversion")
+                crop = (
+                    conversion.get("training_crop")
+                    if isinstance(conversion, dict)
+                    else None
+                )
                 if not isinstance(sample_id, str) or not isinstance(crop, dict):
                     continue
                 size = int(crop["size"])

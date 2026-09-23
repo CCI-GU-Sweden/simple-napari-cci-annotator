@@ -23,8 +23,9 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 12. Click **Create / Refresh Crop**, correct its local bbox layer, then click **Add Crop + Corrections**.
 13. Click **Return to Source**, move the selection to another failure, and repeat. The full-size inference image is not added to the training pool.
 14. Use **Validate Project** to check image/label pairing, fixed image dimensions, and label contents.
-15. In **Dataset building and retraining**, choose the base `yolo26n.pt` or the currently loaded fine-tuned model, preview the stable split, then start retraining.
-16. When training finishes, explicitly keep the current model, load the new `best.pt`, or open the immutable run folder.
+15. Use **Review saved annotations** to load previous/next project pairs, make corrections, and save the updated annotation.
+16. In **Dataset building and retraining**, choose the base `yolo26n.pt`, a model in the project, or the currently loaded fine-tuned model, preview the stable split, then start retraining.
+17. When training finishes, explicitly keep the current model, load the promoted model, or open the immutable run folder.
 
 Automatic label discovery checks, in order:
 
@@ -40,6 +41,7 @@ Selecting an empty folder with **New Project** initializes:
 project/
 ├── project.yaml
 ├── models/
+│   └── retrain_YYYYMMDD_HHMMSS.pt
 └── annotations/
     ├── images/
     ├── labels/
@@ -84,6 +86,8 @@ classes:
 Use **Edit Classes** to rename that class or append more classes. Class IDs are stable, contiguous YOLO indices starting at `0`; names must be non-empty and unique. Only the last class can be removed, and removal is blocked while that ID occurs in a saved label or the current bbox layer. This prevents an existing label from silently changing meaning.
 
 Every shape stores `class_id` and `class_name`. The current-class selector sets the class and stable display color for newly drawn boxes. **Apply Class to Selected** reclassifies only the selected boxes, marks them as manual corrections, and clears stale prediction confidence. Live per-class counts are shown beside the annotation controls. Saving still writes standard five-column YOLO rows, so no custom conversion is required for retraining.
+
+The **Review saved annotations** section lists every canonical image/label pair and provides **Previous**, **Load Selected**, and **Next** navigation. Invalid stored pairs receive a warning marker and an explanation instead of being loaded silently. During editing, malformed boxes or boxes extending outside the image receive a translucent red face while retaining their class-colored edge; saving is disabled until every red box is corrected or deleted.
 
 ## Large-image prediction and merging
 
@@ -136,7 +140,7 @@ Then enter one grouping level in the GUI—for example `metadata.patient`. Every
 
 Metadata records are merged per sample in append order. A later metadata record can update one field without repeating the others, and later annotation saves do not erase previously appended metadata. Keep `sample_id` spelling exact. Malformed JSON lines are ignored, so validate the dataset after editing. When **Group metadata** is left empty, the plugin groups by the original audited `source_path`, falling back to the canonical sample ID when no source path is available.
 
-The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base and the currently loaded compatible model as the fine-tuned option. This choice affects only the new run; successful training never silently replaces the prediction model.
+The **Starting model** control offers the repository-root `yolo26n.pt` as the naive pretrained base, every `.pt` checkpoint in the project's `models/` folder, and a compatible externally loaded model. This choice affects only the new run; successful training never silently replaces the prediction model.
 
 Training images are generated inside a new `retrain_YYYYMMDD_HHMMSS` folder. Each canonical image already matches the locked project patch size, so it becomes one training item without resizing or further spatial subdivision. The dataset validator rejects mismatched dimensions. Reviewed-negative crops remain first-class empty-label samples.
 
@@ -158,6 +162,8 @@ retrain_YYYYMMDD_HHMMSS/
 
 `dataset.yaml` derives its complete `names` map from the project classes. `run.yaml` records the input model and checksum, package versions, dataset and training settings, split assignments, device, timestamps, warnings, outputs, and final status. Failed and cancelled runs remain on disk with their status and diagnostic information.
 
+After a successful validated run, `training/weights/best.pt` remains in the immutable run and an atomic copy is added to `<project>/models/<run-folder-name>.pt`, for example `models/retrain_20260923_143012.pt`. The completion dialog loads this project copy when requested. Exploratory output without `best.pt` is not promoted.
+
 With only one independent source group, validation is impossible. The plugin blocks normal retraining unless **Train without independent validation** is enabled and confirmed for that run. Such output is prominently marked exploratory and must not be used to claim generalization quality. Ultralytics requires a validation-loader path even when validation is disabled, so train-only `dataset.yaml` points that unused loader at the training images; `run.yaml` records this compatibility workaround and `validation_enabled: false`.
 
 ## Image conversion
@@ -175,7 +181,9 @@ Each output component—red, green, and blue—can use any source channel or be 
 
 Normalization is currently calculated independently for each selected channel of each 2D plane. The converted output is always RGB `uint8` with the same Y/X dimensions as the source plane, so bbox coordinates do not change.
 
-Channel mapping and normalization become immutable project settings after the first converted image/bbox pair is saved. Create a new project to use a different conversion. The audit log records both the configured method and the effective per-channel values used for every image.
+Channel mapping and normalization become immutable project settings after the first converted image/bbox pair is saved. Create a new project to use a different conversion. For inference, the locked `project.yaml` mapping is read directly and is authoritative over widget state. The audit log records both the configured method and the effective per-channel values used for every image.
+
+Canonical training images already contain those normalized RGB `uint8` pixels, so dataset preparation tiles/copies them without applying normalization a second time. Before retraining, validation requires RGB canonical images and verifies that each sample's audit conversion matches the locked project settings. A missing or mismatched conversion record blocks the run instead of mixing normalization policies.
 
 The widget warns about unsaved bbox edits before reloading labels, changing source image/Z/T context, or closing. Choosing Save uses the cached pixels and plane identity from the annotation being edited, avoiding accidental reassignment to a newly selected plane.
 
