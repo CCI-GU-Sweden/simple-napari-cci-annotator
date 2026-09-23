@@ -215,6 +215,7 @@ class ProjectStore:
             classes=dict(class_map),
             image_processing={
                 "channels": "unset",
+                "filter": "unset",
                 "normalization": "unset",
                 "locked": False,
             },
@@ -305,7 +306,9 @@ class ProjectStore:
         requested = dict(settings)
         requested["locked"] = True
         if self.config.image_processing.get("locked"):
-            if self.config.image_processing != requested:
+            if not _image_processing_equivalent(
+                self.config.image_processing, requested
+            ):
                 raise ImageProcessingLockedError(
                     "Image-processing settings are locked for this project."
                 )
@@ -424,6 +427,17 @@ def _validate_class_map(classes: dict[int, str]) -> None:
     folded = [name.casefold() for name in names]
     if len(folded) != len(set(folded)):
         raise InvalidProjectError("Class names must be unique.")
+
+
+def _image_processing_equivalent(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    """Treat pre-filter project settings as the explicit no-filter default."""
+    left = dict(first)
+    right = dict(second)
+    left.setdefault("filter", {"method": "none", "radius": 1})
+    right.setdefault("filter", {"method": "none", "radius": 1})
+    return left == right
 
 
 def _validate_training_patch(value: Any) -> dict[str, Any]:

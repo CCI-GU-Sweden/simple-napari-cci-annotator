@@ -14,7 +14,7 @@ The plugin is being rebuilt in milestones. Project persistence, multidimensional
 3. Use **Edit Classes** to append or rename project classes when needed.
 4. Open/select an image layer in napari. RGB images and multidimensional TIFF/OME-TIFF arrays are supported.
 5. For multidimensional data, select the channel axis and map up to three source channels into output red, green, and blue.
-6. Select and preview the normalization used to create the RGB `uint8` training image.
+6. Optionally select a spatial pre-filter and radius, then select and preview the normalization used to create the RGB `uint8` training image.
 7. The plugin automatically looks for a same-stem YOLO bbox file and creates an editable `yolo_bboxes` Shapes layer.
 8. Choose **Current class** before drawing a box. To reclassify boxes, select them and click **Apply Class to Selected**.
 9. To run inference, choose a YOLO detection model and set device, confidence, model IoU, tile size/overlap, merge IoU, and maximum detections per tile.
@@ -201,9 +201,19 @@ Each output component—red, green, and blue—can use any source channel or be 
 - Fixed input range
 - Integer data-type range
 
+Before normalization, each selected 2D source-channel plane can optionally receive one project-wide spatial filter:
+
+- Gaussian blur
+- Median filter
+- Mean filter
+- Frequency-domain low-pass filter
+- White top-hat
+
+All filters share a radius measured in source pixels. Median, mean, and top-hat use a disk footprint. Gaussian uses a radius-limited Gaussian kernel, with `sigma = radius / 2` (and a minimum sigma of `0.5`). The explicit low-pass option uses a second-order Butterworth frequency response with reflected boundary padding; larger radii lower the cutoff and remove more fine-scale variation. Filtering is performed independently on the selected source channels before normalization and RGB stacking; it is not applied a second time during dataset preparation.
+
 Normalization is currently calculated independently for each selected channel of each 2D plane. The converted output is always RGB `uint8` with the same Y/X dimensions as the source plane, so bbox coordinates do not change.
 
-Channel mapping and normalization become immutable project settings after the first converted image/bbox pair is saved. Create a new project to use a different conversion. For inference, the locked `project.yaml` mapping is read directly and is authoritative over widget state. The audit log records both the configured method and the effective per-channel values used for every image.
+Channel mapping, pre-filter, radius, and normalization become immutable project settings after the first converted annotation is saved. Create a new project to use a different conversion. For inference, the locked `project.yaml` mapping is read directly and is authoritative over widget state. The audit log records the configured filter and normalization settings plus the effective per-channel normalization values used for every image.
 
 Canonical training images already contain those normalized RGB `uint8` pixels, so dataset preparation tiles/copies them without applying normalization a second time. Before retraining, validation requires RGB canonical images and verifies that each sample's audit conversion matches the locked project settings. A missing or mismatched conversion record blocks the run instead of mixing normalization policies.
 

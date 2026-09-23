@@ -40,6 +40,7 @@ from ._dataset_builder import (
     DatasetPreview,
 )
 from ._image_adapter import (
+    IMAGE_FILTERS,
     NORMALIZATION_METHODS,
     ConvertedImage,
     ImageAdapter,
@@ -213,6 +214,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "Choose the source channel mapped into this RGB output component."
             )
             combo.currentIndexChanged.connect(self._on_processing_value_changed)
+
+        self._filter_combo = QComboBox()
+        self._filter_combo.setToolTip(
+            "Optional spatial filter applied independently to every selected source "
+            "channel before normalization and RGB conversion."
+        )
+        for method, display_name in IMAGE_FILTERS.items():
+            self._filter_combo.addItem(display_name, method)
+        self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self._filter_radius_spin = QSpinBox()
+        self._filter_radius_spin.setRange(1, 100)
+        self._filter_radius_spin.setValue(1)
+        self._filter_radius_spin.setToolTip(
+            "Filter radius in source pixels. Gaussian uses a radius-limited kernel; "
+            "median, mean, and top-hat use a disk footprint; frequency low-pass "
+            "uses larger values for stronger smoothing."
+        )
+        self._filter_radius_spin.valueChanged.connect(
+            self._on_processing_value_changed
+        )
 
         self._normalization_combo = QComboBox()
         self._normalization_combo.setToolTip(
@@ -564,6 +585,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         processing_form.addRow("Output red", self._red_channel_combo)
         processing_form.addRow("Output green", self._green_channel_combo)
         processing_form.addRow("Output blue", self._blue_channel_combo)
+        processing_form.addRow("Pre-filter", self._filter_combo)
+        processing_form.addRow("Filter radius", self._filter_radius_spin)
         processing_form.addRow("Normalization", self._normalization_combo)
         processing_form.addRow(self._lower_parameter_label, self._lower_value_spin)
         processing_form.addRow(self._upper_parameter_label, self._upper_value_spin)
@@ -724,6 +747,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
         self._connect_viewer_events()
         self._on_normalization_changed()
+        self._on_filter_changed()
         self._update_action_state()
 
     @staticmethod
@@ -2167,7 +2191,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 return
             self._processing_lock_label.setText(
                 "Image conversion is locked for this project. Create a new project "
-                "to use different channels or normalization."
+                "to use different channels, filtering, or normalization."
             )
         else:
             self._locked_processing_settings = None
@@ -2211,6 +2235,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
             if self._locked_processing_settings is not None:
                 settings = self._locked_processing_settings
+                self._set_combo_data(self._filter_combo, settings.filter_method)
+                self._filter_radius_spin.setValue(settings.filter_radius)
                 self._set_combo_data(self._normalization_combo, settings.normalization)
                 if settings.lower is not None:
                     self._lower_value_spin.setValue(settings.lower)
@@ -2221,6 +2247,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._updating_processing_controls = False
 
         self._on_normalization_changed()
+        self._on_filter_changed()
         self._set_processing_controls_enabled(
             self._project is not None and self._locked_processing_settings is None
         )
@@ -2323,14 +2350,23 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._converted_image = None
         self._on_processing_value_changed()
 
+    def _on_filter_changed(self, index=None) -> None:
+        del index
+        enabled = (
+            self._filter_combo.currentData() != "none"
+            and self._locked_processing_settings is None
+        )
+        self._filter_radius_spin.setEnabled(enabled)
+        self._on_processing_value_changed()
+
     def _on_processing_value_changed(self, value=None) -> None:
         if self._updating_processing_controls:
             return
         self._converted_image = None
         image_layer = self._image_for_annotation()
-        if self._annotation_io is not None and self._is_source_image_layer(
-            image_layer
-        ):
+        if (
+            self._annotation_io is not None or self._segmentation_io is not None
+        ) and self._is_source_image_layer(image_layer):
             self._update_plane_status(image_layer)
             if self._annotation_dirty:
                 try:
@@ -2349,6 +2385,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
             green_channel=self._green_channel_combo.currentData(),
             blue_channel=self._blue_channel_combo.currentData(),
             normalization=str(method),
+            filter_method=str(self._filter_combo.currentData()),
+            filter_radius=self._filter_radius_spin.value(),
             lower=self._lower_value_spin.value() if uses_parameters else None,
             upper=self._upper_value_spin.value() if uses_parameters else None,
         )
@@ -2375,6 +2413,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         ):
             combo.setEnabled(enabled and has_channel_axis)
         self._normalization_combo.setEnabled(enabled)
+        self._filter_combo.setEnabled(enabled)
+        self._filter_radius_spin.setEnabled(
+            enabled and self._filter_combo.currentData() != "none"
+        )
         method = self._normalization_combo.currentData()
         uses_parameters = method in {"percentile", "z_score", "fixed_range"}
         self._lower_value_spin.setEnabled(enabled and uses_parameters)

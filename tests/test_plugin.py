@@ -37,6 +37,7 @@ from simple_napari_cci_annotator._annotation_browser import (
 )
 from simple_napari_cci_annotator._image_adapter import (
     ImageConversionError,
+    apply_image_filter,
     normalize_to_uint8,
 )
 from simple_napari_cci_annotator._project_store import (
@@ -70,7 +71,7 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.8.0"
+    assert simple_napari_cci_annotator.__version__ == "0.8.2"
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -90,6 +91,7 @@ def test_initialize_and_reopen_project(tmp_path):
     assert project.config.classes == {0: "LABEL"}
     assert project.config.image_processing == {
         "channels": "unset",
+        "filter": "unset",
         "normalization": "unset",
         "locked": False,
     }
@@ -328,6 +330,66 @@ def test_normalization_methods_return_uint8(method, lower, upper):
     assert int(converted.max()) <= 255
 
 
+@pytest.mark.parametrize("method", ["gaussian", "median", "mean", "low_pass"])
+def test_smoothing_filters_preserve_a_constant_plane(method):
+    data = np.full((9, 9), 17, dtype=np.uint16)
+    filtered = apply_image_filter(data, method=method, radius=2)
+
+    np.testing.assert_allclose(filtered, 17)
+
+
+def test_white_tophat_removes_constant_background():
+    data = np.full((9, 9), 17, dtype=np.uint16)
+    filtered = apply_image_filter(data, method="white_tophat", radius=2)
+
+    np.testing.assert_allclose(filtered, 0)
+
+
+def test_frequency_low_pass_suppresses_high_frequency_noise():
+    checkerboard = (np.indices((64, 64)).sum(axis=0) % 2).astype(float)
+
+    filtered = apply_image_filter(checkerboard, method="low_pass", radius=4)
+
+    assert filtered.shape == checkerboard.shape
+    assert np.std(filtered) < np.std(checkerboard) * 0.1
+    assert float(filtered.mean()) == pytest.approx(0.5, abs=0.01)
+
+
+def test_filter_is_applied_per_channel_before_normalization():
+    data = np.zeros((2, 7, 7), dtype=np.uint16)
+    data[0, 3, 3] = 255
+    data[1] = 100
+    layer = SimpleNamespace(
+        data=data,
+        name="filtered",
+        metadata={"axes": "CYX"},
+        axis_labels=(),
+        rgb=False,
+    )
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0, 0)))
+    settings = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=None,
+        filter_method="mean",
+        filter_radius=1,
+        normalization="fixed_range",
+        lower=0,
+        upper=255,
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings)
+
+    assert converted.data[3, 3, 0] == 51
+    assert converted.data[3, 2, 0] == 51
+    assert converted.data[2, 2, 0] == 0
+    assert np.all(converted.data[..., 1] == 100)
+    assert np.all(converted.data[..., 2] == 0)
+    assert converted.normalization_stats[0]["filter_method"] == "mean"
+    assert converted.normalization_stats[0]["filter_radius"] == 1
+
+
 def test_multidimensional_current_tz_plane_and_channel_mapping():
     data = np.zeros((2, 3, 4, 5, 6), dtype=np.uint16)
     base = np.arange(30, dtype=np.uint16).reshape(5, 6)
@@ -403,6 +465,35 @@ def test_project_image_processing_settings_lock(tmp_path):
     )
     with pytest.raises(ImageProcessingLockedError):
         reopened.lock_image_processing(changed.to_mapping())
+
+
+def test_locked_settings_before_filters_equal_explicit_no_filter(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "legacy-filter-project")
+    settings = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    )
+    legacy_mapping = settings.to_mapping()
+    legacy_mapping.pop("filter")
+    project.lock_image_processing(legacy_mapping)
+
+    reopened = ProjectStore.load(project.paths.root)
+    reopened.lock_image_processing(settings.to_mapping())
+
+    filtered = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+        filter_method="median",
+        filter_radius=1,
+    )
+    with pytest.raises(ImageProcessingLockedError):
+        reopened.lock_image_processing(filtered.to_mapping())
 
 
 def test_project_training_patch_contract_locks(tmp_path):
@@ -987,7 +1078,7 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.8.0" in text
+    assert "plugin_version: 0.8.2" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
@@ -1126,6 +1217,8 @@ def test_parameter_controls_have_tooltips(qtbot):
 
     controls = (
         widget._normalization_combo,
+        widget._filter_combo,
+        widget._filter_radius_spin,
         widget._confidence_spin,
         widget._model_iou_spin,
         widget._merge_iou_spin,
@@ -1230,9 +1323,13 @@ def test_locked_project_normalization_is_authoritative_for_inference_input(
     widget._normalization_combo.setCurrentIndex(
         widget._normalization_combo.findData("simple_max")
     )
+    widget._filter_combo.setCurrentIndex(widget._filter_combo.findData("median"))
+    widget._filter_radius_spin.setValue(7)
     converted = widget._convert_current_image(source)
 
     assert converted.settings.normalization == "min_max"
+    assert converted.settings.filter_method == "none"
+    assert converted.settings.filter_radius == 1
     np.testing.assert_array_equal(
         converted.data[..., 0], np.asarray([[0, 85], [170, 255]])
     )

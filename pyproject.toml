@@ -29,6 +29,7 @@ dependencies = [
     "ultralytics",
     "pillow",
     "scikit-image",
+    "scipy",
     "tifffile",
 ]
 

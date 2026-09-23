@@ -19,6 +19,7 @@ from ._annotation_io import (
     BoundingBox,
     LabelValidationError,
 )
+from ._image_adapter import ImageConversionError, ImageProcessingSettings
 from ._project_store import ProjectStore
 from ._tiled_inference import Tile, create_tile_plan
 
@@ -467,7 +468,17 @@ class DatasetBuilder:
             )
         conversion = event.get("conversion", {})
         actual = conversion.get("settings") if isinstance(conversion, dict) else None
-        if actual != expected:
+        try:
+            normalized_expected = ImageProcessingSettings.from_mapping(
+                expected
+            ).to_mapping()
+            normalized_actual = ImageProcessingSettings.from_mapping(
+                actual
+            ).to_mapping()
+        except (ImageConversionError, TypeError):
+            normalized_expected = expected
+            normalized_actual = actual
+        if normalized_actual != normalized_expected:
             return (
                 f"Invalid sample {stem!r}: audit conversion settings do not "
                 "match the locked project image-processing settings. Re-save "

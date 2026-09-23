@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
+from scipy.ndimage import convolve, grey_opening, median_filter
+from skimage.morphology import disk
 
 
 class ImageConversionError(ValueError):
@@ -21,6 +23,15 @@ NORMALIZATION_METHODS = {
     "dtype_range": "Data type range",
 }
 
+IMAGE_FILTERS = {
+    "none": "None",
+    "gaussian": "Gaussian blur",
+    "median": "Median filter",
+    "mean": "Mean filter",
+    "low_pass": "Low-pass (frequency)",
+    "white_tophat": "White top-hat",
+}
+
 
 @dataclass(frozen=True)
 class ImageProcessingSettings:
@@ -29,6 +40,8 @@ class ImageProcessingSettings:
     green_channel: int | None
     blue_channel: int | None
     normalization: str
+    filter_method: str = "none"
+    filter_radius: int = 1
     lower: float | None = None
     upper: float | None = None
     output_dtype: str = "uint8"
@@ -42,6 +55,10 @@ class ImageProcessingSettings:
         return {
             "channel_axis": self.channel_axis,
             "rgb_channels": list(self.rgb_channels),
+            "filter": {
+                "method": self.filter_method,
+                "radius": self.filter_radius,
+            },
             "normalization": {
                 "method": self.normalization,
                 "lower": self.lower,
@@ -57,12 +74,15 @@ class ImageProcessingSettings:
         try:
             channels = value["rgb_channels"]
             normalization = value["normalization"]
+            image_filter = value.get("filter", {"method": "none", "radius": 1})
             settings = cls(
                 channel_axis=_optional_int(value.get("channel_axis")),
                 red_channel=_optional_int(channels[0]),
                 green_channel=_optional_int(channels[1]),
                 blue_channel=_optional_int(channels[2]),
                 normalization=str(normalization["method"]),
+                filter_method=str(image_filter.get("method", "none")),
+                filter_radius=int(image_filter.get("radius", 1)),
                 lower=_optional_float(normalization.get("lower")),
                 upper=_optional_float(normalization.get("upper")),
                 output_dtype=str(value.get("output_dtype", "uint8")),
@@ -80,6 +100,16 @@ class ImageProcessingSettings:
             raise ImageConversionError(
                 f"Unknown normalization method: {self.normalization!r}."
             )
+        if self.filter_method not in IMAGE_FILTERS:
+            raise ImageConversionError(
+                f"Unknown image filter: {self.filter_method!r}."
+            )
+        if (
+            isinstance(self.filter_radius, bool)
+            or not isinstance(self.filter_radius, int)
+            or not 1 <= self.filter_radius <= 100
+        ):
+            raise ImageConversionError("Filter radius must be an integer within 1..100.")
         if self.output_dtype != "uint8":
             raise ImageConversionError("Only uint8 RGB project images are supported.")
         if self.scope != "per_plane_per_channel":
@@ -284,12 +314,19 @@ class ImageAdapter:
                 normalized.append(np.zeros(reference_shape, dtype=np.uint8))
                 statistics.append({"method": "empty", "lower": None, "upper": None})
                 continue
-            converted, stats = normalize_to_uint8(
+            filtered = apply_image_filter(
                 channel,
+                method=settings.filter_method,
+                radius=settings.filter_radius,
+            )
+            converted, stats = normalize_to_uint8(
+                filtered,
                 method=settings.normalization,
                 lower=settings.lower,
                 upper=settings.upper,
             )
+            stats["filter_method"] = settings.filter_method
+            stats["filter_radius"] = settings.filter_radius
             normalized.append(converted)
             statistics.append(stats)
 
@@ -333,6 +370,65 @@ class ImageAdapter:
         if first_shape is None:
             raise ImageConversionError("Select at least one source channel.")
         return tuple(extracted)  # type: ignore[return-value]
+
+
+def apply_image_filter(data, *, method: str, radius: int) -> np.ndarray:
+    """Filter one 2D source channel before normalization and RGB stacking."""
+    values = np.asarray(data)
+    if values.ndim != 2:
+        raise ImageConversionError(
+            f"Expected a 2D channel plane, received shape {values.shape}."
+        )
+    if method not in IMAGE_FILTERS:
+        raise ImageConversionError(f"Unknown image filter: {method!r}.")
+    if (
+        isinstance(radius, bool)
+        or not isinstance(radius, int)
+        or not 1 <= radius <= 100
+    ):
+        raise ImageConversionError("Filter radius must be an integer within 1..100.")
+    work = values.astype(np.float64, copy=False)
+    if method == "none":
+        return work
+
+    footprint = disk(radius).astype(bool)
+    if method == "median":
+        return median_filter(work, footprint=footprint, mode="reflect")
+    if method == "mean":
+        kernel = footprint.astype(np.float64)
+        kernel /= kernel.sum()
+        return convolve(work, kernel, mode="reflect")
+    if method == "gaussian":
+        coordinates = np.arange(-radius, radius + 1, dtype=np.float64)
+        yy, xx = np.meshgrid(coordinates, coordinates, indexing="ij")
+        sigma = max(radius / 2.0, 0.5)
+        kernel = np.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+        kernel *= footprint
+        kernel /= kernel.sum()
+        return convolve(work, kernel, mode="reflect")
+    if method == "low_pass":
+        return _frequency_low_pass(work, radius)
+    if method == "white_tophat":
+        opened = grey_opening(work, footprint=footprint, mode="reflect")
+        return np.asarray(work - opened, dtype=np.float64)
+    raise ImageConversionError(f"Unknown image filter: {method!r}.")
+
+
+def _frequency_low_pass(data: np.ndarray, radius: int) -> np.ndarray:
+    """Apply a second-order Butterworth low-pass with reflected boundaries."""
+    padding = min(max(8, radius * 2), max(data.shape))
+    mode = "reflect" if min(data.shape) > 1 else "edge"
+    padded = np.pad(data, padding, mode=mode)
+    frequencies_y = np.fft.fftfreq(padded.shape[0])[:, np.newaxis]
+    frequencies_x = np.fft.rfftfreq(padded.shape[1])[np.newaxis, :]
+    radial_frequency = np.sqrt(frequencies_y**2 + frequencies_x**2)
+    cutoff = 0.5 / float(radius)
+    transfer = 1.0 / np.sqrt(1.0 + (radial_frequency / cutoff) ** 4)
+    spectrum = np.fft.rfft2(padded)
+    filtered = np.fft.irfft2(spectrum * transfer, s=padded.shape)
+    return np.asarray(
+        filtered[padding:-padding, padding:-padding], dtype=np.float64
+    )
 
 
 def normalize_to_uint8(
