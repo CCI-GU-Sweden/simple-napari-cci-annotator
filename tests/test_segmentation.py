@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ from simple_napari_cci_annotator._segmentation_crop import (
 )
 from simple_napari_cci_annotator._segmentation_dataset import (
     SegmentationDatasetBuilder,
+    export_instance_polygon,
     mask_to_yolo_polygon,
 )
 from simple_napari_cci_annotator._segmentation_tiling import (
@@ -191,6 +193,23 @@ def test_mask_polygon_reports_material_hole_topology_loss():
         mask_to_yolo_polygon(mask)
 
 
+def test_nested_instance_hole_exports_as_overlapping_parent_polygon():
+    instance_map = np.zeros((100, 100), dtype=np.uint32)
+    instance_map[5:95, 5:95] = 1
+    instance_map[25:75, 25:75] = 2
+
+    nucleus = export_instance_polygon(instance_map, 1)
+    nucleolus = export_instance_polygon(instance_map, 2)
+
+    assert nucleus.nested_child_ids == (2,)
+    assert nucleus.nested_pixel_count == 2500
+    assert nucleus.exclusive_iou < 0.90
+    assert nucleus.round_trip_iou >= 0.90
+    assert nucleus.unexplained_hole_pixels == 0
+    assert nucleolus.nested_child_ids == ()
+    assert nucleolus.round_trip_iou >= 0.90
+
+
 def test_mask_polygon_rejects_disconnected_exterior_components():
     mask = np.zeros((40, 40), dtype=bool)
     mask[2:10, 2:10] = True
@@ -216,12 +235,13 @@ def test_segmentation_dataset_snapshot_keeps_triples_and_empty_masks(tmp_path):
     io = SegmentationIO(project)
     image = np.zeros((512, 512, 3), dtype=np.uint8)
     positive = np.zeros((512, 512), dtype=np.uint32)
-    positive[30:90, 40:110] = 1
+    positive[30:150, 40:160] = 1
+    positive[60:120, 70:130] = 2
     io.save(
         image_data=image,
         sample_id="positive",
         mask=positive,
-        instances={1: _record(1, 1)},
+        instances={1: _record(1), 2: _record(2, 1)},
         source_path=tmp_path / "source-positive.tif",
         conversion_metadata={"settings": settings},
     )
@@ -257,6 +277,22 @@ def test_segmentation_dataset_snapshot_keeps_triples_and_empty_masks(tmp_path):
             path.stem for path in (snapshot.dataset_root / "instances" / split).glob("*.json")
         }
     assert "minimum_round_trip_iou" in snapshot.tile_manifest.read_text(encoding="utf-8")
+    with snapshot.tile_manifest.open(encoding="utf-8", newline="") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    positive_manifest = next(
+        row for row in manifest_rows if row["source_sample"] == "positive"
+    )
+    assert float(positive_manifest["minimum_exclusive_iou"]) < 0.90
+    assert positive_manifest["nested_parent_count"] == "1"
+    relationships = json.loads(positive_manifest["nested_relationships"])
+    assert relationships[0]["child_instance_ids"] == [2]
+    assert relationships[0]["parent_class_id"] == 0
+    assert relationships[0]["child_class_ids"] == [1]
+    positive_split = preview.assignments["positive"]
+    exported_rows = (
+        snapshot.dataset_root / "labels" / positive_split / "positive.txt"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(exported_rows) == 2
 
     base_model = tmp_path / "yolo26n-seg.pt"
     base_model.write_bytes(b"segment-weights")

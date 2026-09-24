@@ -12,6 +12,7 @@ import numpy as np
 import tifffile
 import yaml
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 from skimage.draw import polygon
 from skimage.measure import approximate_polygon, find_contours, label
 
@@ -81,6 +82,16 @@ class SegmentationDatasetSnapshot:
     image_count: int
     label_count: int
     rejected_box_count: int
+
+
+@dataclass(frozen=True)
+class PolygonExport:
+    points: np.ndarray
+    round_trip_iou: float
+    exclusive_iou: float
+    nested_child_ids: tuple[int, ...] = ()
+    nested_pixel_count: int = 0
+    unexplained_hole_pixels: int = 0
 
 
 class SegmentationDatasetBuilder:
@@ -206,14 +217,40 @@ class SegmentationDatasetBuilder:
             lines: list[str] = []
             class_counts: dict[int, int] = {}
             ious: list[float] = []
+            exclusive_ious: list[float] = []
+            nesting: list[dict[str, Any]] = []
             for instance_id, record in sorted(loaded.instances.items()):
-                points, iou = mask_to_yolo_polygon(
-                    loaded.mask == instance_id,
+                exported = export_instance_polygon(
+                    loaded.mask,
+                    instance_id,
                     minimum_iou=self.minimum_polygon_iou,
                 )
-                coords = " ".join(f"{value:.8f}" for value in points.ravel())
+                coords = " ".join(
+                    f"{value:.8f}" for value in exported.points.ravel()
+                )
                 lines.append(f"{record.class_id} {coords}")
-                ious.append(iou)
+                ious.append(exported.round_trip_iou)
+                exclusive_ious.append(exported.exclusive_iou)
+                if exported.nested_child_ids:
+                    nesting.append(
+                        {
+                            "parent_instance_id": instance_id,
+                            "parent_class_id": record.class_id,
+                            "child_instance_ids": list(exported.nested_child_ids),
+                            "child_class_ids": sorted(
+                                {
+                                    loaded.instances[child_id].class_id
+                                    for child_id in exported.nested_child_ids
+                                }
+                            ),
+                            "nested_pixel_count": exported.nested_pixel_count,
+                            "exclusive_iou": exported.exclusive_iou,
+                            "round_trip_iou": exported.round_trip_iou,
+                            "unexplained_hole_pixels": (
+                                exported.unexplained_hole_pixels
+                            ),
+                        }
+                    )
                 class_counts[record.class_id] = class_counts.get(record.class_id, 0) + 1
             image_out = root / "images" / split / f"{sample.sample_id}.png"
             label_out = root / "labels" / split / f"{sample.sample_id}.txt"
@@ -240,6 +277,9 @@ class SegmentationDatasetBuilder:
                 "class_counts": json.dumps(class_counts, sort_keys=True),
                 "minimum_round_trip_iou": min(ious) if ious else "",
                 "mean_round_trip_iou": float(np.mean(ious)) if ious else "",
+                "minimum_exclusive_iou": min(exclusive_ious) if exclusive_ious else "",
+                "nested_parent_count": len(nesting),
+                "nested_relationships": json.dumps(nesting, sort_keys=True),
                 "discarded_components": 0,
                 "image_sha256": _sha256(image_out),
                 "label_sha256": _sha256(label_out),
@@ -300,16 +340,26 @@ class SegmentationDatasetBuilder:
                 padding_errors = _mask_padding_errors(loaded.mask, event)
                 if padding_errors:
                     raise SegmentationError("; ".join(padding_errors))
+                nested_exports: list[tuple[int, PolygonExport]] = []
                 for instance_id in loaded.instances:
                     try:
-                        mask_to_yolo_polygon(
-                            loaded.mask == instance_id,
+                        exported = export_instance_polygon(
+                            loaded.mask,
+                            instance_id,
                             minimum_iou=self.minimum_polygon_iou,
                         )
+                        if exported.nested_child_ids:
+                            nested_exports.append((instance_id, exported))
                     except DatasetBuildError as exc:
                         raise SegmentationError(
                             f"instance {instance_id}: {exc}"
                         ) from exc
+                for parent_id, exported in nested_exports:
+                    warnings.append(
+                        f"{entry.sample_id}: instance {parent_id} encloses nested "
+                        f"instance(s) {list(exported.nested_child_ids)}; the YOLO "
+                        "export intentionally overlaps their polygons."
+                    )
             except (OSError, SegmentationError, ImageConversionError, ValueError, KeyError) as exc:
                 errors.append(f"Invalid sample {entry.sample_id!r}: {exc}")
                 continue
@@ -334,9 +384,70 @@ class SegmentationDatasetBuilder:
 
 
 def mask_to_yolo_polygon(mask: np.ndarray, *, minimum_iou: float = 0.90) -> tuple[np.ndarray, float]:
+    """Export one standalone mask, retaining strict unexplained-hole validation."""
     binary = np.asarray(mask, dtype=bool)
+    exported = _polygon_export(
+        binary,
+        export_target=binary,
+        minimum_iou=minimum_iou,
+    )
+    return exported.points, exported.round_trip_iou
+
+
+def export_instance_polygon(
+    instance_mask: np.ndarray,
+    instance_id: int,
+    *,
+    minimum_iou: float = 0.90,
+) -> PolygonExport:
+    """Export an instance, restoring holes fully occupied by nested objects."""
+    array = np.asarray(instance_mask)
+    if array.ndim != 2:
+        raise DatasetBuildError("Instance maps must be two-dimensional.")
+    instance_id = int(instance_id)
+    if instance_id <= 0:
+        raise DatasetBuildError("Instance IDs must be positive integers.")
+    binary = array == instance_id
+    filled = np.asarray(binary_fill_holes(binary), dtype=bool)
+    holes = filled & ~binary
+    hole_components = label(holes, connectivity=1)
+    nested_fill = np.zeros_like(binary)
+    nested_child_ids: set[int] = set()
+    unexplained_hole_pixels = 0
+    for hole_id in range(1, int(hole_components.max(initial=0)) + 1):
+        component = hole_components == hole_id
+        values = {int(value) for value in np.unique(array[component])}
+        child_ids = values - {0, instance_id}
+        if values and 0 not in values and child_ids:
+            nested_fill[component] = True
+            nested_child_ids.update(child_ids)
+        else:
+            unexplained_hole_pixels += int(np.count_nonzero(component))
+    return _polygon_export(
+        binary,
+        export_target=binary | nested_fill,
+        minimum_iou=minimum_iou,
+        nested_child_ids=tuple(sorted(nested_child_ids)),
+        nested_pixel_count=int(np.count_nonzero(nested_fill)),
+        unexplained_hole_pixels=unexplained_hole_pixels,
+    )
+
+
+def _polygon_export(
+    binary: np.ndarray,
+    *,
+    export_target: np.ndarray,
+    minimum_iou: float,
+    nested_child_ids: tuple[int, ...] = (),
+    nested_pixel_count: int = 0,
+    unexplained_hole_pixels: int = 0,
+) -> PolygonExport:
+    binary = np.asarray(binary, dtype=bool)
+    export_target = np.asarray(export_target, dtype=bool)
     if binary.ndim != 2 or not np.any(binary):
         raise DatasetBuildError("Cannot export an empty instance mask.")
+    if export_target.shape != binary.shape or np.any(binary & ~export_target):
+        raise DatasetBuildError("Polygon export target is inconsistent with the instance mask.")
     component_count = int(label(binary, connectivity=1).max(initial=0))
     if component_count != 1:
         raise DatasetBuildError(
@@ -361,14 +472,27 @@ def mask_to_yolo_polygon(mask: np.ndarray, *, minimum_iou: float = 0.90) -> tupl
     reconstructed = np.zeros_like(binary)
     rr, cc = polygon(contour[:, 0], contour[:, 1], shape=binary.shape)
     reconstructed[rr, cc] = True
-    union = np.count_nonzero(binary | reconstructed)
-    iou = float(np.count_nonzero(binary & reconstructed) / union) if union else 1.0
-    if iou < minimum_iou:
+    exclusive_iou = _binary_iou(binary, reconstructed)
+    round_trip_iou = _binary_iou(export_target, reconstructed)
+    if round_trip_iou < minimum_iou:
         raise DatasetBuildError(
-            f"Mask-to-polygon round-trip IoU {iou:.3f} is below {minimum_iou:.3f}."
+            f"Mask-to-polygon round-trip IoU {round_trip_iou:.3f} is below "
+            f"{minimum_iou:.3f}."
         )
     points = np.column_stack((contour[:, 1] / width, contour[:, 0] / height))
-    return np.clip(points, 0.0, 1.0), iou
+    return PolygonExport(
+        points=np.clip(points, 0.0, 1.0),
+        round_trip_iou=round_trip_iou,
+        exclusive_iou=exclusive_iou,
+        nested_child_ids=nested_child_ids,
+        nested_pixel_count=nested_pixel_count,
+        unexplained_hole_pixels=unexplained_hole_pixels,
+    )
+
+
+def _binary_iou(first: np.ndarray, second: np.ndarray) -> float:
+    union = int(np.count_nonzero(first | second))
+    return float(np.count_nonzero(first & second) / union) if union else 1.0
 
 
 def _contour_area(contour: np.ndarray) -> float:
