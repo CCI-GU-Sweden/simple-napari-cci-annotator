@@ -13,7 +13,7 @@ import tifffile
 import yaml
 from PIL import Image
 from skimage.draw import polygon
-from skimage.measure import approximate_polygon, find_contours
+from skimage.measure import approximate_polygon, find_contours, label
 
 from ._dataset_builder import (
     DatasetBuildCancelled,
@@ -301,7 +301,15 @@ class SegmentationDatasetBuilder:
                 if padding_errors:
                     raise SegmentationError("; ".join(padding_errors))
                 for instance_id in loaded.instances:
-                    mask_to_yolo_polygon(loaded.mask == instance_id, minimum_iou=self.minimum_polygon_iou)
+                    try:
+                        mask_to_yolo_polygon(
+                            loaded.mask == instance_id,
+                            minimum_iou=self.minimum_polygon_iou,
+                        )
+                    except DatasetBuildError as exc:
+                        raise SegmentationError(
+                            f"instance {instance_id}: {exc}"
+                        ) from exc
             except (OSError, SegmentationError, ImageConversionError, ValueError, KeyError) as exc:
                 errors.append(f"Invalid sample {entry.sample_id!r}: {exc}")
                 continue
@@ -329,10 +337,20 @@ def mask_to_yolo_polygon(mask: np.ndarray, *, minimum_iou: float = 0.90) -> tupl
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2 or not np.any(binary):
         raise DatasetBuildError("Cannot export an empty instance mask.")
+    component_count = int(label(binary, connectivity=1).max(initial=0))
+    if component_count != 1:
+        raise DatasetBuildError(
+            f"Instance mask has {component_count} disconnected exterior components."
+        )
     contours = find_contours(np.pad(binary, 1), 0.5)
-    if len(contours) != 1:
-        raise DatasetBuildError("An instance must have exactly one connected exterior contour.")
-    contour = approximate_polygon(contours[0] - 1.0, tolerance=0.5)
+    if not contours:
+        raise DatasetBuildError("Instance mask has no traceable exterior contour.")
+    # A connected binary object can still yield several contours: the largest
+    # encloses the object and the others are holes. YOLO segmentation rows do
+    # not represent holes, so export the exterior and quantify the resulting
+    # topology loss with the round-trip IoU check below.
+    exterior = max(contours, key=_contour_area)
+    contour = approximate_polygon(exterior - 1.0, tolerance=0.5)
     if len(contour) > 1 and np.allclose(contour[0], contour[-1]):
         contour = contour[:-1]
     if len(contour) < 3:
@@ -351,6 +369,15 @@ def mask_to_yolo_polygon(mask: np.ndarray, *, minimum_iou: float = 0.90) -> tupl
         )
     points = np.column_stack((contour[:, 1] / width, contour[:, 0] / height))
     return np.clip(points, 0.0, 1.0), iou
+
+
+def _contour_area(contour: np.ndarray) -> float:
+    points = np.asarray(contour, dtype=float)
+    if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+        return 0.0
+    y = points[:, 0]
+    x = points[:, 1]
+    return abs(float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))) / 2.0
 
 
 def _mask_padding_errors(mask: np.ndarray, event: dict[str, Any]) -> tuple[str, ...]:

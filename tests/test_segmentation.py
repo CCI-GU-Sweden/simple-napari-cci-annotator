@@ -42,7 +42,10 @@ from simple_napari_cci_annotator._tiled_inference import (
     InferenceError,
     InferenceSettings,
 )
-from simple_napari_cci_annotator._dataset_builder import DatasetBuildSettings
+from simple_napari_cci_annotator._dataset_builder import (
+    DatasetBuildError,
+    DatasetBuildSettings,
+)
 from simple_napari_cci_annotator._image_adapter import ImageProcessingSettings
 from simple_napari_cci_annotator._training_crop import CropBounds
 from simple_napari_cci_annotator._training import TrainingService, TrainingSettings
@@ -165,6 +168,36 @@ def test_mask_polygon_round_trip_preserves_class_independent_geometry():
     assert points.shape[1] == 2
     assert np.all((0 <= points) & (points <= 1))
     assert iou >= 0.90
+
+
+def test_mask_polygon_uses_outer_contour_for_holes_and_image_edges():
+    mask = np.zeros((64, 80), dtype=bool)
+    mask[:40, :55] = True
+    mask[12:16, 20:24] = False
+
+    points, iou = mask_to_yolo_polygon(mask)
+
+    assert points.shape[0] >= 3
+    assert np.any(points == 0.0)
+    assert iou >= 0.90
+
+
+def test_mask_polygon_reports_material_hole_topology_loss():
+    mask = np.zeros((80, 80), dtype=bool)
+    mask[5:75, 5:75] = True
+    mask[20:60, 20:60] = False
+
+    with pytest.raises(DatasetBuildError, match="round-trip IoU"):
+        mask_to_yolo_polygon(mask)
+
+
+def test_mask_polygon_rejects_disconnected_exterior_components():
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[2:10, 2:10] = True
+    mask[25:35, 25:35] = True
+
+    with pytest.raises(DatasetBuildError, match="2 disconnected exterior"):
+        mask_to_yolo_polygon(mask)
 
 
 def test_segmentation_dataset_snapshot_keeps_triples_and_empty_masks(tmp_path):
