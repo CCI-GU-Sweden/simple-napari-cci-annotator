@@ -51,8 +51,10 @@ from ._image_adapter import (
 from ._inference_worker import InferenceWorker
 from ._instance_mask import (
     ComposedInstances,
+    compact_instance_ids,
     disconnected_instance_ids,
     keep_largest_component_by_bbox,
+    remove_small_instances,
     split_instance,
 )
 from ._project_store import ProjectError, ProjectStore
@@ -334,6 +336,22 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         self._largest_instance_button.clicked.connect(
             self._on_keep_largest_mask_component
+        )
+        self._remove_small_instances_button = QPushButton("Remove <5 px")
+        self._remove_small_instances_button.setToolTip(
+            "Delete every instance whose total mask area is 1–4 pixels. "
+            "Objects with exactly 5 pixels are kept."
+        )
+        self._remove_small_instances_button.clicked.connect(
+            self._on_remove_small_mask_instances
+        )
+        self._compact_instance_ids_button = QPushButton("Collapse Instance IDs")
+        self._compact_instance_ids_button.setToolTip(
+            "Remove metadata records with no pixels and renumber surviving "
+            "instance IDs consecutively from 1 without changing their classes."
+        )
+        self._compact_instance_ids_button.clicked.connect(
+            self._on_compact_mask_instances
         )
         self._instance_details_label = QLabel("Selected instance: unavailable")
         self._instance_details_label.setWordWrap(True)
@@ -641,6 +659,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         mask_cleanup_buttons.addWidget(self._merge_instance_button)
         mask_cleanup_buttons.addWidget(self._largest_instance_button)
         annotation_layout.addLayout(mask_cleanup_buttons)
+        mask_bulk_cleanup_buttons = QHBoxLayout()
+        mask_bulk_cleanup_buttons.addWidget(self._remove_small_instances_button)
+        mask_bulk_cleanup_buttons.addWidget(self._compact_instance_ids_button)
+        annotation_layout.addLayout(mask_bulk_cleanup_buttons)
         annotation_layout.addWidget(self._instance_details_label)
         annotation_layout.addWidget(self._class_counts_label)
         annotation_layout.addWidget(self._label_status_label)
@@ -1359,10 +1381,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         if self._project.config.task == "segment":
             records = self._active_segment_instances()
+            layer = self._editable_segmentation_layer()
+            present_ids = (
+                {
+                    int(instance_id)
+                    for instance_id in np.unique(np.asarray(layer.data))
+                    if instance_id
+                }
+                if layer is not None
+                else set()
+            )
             counts = {
                 class_id: sum(
-                    record.class_id == class_id
-                    for record in records.values()
+                    instance_id in present_ids and record.class_id == class_id
+                    for instance_id, record in records.items()
                 )
                 for class_id in self._project.config.classes
             }
@@ -1697,6 +1729,71 @@ class SimpleCciAnnotatorQWidget(QWidget):
             f"{report.removed_pixels} pixel(s); save to keep this correction."
         )
         self._on_labels_data_changed()
+
+    def _on_remove_small_mask_instances(self) -> None:
+        layer = self._editable_segmentation_layer()
+        if layer is None:
+            self._show_info("Open a segmentation image first.")
+            return
+        try:
+            data, records, report = remove_small_instances(
+                layer.data,
+                self._active_segment_instances(),
+                minimum_area=5,
+            )
+        except SegmentationError as exc:
+            self._show_error(str(exc))
+            return
+        layer.data = data
+        self._set_active_segment_instances(records)
+        self._on_labels_data_changed()
+        if report.removed_instance_ids:
+            self._label_status_label.setText(
+                f"Instances: removed {len(report.removed_instance_ids)} object(s) "
+                f"smaller than 5 pixels ({report.removed_pixels} pixels total). "
+                "Use Collapse Instance IDs to discard any other empty records "
+                "and renumber the survivors."
+            )
+        else:
+            self._label_status_label.setText(
+                "Instances: no objects smaller than 5 pixels were found."
+            )
+
+    def _on_compact_mask_instances(self) -> None:
+        layer = self._editable_segmentation_layer()
+        if layer is None or self._project is None:
+            self._show_info("Open a segmentation project and image first.")
+            return
+        selected = self._selected_instance_id()
+        try:
+            data, records, report = compact_instance_ids(
+                layer.data,
+                self._active_segment_instances(),
+                self._project.config.classes,
+            )
+        except SegmentationError as exc:
+            self._show_error(str(exc))
+            return
+        layer.data = data
+        self._set_active_segment_instances(records)
+        try:
+            layer.selected_label = report.old_to_new.get(selected, 0)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        self._on_labels_data_changed()
+        renumbered = sum(
+            old_id != new_id for old_id, new_id in report.old_to_new.items()
+        )
+        if report.removed_empty_ids or renumbered:
+            self._label_status_label.setText(
+                f"Instances: collapsed {len(report.old_to_new)} surviving "
+                f"object(s), removed {len(report.removed_empty_ids)} empty "
+                f"record(s), and renumbered {renumbered} ID(s)."
+            )
+        else:
+            self._label_status_label.setText(
+                "Instances: IDs are already consecutive and no empty records remain."
+            )
 
     def _apply_class_to_selected_instance(self) -> None:
         instance_id = self._selected_instance_id()
@@ -4302,10 +4399,18 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._split_instance_button,
             self._merge_instance_button,
             self._largest_instance_button,
+            self._remove_small_instances_button,
+            self._compact_instance_ids_button,
         ):
             control.setVisible(is_segment)
         self._instance_details_label.setVisible(is_segment)
         self._new_instance_button.setEnabled(is_segment and has_mask and not running)
+        self._remove_small_instances_button.setEnabled(
+            is_segment and has_mask and not running
+        )
+        self._compact_instance_ids_button.setEnabled(
+            is_segment and has_mask and not running
+        )
         for control in (
             self._delete_instance_button,
             self._split_instance_button,

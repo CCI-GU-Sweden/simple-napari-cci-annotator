@@ -14,9 +14,11 @@ import tifffile
 from simple_napari_cci_annotator._instance_mask import (
     ComposedInstances,
     PredictedInstance,
+    compact_instance_ids,
     compose_predictions,
     disconnected_instance_ids,
     keep_largest_component_by_bbox,
+    remove_small_instances,
     split_instance,
 )
 from simple_napari_cci_annotator._project_store import ClassMapError, ProjectStore
@@ -66,6 +68,51 @@ def _record(instance_id: int, class_id: int = 0) -> InstanceRecord:
         bbox=(0, 0, 0, 0),
         area=0,
     )
+
+
+def test_remove_small_instances_uses_strict_five_pixel_threshold():
+    mask = np.zeros((6, 8), dtype=np.uint32)
+    mask[0:2, 0:2] = 2  # Four pixels: removed.
+    mask[0, 3:8] = 7  # Five pixels: retained.
+    mask[2:4, 4:7] = 20  # Six pixels: retained.
+    records = {
+        2: _record(2),
+        7: _record(7, 1),
+        20: _record(20),
+        99: _record(99, 1),  # Existing empty metadata is left for compaction.
+    }
+
+    cleaned, cleaned_records, report = remove_small_instances(
+        mask, records, minimum_area=5
+    )
+
+    assert report.removed_instance_ids == (2,)
+    assert report.removed_pixels == 4
+    assert not np.any(cleaned == 2)
+    assert np.count_nonzero(cleaned == 7) == 5
+    assert np.count_nonzero(cleaned == 20) == 6
+    assert set(cleaned_records) == {7, 20, 99}
+
+
+def test_compact_instance_ids_drops_empty_records_and_preserves_classes():
+    mask = np.zeros((5, 6), dtype=np.uint32)
+    mask[0, 0:2] = 7
+    mask[2:4, 3:6] = 20
+    records = {7: _record(7, 1), 20: _record(20), 99: _record(99, 1)}
+
+    compact, compact_records, report = compact_instance_ids(
+        mask, records, {0: "Cell", 1: "Debris"}
+    )
+
+    assert report.old_to_new == {7: 1, 20: 2}
+    assert report.removed_empty_ids == (99,)
+    assert set(np.unique(compact)) == {0, 1, 2}
+    assert compact_records[1].class_id == 1
+    assert compact_records[1].class_name == "Debris"
+    assert compact_records[2].class_id == 0
+    assert compact_records[2].class_name == "Cell"
+    assert compact_records[1].area == 2
+    assert compact_records[2].area == 6
 
 
 def test_segment_project_contract_and_uint32_round_trip(tmp_path):

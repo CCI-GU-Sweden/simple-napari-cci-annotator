@@ -1274,6 +1274,8 @@ def test_parameter_controls_have_tooltips(qtbot):
         widget._overlap_percent_spin,
         widget._clear_border_instances_checkbox,
         widget._show_segmentation_grid_checkbox,
+        widget._remove_small_instances_button,
+        widget._compact_instance_ids_button,
         widget._patch_size_combo,
         widget._training_model_combo,
         widget._validation_fraction_spin,
@@ -1601,6 +1603,54 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     reloaded = widget._segmentation_layer()
     assert int(reloaded.data[12, 32]) == instance_id
     assert widget._segment_instances[instance_id].class_id == 0
+
+
+def test_widget_removes_tiny_instances_and_collapses_empty_ids(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-cleanup", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((32, 32, 3), dtype=np.uint8),
+        name="cleanup",
+        path=tmp_path / "cleanup.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+
+    widget._on_new_mask_instance()
+    tiny_id = labels.selected_label
+    data = labels.data.copy()
+    data[0:2, 0:2] = tiny_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    widget._on_new_mask_instance()
+    retained_id = labels.selected_label
+    data = labels.data.copy()
+    data[0, 4:9] = retained_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    widget._on_new_mask_instance()  # Intentionally leave this metadata ID empty.
+    empty_id = labels.selected_label
+
+    widget._on_remove_small_mask_instances()
+
+    assert not np.any(labels.data == tiny_id)
+    assert np.count_nonzero(labels.data == retained_id) == 5
+    assert set(widget._segment_instances) == {retained_id, empty_id}
+    assert "0 Cell: 1" in widget._class_counts_label.text()
+
+    widget._on_compact_mask_instances()
+
+    assert set(np.unique(labels.data)) == {0, 1}
+    assert set(widget._segment_instances) == {1}
+    assert widget._segment_instances[1].class_id == 0
+    assert labels.selected_label == 0
+    assert not widget._segmentation_errors
 
 
 def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtbot):

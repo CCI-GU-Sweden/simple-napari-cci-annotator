@@ -32,6 +32,18 @@ class ComposedInstances:
     provenance: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SmallInstanceRemoval:
+    removed_instance_ids: tuple[int, ...]
+    removed_pixels: int
+
+
+@dataclass(frozen=True)
+class InstanceCompaction:
+    old_to_new: dict[int, int]
+    removed_empty_ids: tuple[int, ...]
+
+
 def keep_largest_component_by_bbox(
     binary_mask: np.ndarray,
 ) -> tuple[np.ndarray, ComponentCleanup]:
@@ -132,6 +144,85 @@ def disconnected_instance_ids(mask: np.ndarray) -> tuple[int, ...]:
         for instance_id in np.unique(array)
         if instance_id
         and label(array == instance_id, connectivity=1).max(initial=0) > 1
+    )
+
+
+def remove_small_instances(
+    mask: np.ndarray,
+    instances: Mapping[int, InstanceRecord],
+    *,
+    minimum_area: int = 5,
+) -> tuple[np.ndarray, dict[int, InstanceRecord], SmallInstanceRemoval]:
+    """Explicitly remove instances smaller than ``minimum_area`` pixels."""
+    if minimum_area < 1:
+        raise SegmentationError("Minimum instance area must be at least one pixel.")
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise SegmentationError("The instance mask must be two-dimensional.")
+    if not np.issubdtype(array.dtype, np.integer) or np.any(array < 0):
+        raise SegmentationError("Mask IDs must be non-negative integers.")
+    array = array.astype(np.uint32, copy=False)
+    present, counts = np.unique(array[array > 0], return_counts=True)
+    missing = sorted(int(value) for value in present if int(value) not in instances)
+    if missing:
+        raise SegmentationError(f"Instance IDs missing metadata: {missing}")
+    removed = tuple(
+        int(instance_id)
+        for instance_id, count in zip(present, counts, strict=True)
+        if int(count) < minimum_area
+    )
+    output = array.copy()
+    if removed:
+        output[np.isin(output, removed)] = 0
+    records = {
+        int(instance_id): record
+        for instance_id, record in instances.items()
+        if int(instance_id) not in removed
+    }
+    return output, records, SmallInstanceRemoval(
+        removed_instance_ids=removed,
+        removed_pixels=sum(
+            int(count)
+            for instance_id, count in zip(present, counts, strict=True)
+            if int(instance_id) in removed
+        ),
+    )
+
+
+def compact_instance_ids(
+    mask: np.ndarray,
+    instances: Mapping[int, InstanceRecord],
+    classes: Mapping[int, str],
+) -> tuple[np.ndarray, dict[int, InstanceRecord], InstanceCompaction]:
+    """Drop empty metadata and deterministically renumber present IDs to 1..N."""
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise SegmentationError("The instance mask must be two-dimensional.")
+    if not np.issubdtype(array.dtype, np.integer) or np.any(array < 0):
+        raise SegmentationError("Mask IDs must be non-negative integers.")
+    array = array.astype(np.uint32, copy=False)
+    present = tuple(sorted(int(value) for value in np.unique(array) if value))
+    missing = sorted(set(present) - {int(value) for value in instances})
+    if missing:
+        raise SegmentationError(f"Instance IDs missing metadata: {missing}")
+    mapping = {old_id: new_id for new_id, old_id in enumerate(present, start=1)}
+    output = np.zeros_like(array)
+    raw_records: dict[int, InstanceRecord] = {}
+    for old_id, new_id in mapping.items():
+        output[array == old_id] = new_id
+        record = instances[old_id]
+        raw_records[new_id] = InstanceRecord(
+            **{
+                **record.__dict__,
+                "instance_id": new_id,
+            }
+        )
+    records = refresh_instance_records(output, raw_records, classes)
+    return output, records, InstanceCompaction(
+        old_to_new=mapping,
+        removed_empty_ids=tuple(
+            sorted({int(value) for value in instances} - set(present))
+        ),
     )
 
 
