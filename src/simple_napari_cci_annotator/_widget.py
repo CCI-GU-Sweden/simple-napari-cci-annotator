@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,8 @@ from qtpy.QtWidgets import (
 )
 
 from ._annotation_io import AnnotationError, AnnotationIO, LabelValidationError
+from ._batch_inference import BatchInferenceError, BatchInferenceSettings
+from ._batch_worker import BatchInferenceWorker
 from ._annotation_browser import (
     AnnotationBrowser,
     AnnotationReviewEntry,
@@ -58,6 +61,7 @@ from ._instance_mask import (
     split_instance,
 )
 from ._project_store import ProjectError, ProjectStore
+from ._prediction_output import PredictionOutputError, PredictionOutputWriter
 from ._segmentation_io import (
     InstanceRecord,
     SegmentationError,
@@ -166,6 +170,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._last_normalization_method: str | None = None
         self._model: YoloDetectionModel | YoloSegmentationModel | None = None
         self._inference_worker: InferenceWorker | SegmentationWorker | None = None
+        self._batch_worker: BatchInferenceWorker | None = None
         self._inference_sample_id: str | None = None
         self._inference_converted: ConvertedImage | None = None
         self._training_worker: TrainingWorker | None = None
@@ -462,11 +467,19 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._predict_button.clicked.connect(self._on_predict)
         self._cancel_inference_button = QPushButton("Cancel")
         self._cancel_inference_button.clicked.connect(self._on_cancel_inference)
+        self._save_output_button = QPushButton("Save Current Output")
+        self._save_output_button.setToolTip(
+            "Save the current full-size RGB image and edited boxes or instance "
+            "mask to a separate output folder. This does not add training data."
+        )
+        self._save_output_button.clicked.connect(self._on_save_prediction_output)
         self._inference_progress = QProgressBar()
         self._inference_progress.setRange(0, 1)
         self._inference_progress.setValue(0)
         self._inference_status_label = QLabel("Inference: idle")
         self._inference_status_label.setWordWrap(True)
+        self._output_status_label = QLabel("Output: choose Save Current Output after review.")
+        self._output_status_label.setWordWrap(True)
 
         self._patch_size_combo = QComboBox()
         self._patch_size_combo.addItem("1024 × 1024", 1024)
@@ -703,6 +716,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         inference_buttons = QHBoxLayout()
         inference_buttons.addWidget(self._predict_button)
         inference_buttons.addWidget(self._cancel_inference_button)
+        inference_buttons.addWidget(self._save_output_button)
         inference_layout = QVBoxLayout()
         inference_layout.addWidget(self._model_path_label)
         inference_layout.addWidget(self._model_status_label)
@@ -711,10 +725,60 @@ class SimpleCciAnnotatorQWidget(QWidget):
         inference_layout.addLayout(inference_buttons)
         inference_layout.addWidget(self._inference_progress)
         inference_layout.addWidget(self._inference_status_label)
+        inference_layout.addWidget(self._output_status_label)
         self._inference_section = CollapsibleSection(
             "Large-image tiled prediction",
             inference_layout,
             expanded=False,
+        )
+
+        self._batch_input_input = QLineEdit()
+        self._batch_input_input.setPlaceholderText("Folder containing TIFF images")
+        self._batch_input_input.textChanged.connect(self._on_batch_input_changed)
+        self._batch_input_button = QPushButton("Choose Input Folder")
+        self._batch_input_button.clicked.connect(self._on_choose_batch_input)
+        self._batch_output_input = QLineEdit()
+        self._batch_output_input.setPlaceholderText(
+            "Defaults to a Prediction folder inside the input folder"
+        )
+        self._batch_output_button = QPushButton("Choose Output Folder")
+        self._batch_output_button.clicked.connect(self._on_choose_batch_output)
+        self._batch_invert_checkbox = QCheckBox("Invert intensities for all batch images")
+        self._batch_invert_checkbox.setToolTip(
+            "Per-image inversion is not locked in the project. This applies the "
+            "same inversion choice to every batch plane and records it in metadata."
+        )
+        self._batch_start_button = QPushButton("Predict All TIFF Images")
+        self._batch_start_button.clicked.connect(self._on_start_batch)
+        self._batch_cancel_button = QPushButton("Cancel Batch")
+        self._batch_cancel_button.clicked.connect(self._on_cancel_batch)
+        self._batch_progress = QProgressBar()
+        self._batch_progress.setRange(0, 1)
+        self._batch_progress.setValue(0)
+        self._batch_status_label = QLabel(
+            "Batch: open a model and a project with locked image processing."
+        )
+        self._batch_status_label.setWordWrap(True)
+        batch_form = QFormLayout()
+        batch_input_row = QHBoxLayout()
+        batch_input_row.addWidget(self._batch_input_input)
+        batch_input_row.addWidget(self._batch_input_button)
+        batch_form.addRow("Input folder", batch_input_row)
+        batch_output_row = QHBoxLayout()
+        batch_output_row.addWidget(self._batch_output_input)
+        batch_output_row.addWidget(self._batch_output_button)
+        batch_form.addRow("Output folder", batch_output_row)
+        batch_buttons = QHBoxLayout()
+        batch_buttons.addWidget(self._batch_start_button)
+        batch_buttons.addWidget(self._batch_cancel_button)
+        batch_layout = QVBoxLayout()
+        batch_layout.addLayout(batch_form)
+        batch_layout.addWidget(self._batch_invert_checkbox)
+        batch_layout.addLayout(batch_buttons)
+        batch_layout.addWidget(self._batch_progress)
+        batch_layout.addWidget(self._batch_status_label)
+        self._batch_section = CollapsibleSection(
+            "Batch TIFF prediction", batch_layout, expanded=False
         )
 
         crop_form = QFormLayout()
@@ -783,6 +847,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         content_layout.addWidget(self._annotation_section)
         content_layout.addWidget(self._review_section)
         content_layout.addWidget(self._inference_section)
+        content_layout.addWidget(self._batch_section)
         content_layout.addWidget(self._crop_section)
         content_layout.addWidget(self._retrain_section)
         content_layout.addStretch(1)
@@ -1304,6 +1369,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 f"Instances: loaded {len(instances)} object(s) from {pair[0]}"
             )
             self._save_annotation_button.setText("Update Image + Instance Mask")
+        if tuple(converted.data.shape[:2]) != (self._training_patch_size(),) * 2:
+            self._label_status_label.setText(
+                self._label_status_label.text()
+                + " This is a working mask; use Select Training Crop to save regions."
+            )
+            self._save_annotation_button.setText(
+                "Use Training Crop to Save Corrections"
+            )
         self._refresh_segmentation_validation()
         self._update_class_counts()
         self._on_selected_instance_changed()
@@ -1700,16 +1773,36 @@ class SimpleCciAnnotatorQWidget(QWidget):
         source_ids.discard(target)
         records = self._active_segment_instances()
         missing = sorted(source_ids - set(records))
-        if not source_ids or missing:
+        if not source_ids or missing or target not in records:
             self._show_error(
                 "Enter at least one existing source ID."
                 + (f" Missing: {missing}" if missing else "")
             )
             return
+        different_classes = sorted(
+            source_id
+            for source_id in source_ids
+            if records[source_id].class_id != records[target].class_id
+        )
+        if different_classes:
+            self._show_error(
+                "Cannot merge instances with different classes. "
+                f"Assign the target class to IDs {different_classes} first."
+            )
+            return
         data = np.asarray(layer.data, dtype=np.uint32).copy()
-        for source_id in source_ids:
+        lineage = list(records[target].lineage)
+        for source_id in sorted(source_ids):
             data[data == source_id] = target
+            lineage.extend((*records[source_id].lineage, source_id))
             records.pop(source_id, None)
+        records[target] = replace(
+            records[target],
+            confidence=None,
+            source="manual",
+            status="corrected",
+            lineage=tuple(dict.fromkeys(lineage)),
+        )
         layer.data = data
         self._on_labels_data_changed()
 
@@ -1898,9 +1991,19 @@ class SimpleCciAnnotatorQWidget(QWidget):
         elif self._crop_bounds is not None and self._crop_dirty:
             self._label_status_label.setText("Instances: unsaved training-crop edits.")
         elif self._annotation_dirty:
-            self._label_status_label.setText(
-                "Instances: unsaved edits. Save before changing image or Z/T plane."
-            )
+            if (
+                self._converted_image is not None
+                and data.shape != (self._training_patch_size(),) * 2
+            ):
+                self._label_status_label.setText(
+                    "Instances: unsaved working mask. Select Training "
+                    "Crop, then Create / Refresh Crop and Add Crop + Corrections "
+                    "to save useful regions."
+                )
+            else:
+                self._label_status_label.setText(
+                    "Instances: unsaved edits. Save before changing image or Z/T plane."
+                )
         self._apply_instance_colors(layer)
 
     def _crop_bbox_layer(self):
@@ -1974,7 +2077,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if tuple(converted.data.shape[:2]) != (patch_size, patch_size):
             raise SegmentationError(
                 f"Canonical training images must be {patch_size}×{patch_size}. "
-                "Segmentation crop saving arrives in Phase 7D."
+                "Use Select Training Crop to save a region of this image."
             )
         self._refresh_segmentation_validation()
         if self._segmentation_errors:
@@ -2210,8 +2313,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             response = QMessageBox.warning(
                 self,
                 "Discard full-size working mask",
-                "This image is not the fixed training size. Segmentation crop saving "
-                "arrives in Phase 7D. Discard the current mask edits?",
+                "This image is not the fixed training size and cannot be saved "
+                "directly. Use Select Training Crop to save useful regions first. "
+                "Discard the remaining full-size mask edits?",
                 QMessageBox.Discard | QMessageBox.Cancel,
                 QMessageBox.Cancel,
             )
@@ -2243,6 +2347,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return True
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        if self._batch_worker is not None and self._batch_worker.isRunning():
+            self._batch_worker.request_cancel()
+            self._batch_status_label.setText(
+                "Batch: cancellation requested. Close again after it stops."
+            )
+            event.ignore()
+            return
         if self._training_worker is not None and self._training_worker.isRunning():
             self._training_worker.request_cancel()
             self._training_status_label.setText(
@@ -3717,6 +3828,230 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         self._cancel_inference_button.setEnabled(False)
 
+    def _on_save_prediction_output(self) -> None:
+        if self._project is None or self._converted_image is None:
+            self._show_error("Open a project and image before saving output.")
+            return
+        if self._crop_bounds is not None:
+            self._show_error(
+                "Return to the source image before saving full-size output."
+            )
+            return
+        image_layer = self._image_for_annotation()
+        converted = self._converted_image
+        if (
+            not self._is_image_layer(image_layer)
+            or self._image_stem(image_layer) != converted.sample_id
+        ):
+            self._show_error("The output image and editable annotation do not match.")
+            return
+        is_segment = self._project.config.task == "segment"
+        layer = self._segmentation_layer() if is_segment else self._annotation_layer()
+        if layer is None or layer.metadata.get("cci_image_stem") != converted.sample_id:
+            self._show_error("No matching editable prediction result is available.")
+            return
+        if is_segment:
+            self._refresh_segmentation_validation()
+            if self._segmentation_errors:
+                self._show_error(
+                    "Correct the instance mask before saving output:\n"
+                    + "\n".join(self._segmentation_errors)
+                )
+                return
+        elif self._annotation_invalid_indices:
+            self._show_error("Correct out-of-bounds boxes before saving output.")
+            return
+
+        start = self._project.paths.root / "outputs"
+        parent_text = QFileDialog.getExistingDirectory(
+            self,
+            "Choose prediction output parent",
+            str(start if start.is_dir() else self._project.paths.root),
+        )
+        if not parent_text:
+            return
+        parent = Path(parent_text)
+        if parent.resolve().is_relative_to(self._project.paths.annotations.resolve()):
+            self._show_error("Choose an output folder outside project annotations.")
+            return
+        writer = PredictionOutputWriter(self._project)
+        paths = writer.paths(parent, converted.sample_id)
+        overwrite = False
+        if any(path.exists() for path in paths.files):
+            response = QMessageBox.question(
+                self,
+                "Replace saved output?",
+                f"Output files already exist in {paths.folder}. Replace them?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response != QMessageBox.Yes:
+                return
+            overwrite = True
+        conversion = {
+            "settings": converted.settings.to_mapping(),
+            "inverted": converted.inverted,
+            "plane_indices": converted.plane.non_spatial_indices,
+            "axis_labels": list(converted.plane.axis_labels),
+            "normalization_stats": list(converted.normalization_stats),
+        }
+        source_path = self._source_path(image_layer)
+        prediction = layer.metadata.get("cci_prediction")
+        try:
+            if is_segment:
+                result = writer.save_segmentation(
+                    parent,
+                    converted.sample_id,
+                    converted.data,
+                    np.asarray(layer.data),
+                    self._segment_instances,
+                    source_path=source_path,
+                    conversion=conversion,
+                    prediction=prediction,
+                    overwrite=overwrite,
+                )
+            else:
+                count = len(layer.data)
+                properties = dict(getattr(layer, "properties", {}) or {})
+                result = writer.save_detection(
+                    parent,
+                    converted.sample_id,
+                    converted.data,
+                    tuple(np.asarray(shape) for shape in layer.data),
+                    self._class_ids(layer, count),
+                    confidences=self._property_values(
+                        properties, "confidence", count, np.nan, float
+                    ),
+                    sources=self._property_values(
+                        properties, "source", count, "manual", object
+                    ),
+                    tile_ids=self._property_values(
+                        properties, "tile_id", count, -1, int
+                    ),
+                    source_path=source_path,
+                    conversion=conversion,
+                    prediction=prediction,
+                    overwrite=overwrite,
+                )
+        except (
+            PredictionOutputError,
+            LabelValidationError,
+            OSError,
+            ValueError,
+        ) as exc:
+            self._show_error(f"Could not save prediction output:\n{exc}")
+            return
+        self._output_status_label.setText(f"Output: saved to {result.folder}")
+        self._show_info(f"Saved current output to:\n{result.folder}")
+
+    def _on_batch_input_changed(self, text: str) -> None:
+        default = Path(text.strip()) / "Prediction" if text.strip() else None
+        self._batch_output_input.setPlaceholderText(
+            str(default)
+            if default is not None
+            else "Defaults to a Prediction folder inside the input folder"
+        )
+        self._update_action_state()
+
+    def _on_choose_batch_input(self) -> None:
+        start = self._batch_input_input.text().strip()
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Choose TIFF input folder",
+            start or str(self._project.paths.root if self._project else Path.home()),
+        )
+        if chosen:
+            self._batch_input_input.setText(chosen)
+
+    def _on_choose_batch_output(self) -> None:
+        start = self._batch_output_input.text().strip()
+        if not start:
+            source = self._batch_input_input.text().strip()
+            start = str(Path(source) / "Prediction") if source else ""
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Choose batch output folder",
+            start or str(self._project.paths.root if self._project else Path.home()),
+        )
+        if chosen:
+            self._batch_output_input.setText(chosen)
+
+    def _on_start_batch(self) -> None:
+        if self._project is None or self._model is None:
+            self._show_error("Open a project and select a matching model first.")
+            return
+        if self._batch_worker is not None:
+            return
+        input_text = self._batch_input_input.text().strip()
+        if not input_text:
+            self._show_error("Choose a TIFF input folder first.")
+            return
+        input_folder = Path(input_text)
+        output_text = self._batch_output_input.text().strip()
+        output_parent = (
+            Path(output_text) if output_text else input_folder / "Prediction"
+        )
+        settings = BatchInferenceSettings(
+            input_folder=input_folder,
+            output_parent=output_parent,
+            inference=self._inference_settings(),
+            invert=self._batch_invert_checkbox.isChecked(),
+            clear_border_instances=self._clear_border_instances_checkbox.isChecked(),
+        )
+        worker = BatchInferenceWorker(self._project, self._model, settings)
+        try:
+            total = worker.validate()
+        except (BatchInferenceError, ImageConversionError, InferenceError, OSError) as exc:
+            worker.deleteLater()
+            self._show_error(f"Could not start batch prediction:\n{exc}")
+            return
+        worker.progress.connect(self._on_batch_progress)
+        worker.succeeded.connect(self._on_batch_succeeded)
+        worker.failed.connect(self._on_batch_failed)
+        worker.finished.connect(self._on_batch_finished)
+        self._batch_worker = worker
+        self._batch_progress.setRange(0, total)
+        self._batch_progress.setValue(0)
+        self._batch_status_label.setText(
+            f"Batch: starting {total} TIFF file(s) · output {output_parent}"
+        )
+        self._update_action_state()
+        worker.start()
+
+    def _on_cancel_batch(self) -> None:
+        worker = self._batch_worker
+        if worker is None:
+            return
+        worker.request_cancel()
+        self._batch_cancel_button.setEnabled(False)
+        self._batch_status_label.setText(
+            "Batch: cancellation requested; finishing the current operation."
+        )
+
+    def _on_batch_progress(self, current: int, total: int, message: str) -> None:
+        self._batch_progress.setRange(0, max(1, total))
+        self._batch_progress.setValue(current)
+        self._batch_status_label.setText(f"Batch: {message}")
+
+    def _on_batch_succeeded(self, result) -> None:
+        self._batch_progress.setValue(self._batch_progress.maximum())
+        self._batch_status_label.setText(
+            f"Batch: {result.status} · {result.completed} file(s) completed, "
+            f"{result.failed} failed, {result.processed_planes} plane(s) saved · "
+            f"{result.run_root}"
+        )
+
+    def _on_batch_failed(self, message: str) -> None:
+        self._batch_status_label.setText("Batch: failed")
+        self._show_error(f"Batch prediction failed:\n{message}")
+
+    def _on_batch_finished(self) -> None:
+        worker = self._batch_worker
+        if worker is not None:
+            worker.deleteLater()
+        self._batch_worker = None
+        self._update_action_state()
+
     def _on_inference_progress(self, current: int, total: int, text: str) -> None:
         self._inference_progress.setRange(0, max(1, total))
         self._inference_progress.setValue(current)
@@ -3813,7 +4148,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and tuple(self._converted_image.data.shape[:2])
             == (self._training_patch_size(),) * 2
         )
-        self._annotation_dirty = direct_save
+        self._annotation_dirty = True
         self._update_class_counts(shapes)
         if direct_save:
             self._label_status_label.setText(
@@ -3888,17 +4223,26 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and tuple(self._converted_image.data.shape[:2])
             == (self._training_patch_size(),) * 2
         )
-        self._annotation_dirty = direct_save
+        self._annotation_dirty = True
         removed_components = sum(item.removed_components for item in result.cleanup)
         removed_pixels = sum(item.removed_pixels for item in result.cleanup)
+        if direct_save:
+            label_status = (
+                f"Instances: {len(result.instances)} prediction(s), not yet saved. "
+            )
+        else:
+            label_status = (
+                f"Instances: {len(result.instances)} working prediction(s). "
+                "Use Select Training Crop to save 512/1024-pixel regions. "
+            )
         self._label_status_label.setText(
-            f"Instances: {len(result.instances)} prediction(s), not yet saved. "
-            f"Cleanup removed {removed_components} component(s) / {removed_pixels} px."
+            label_status
+            + f"Cleanup removed {removed_components} component(s) / {removed_pixels} px."
         )
         self._save_annotation_button.setText(
             "Save Prediction + Corrections"
             if direct_save
-            else "Segmentation Crops Arrive in Phase 7D"
+            else "Use Training Crop to Save Corrections"
         )
         self._inference_progress.setRange(0, 1)
         self._inference_progress.setValue(1)
@@ -4311,7 +4655,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._training_worker is not None
             and self._training_worker.isRunning()
         )
-        running = inference_running or training_running
+        batch_running = self._batch_worker is not None
+        running = inference_running or training_running or batch_running
         self._new_project_button.setEnabled(not running and not has_crop)
         self._new_project_task_combo.setEnabled(not running and not has_crop)
         self._open_project_button.setEnabled(not running and not has_crop)
@@ -4339,6 +4684,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and not has_crop
         )
         self._save_annotation_button.setEnabled(can_save_annotation)
+        if has_project and has_image and not direct_save_size:
+            patch_size = self._training_patch_size()
+            self._save_annotation_button.setToolTip(
+                f"Direct save requires a {patch_size}×{patch_size} image. "
+                "Use Select Training Crop to save a region."
+            )
+        else:
+            self._save_annotation_button.setToolTip("")
         self._validate_project_button.setEnabled(
             has_project and not is_segment and not running
         )
@@ -4350,6 +4703,35 @@ class SimpleCciAnnotatorQWidget(QWidget):
             has_project
             and has_image
             and self._model is not None
+            and not running
+            and not has_crop
+        )
+        can_start_batch = bool(
+            has_project
+            and self._model is not None
+            and self._project.config.image_processing.get("locked")
+            and self._batch_input_input.text().strip()
+            and not running
+            and not has_crop
+        )
+        self._batch_start_button.setEnabled(can_start_batch)
+        self._batch_cancel_button.setEnabled(batch_running)
+        for control in (
+            self._batch_input_input,
+            self._batch_input_button,
+            self._batch_output_input,
+            self._batch_output_button,
+            self._batch_invert_checkbox,
+        ):
+            control.setEnabled(not running)
+        self._save_output_button.setEnabled(
+            has_project
+            and has_image
+            and self._converted_image is not None
+            and (has_mask if is_segment else has_shapes)
+            and not (
+                self._segmentation_errors if is_segment else self._annotation_invalid_indices
+            )
             and not running
             and not has_crop
         )

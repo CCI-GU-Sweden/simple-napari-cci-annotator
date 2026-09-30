@@ -131,6 +131,18 @@ Tile-local detections are clipped to valid pixels and translated directly into f
 
 The output `yolo_bboxes` layer preserves `class_id`, project class name, confidence, source, and tile ID. Prediction settings and the model path are attached to the layer and written into the annotation audit entry when corrections are saved. A loaded model must be a detection model and expose the same class IDs as the project; model names may differ because the project names are authoritative in the annotation UI.
 
+### Save the current full-image output
+
+After reviewing the current image, click **Save Current Output** in the prediction section and choose an output parent folder. The plugin writes the converted RGB plane and the current edited result at full source resolution under `<chosen folder>/<detect or segment>/<sample ID>/`. Detection writes `image.png`, standard five-column `labels.txt`, and `result.json` with confidence and provenance. Segmentation writes `image.png`, a lossless `uint32` `mask.tif`, and `instances.json` with class and instance metadata. Empty results are supported. An existing output requires explicit overwrite confirmation.
+
+This export is separate from the project's canonical training annotations: it does not require a 512/1024 training patch, add a sample to the training pool, or clear the unsaved-correction indicator. Use **Add Crop + Corrections** when a region should become retraining data.
+
+### Batch TIFF prediction
+
+Open an initialized project whose image processing settings have been locked by saving a training annotation, then select a matching model. In **Batch TIFF prediction**, choose an input folder and click **Start Batch**. The batch scans every TIFF file directly in that folder (`.tif`, `.tiff`, `.ome.tif`, and `.ome.tiff`, case insensitive). Other formats and nested folders are skipped. Every Z/T or other nonspatial plane in each TIFF series is predicted separately using the locked project channel selection, filter, and normalization. The batch invert option is recorded separately. Conversion or prediction failures are recorded per file, and the batch continues with the next file.
+
+By default, each run is saved under `<input folder>/Prediction/run_<timestamp>_<id>/`; you can choose another output parent folder. Each converted plane has the same detection or segmentation files described above. `analysis_metadata.json` in the run folder records project settings and checksum, model checksum, inference settings, source checksums, plane IDs, output paths and checksums, errors, and completion status. Results stay outside the project's training annotations. **Cancel Batch** stops after the current cancellable operation and retains completed results. Large TIFF series are loaded one series at a time, so memory use depends on the largest series.
+
 ## Movable fixed-size training crops
 
 The crop workflow turns a local inference failure into one immediately retrainable sample:

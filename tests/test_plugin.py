@@ -41,6 +41,7 @@ from simple_napari_cci_annotator._image_adapter import (
     apply_image_filter,
     normalize_to_uint8,
 )
+from simple_napari_cci_annotator._instance_mask import ComposedInstances
 from simple_napari_cci_annotator._project_store import (
     ClassMapError,
     ImageProcessingLockedError,
@@ -1425,6 +1426,7 @@ def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot)
     assert np.isnan(shapes.properties["confidence"][0])
     assert "1 Debris: 1" in widget._class_counts_label.text()
     assert widget._annotation_dirty
+    widget._annotation_dirty = False  # Avoid an unsaved-edits dialog on teardown.
 
 
 def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbot):
@@ -1651,6 +1653,7 @@ def test_widget_removes_tiny_instances_and_collapses_empty_ids(tmp_path, qtbot):
     assert widget._segment_instances[1].class_id == 0
     assert labels.selected_label == 0
     assert not widget._segmentation_errors
+    widget._annotation_dirty = False  # Avoid an unsaved-edits dialog on teardown.
 
 
 def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtbot):
@@ -1669,6 +1672,11 @@ def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtb
     qtbot.addWidget(widget)
     widget._set_project(project)
     source_labels = widget._segmentation_layer()
+    assert not widget._save_annotation_button.isEnabled()
+    assert widget._save_annotation_button.text() == (
+        "Use Training Crop to Save Corrections"
+    )
+    assert "working mask" in widget._label_status_label.text()
     widget._on_new_mask_instance()
     instance_id = source_labels.selected_label
     data = source_labels.data.copy()
@@ -1704,3 +1712,179 @@ def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtb
     assert len(list(project.paths.images.glob("*.png"))) == 1
     assert len(list(project.paths.masks.glob("*.tif"))) == 1
     assert len(list(project.paths.instances.glob("*.json"))) == 1
+    widget._annotation_dirty = False  # The source working mask is intentionally unsaved.
+
+
+@pytest.mark.parametrize("task", ["detect", "segment"])
+def test_full_size_prediction_requires_discard_confirmation(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / task, task=task)
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((64, 96, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    widget._inference_sample_id = widget._current_sample_id
+    widget._inference_converted = widget._converted_image
+
+    if task == "segment":
+        result = ComposedInstances(
+            mask=np.zeros((64, 96), dtype=np.uint32),
+            instances={},
+            cleanup=(),
+        )
+    else:
+        result = ()
+    widget._on_inference_succeeded(result)
+
+    assert widget._annotation_dirty
+    assert not widget._save_annotation_button.isEnabled()
+    assert widget._select_crop_button.isEnabled()
+    assert "Select Training Crop" in widget._save_annotation_button.toolTip()
+    if task == "segment":
+        assert widget._save_annotation_button.text() == (
+            "Use Training Crop to Save Corrections"
+        )
+        assert "unsaved working mask" in widget._label_status_label.text()
+
+    with patch.object(
+        widget_module.QMessageBox,
+        "warning",
+        return_value=widget_module.QMessageBox.Cancel,
+    ) as warning:
+        widget._load_annotations_for_image(image, force=True)
+        assert widget._annotation_dirty
+        warning.assert_called_once()
+        if task == "segment":
+            assert "Select Training Crop" in warning.call_args.args[2]
+
+    events = []
+    event = SimpleNamespace(
+        ignore=lambda: events.append("ignored"),
+        accept=lambda: events.append("accepted"),
+    )
+    with patch.object(
+        widget_module.QMessageBox,
+        "warning",
+        return_value=widget_module.QMessageBox.Cancel,
+    ):
+        widget.closeEvent(event)
+    assert events == ["ignored"]
+    widget._annotation_dirty = False
+
+
+@pytest.mark.parametrize("in_crop", [False, True])
+def test_mask_merge_requires_same_class_and_keeps_lineage(
+    tmp_path, qtbot, in_crop
+):
+    project = ProjectStore.initialize(
+        tmp_path / "merge", task="segment", classes={0: "Cell", 1: "Debris"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((64, 64, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+    widget._on_new_mask_instance()
+    target_id = labels.selected_label
+    labels.data[20:24, 20:24] = target_id
+    widget._on_labels_data_changed()
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(1))
+    widget._on_new_mask_instance()
+    source_id = labels.selected_label
+    labels.data[24:28, 20:24] = source_id
+    widget._on_labels_data_changed()
+
+    if in_crop:
+        widget._patch_size_combo.setCurrentIndex(
+            widget._patch_size_combo.findData(512)
+        )
+        widget._on_select_training_crop()
+        widget._on_create_training_crop()
+        labels = widget._crop_segmentation_layer()
+        target_id, source_id = 1, 2
+
+    labels.selected_label = target_id
+    before = labels.data.copy()
+    with patch.object(
+        widget_module.QInputDialog, "getText", return_value=(str(source_id), True)
+    ), patch.object(widget, "_show_error") as error:
+        widget._on_merge_mask_instances()
+    np.testing.assert_array_equal(labels.data, before)
+    assert "different classes" in error.call_args.args[0]
+    assert widget._active_segment_instances()[source_id].class_id == 1
+
+    labels.selected_label = source_id
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(0))
+    widget._apply_class_to_selected_instance()
+    labels.selected_label = target_id
+    with patch.object(
+        widget_module.QInputDialog, "getText", return_value=(str(source_id), True)
+    ):
+        widget._on_merge_mask_instances()
+    assert source_id not in widget._active_segment_instances()
+    assert set(np.unique(labels.data)) == {0, target_id}
+    merged = widget._active_segment_instances()[target_id]
+    assert merged.class_id == 0
+    assert merged.source == "manual"
+    assert merged.status == "corrected"
+    assert source_id in merged.lineage
+    widget._annotation_dirty = False
+    widget._crop_dirty = False
+
+
+@pytest.mark.parametrize("task", ["detect", "segment"])
+def test_widget_saves_current_output_outside_training_pool(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / "project", task=task)
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((48, 80, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    output_parent = tmp_path / "outputs"
+    output_parent.mkdir()
+
+    assert widget._save_output_button.isEnabled()
+    with patch.object(
+        widget_module.QFileDialog,
+        "getExistingDirectory",
+        return_value=str(output_parent),
+    ), patch.object(widget, "_show_info"):
+        widget._save_output_button.click()
+
+    folder = output_parent / task / "field"
+    assert (folder / "image.png").is_file()
+    assert (folder / ("mask.tif" if task == "segment" else "labels.txt")).is_file()
+    assert (folder / ("instances.json" if task == "segment" else "result.json")).is_file()
+    assert str(folder) in widget._output_status_label.text()
+    assert not list(project.paths.images.iterdir())
+
+    with patch.object(
+        widget_module.QFileDialog,
+        "getExistingDirectory",
+        return_value=str(output_parent),
+    ), patch.object(
+        widget_module.QMessageBox,
+        "question",
+        return_value=widget_module.QMessageBox.Cancel,
+    ) as question:
+        widget._save_output_button.click()
+    question.assert_called_once()
