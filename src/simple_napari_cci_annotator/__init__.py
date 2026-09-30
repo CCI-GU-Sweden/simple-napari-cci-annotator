@@ -11,7 +11,7 @@ from ._tiled_inference import (
 )
 from ._training import TrainingService, TrainingSettings
 from ._version import __version__
-from ._widget import SimpleCciAnnotatorQWidget
+from .api import ProjectPipeline
 
 __all__ = [
     "AnnotationIO",
@@ -23,6 +23,7 @@ __all__ = [
     "InferenceSettings",
     "InstanceRecord",
     "ProjectStore",
+    "ProjectPipeline",
     "SegmentationIO",
     "SimpleCciAnnotatorQWidget",
     "TiledInferenceEngine",
@@ -30,3 +31,11 @@ __all__ = [
     "TrainingSettings",
     "create_tile_plan",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SimpleCciAnnotatorQWidget":
+        from ._widget import SimpleCciAnnotatorQWidget
+
+        return SimpleCciAnnotatorQWidget
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

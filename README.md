@@ -143,6 +143,30 @@ Open an initialized project whose image processing settings have been locked by 
 
 By default, each run is saved under `<input folder>/Prediction/run_<timestamp>_<id>/`; you can choose another output parent folder. Each converted plane has the same detection or segmentation files described above. `analysis_metadata.json` in the run folder records project settings and checksum, model checksum, inference settings, source checksums, plane IDs, output paths and checksums, errors, and completion status. Results stay outside the project's training annotations. **Cancel Batch** stops after the current cancellable operation and retains completed results. Large TIFF series are loaded one series at a time, so memory use depends on the largest series.
 
+### Headless Python API
+
+`ProjectPipeline` provides the same project, training, and TIFF inference services without importing napari or Qt. It runs synchronously and does not ask for input during a run:
+
+```python
+from simple_napari_cci_annotator import (
+    ImageProcessingSettings, InferenceSettings, ProjectPipeline,
+)
+
+pipeline = ProjectPipeline.create(
+    "project", task="detect", classes={0: "Cell"},
+    image_processing=ImageProcessingSettings(
+        None, None, None, None, "min_max"
+    ),
+)
+# Later: pipeline = ProjectPipeline.open("project")
+settings = InferenceSettings(tile_size=1024, overlap=205)
+one = pipeline.predict_one("inputs/first.ome.tiff", "model.pt", inference=settings)
+batch = pipeline.predict_batch("inputs", "model.pt", inference=settings)
+print(one.run_root, batch.run_root)
+```
+
+`predict_one` and `predict_batch` accept only TIFF/OME-TIFF input. They use the project's locked image processing, process every nonspatial plane, and save the same output files and run metadata as the widget. Pass `output_folder=` to change the default `Prediction` parent, or `progress=` and `cancelled=` callbacks for automation. To train from annotations already saved in the project, call `pipeline.train(TrainingSettings(...))`; this validates the dataset and then uses the existing training service. For example, use `TrainingSettings(model_path=Path("model.pt"), destination=Path("runs"), dataset=DatasetBuildSettings(), train_only=True)` when no independent validation groups are available. Training requires canonical annotation samples and Ultralytics. The API does not create training annotations or perform interactive crop review.
+
 ## Movable fixed-size training crops
 
 The crop workflow turns a local inference failure into one immediately retrainable sample:

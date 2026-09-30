@@ -39,6 +39,7 @@ class BatchInferenceSettings:
     inference: InferenceSettings
     invert: bool = False
     clear_border_instances: bool = False
+    source_files: tuple[Path, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,24 @@ class TiffBatchProcessor:
             raise BatchInferenceError(
                 "Choose a batch output folder outside project annotations."
             )
-        return find_tiff_inputs(self.settings.input_folder)
+        if self.settings.source_files is None:
+            return find_tiff_inputs(self.settings.input_folder)
+        input_root = Path(self.settings.input_folder).expanduser().resolve()
+        files = tuple(Path(path).expanduser().resolve() for path in self.settings.source_files)
+        if not input_root.is_dir() or not files:
+            raise BatchInferenceError("Choose an existing folder with TIFF files.")
+        if any(
+            not path.is_file()
+            or path.parent != input_root
+            or path.suffix.lower() not in {".tif", ".tiff"}
+            for path in files
+        ):
+            raise BatchInferenceError(
+                "Selected inputs must be TIFF files directly inside the input folder."
+            )
+        if len(set(files)) != len(files):
+            raise BatchInferenceError("Selected TIFF inputs contain duplicates.")
+        return files
 
     def run(
         self,
