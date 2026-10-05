@@ -3,7 +3,8 @@ name = "simple-napari-cci-annotator"
 dynamic = ["version"]
 description = "Plugin to easly test a yolo model and retrain it"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   {name = "Simon Leclerc"},
   {email = "simon.leclerc@gu.se"},
