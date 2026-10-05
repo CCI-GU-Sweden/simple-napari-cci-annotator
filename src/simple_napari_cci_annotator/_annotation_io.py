@@ -503,8 +503,8 @@ def _format_boxes(boxes: Sequence[BoundingBox]) -> str:
 def _preferred_image_suffix(source_path: Path | None, image: np.ndarray) -> str:
     if source_path is not None and Path(source_path).suffix.lower() in IMAGE_EXTENSIONS:
         suffix = Path(source_path).suffix.lower()
-        if suffix in {".jpg", ".jpeg", ".webp"} and image.dtype != np.uint8:
-            return ".tif"
+        if suffix in {".jpg", ".jpeg", ".webp"}:
+            return ".png" if image.dtype == np.uint8 else ".tif"
         return suffix
     if image.dtype == np.uint8:
         return ".png"

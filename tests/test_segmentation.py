@@ -41,6 +41,7 @@ from simple_napari_cci_annotator._segmentation_tiling import (
     _canonical_relabel,
     _seam_equivalences,
 )
+from simple_napari_cci_annotator._segmentation_worker import SegmentationWorker
 from simple_napari_cci_annotator._tiled_inference import (
     InferenceCancelled,
     InferenceError,
@@ -587,3 +588,47 @@ def test_tiled_segmentation_honours_cancellation():
             {0: "Cell"},
             cancelled=lambda: True,
         )
+
+
+def test_direct_segmentation_worker_clears_border_instances(qtbot):
+    worker = SegmentationWorker(
+        _FullTilePredictor(),
+        np.zeros((64, 64, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=8),
+        {0: "Cell"},
+        clear_border_instances=True,
+    )
+    succeeded = []
+    failed = []
+    worker.succeeded.connect(succeeded.append)
+    worker.failed.connect(failed.append)
+
+    worker.run()
+
+    assert failed == []
+    assert len(succeeded) == 1
+    assert not np.any(succeeded[0].mask)
+    assert succeeded[0].instances == {}
+    assert succeeded[0].provenance["cleared_border_ids"] == [1]
+
+
+def test_tiled_segmentation_worker_reports_cancellation(monkeypatch, qtbot):
+    worker = SegmentationWorker(
+        _FullTilePredictor(),
+        np.zeros((80, 90, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=8),
+        {0: "Cell"},
+    )
+    cancelled = []
+    failed = []
+    worker.cancelled.connect(lambda: cancelled.append(True))
+    worker.failed.connect(failed.append)
+
+    def interrupt(*args, **kwargs):
+        raise InferenceCancelled("Inference cancelled by the user.")
+
+    monkeypatch.setattr(TiledSegmentationEngine, "predict", interrupt)
+    worker.run()
+
+    assert cancelled == [True]
+    assert failed == []

@@ -326,6 +326,7 @@ class ImageAdapter:
                 method=settings.normalization,
                 lower=settings.lower,
                 upper=settings.upper,
+                source_dtype=channel.dtype,
             )
             if invert:
                 converted = np.asarray(255 - converted, dtype=np.uint8)
@@ -442,6 +443,7 @@ def normalize_to_uint8(
     method: str,
     lower: float | None = None,
     upper: float | None = None,
+    source_dtype: np.dtype | None = None,
 ) -> tuple[np.ndarray, dict[str, float | str | None]]:
     values = np.asarray(data)
     if values.ndim != 2:
@@ -493,11 +495,12 @@ def normalize_to_uint8(
         low_value = float(lower)
         high_value = float(upper)
     elif method == "dtype_range":
-        if np.issubdtype(values.dtype, np.integer):
-            limits = np.iinfo(values.dtype)
+        dtype = np.dtype(source_dtype) if source_dtype is not None else values.dtype
+        if np.issubdtype(dtype, np.integer):
+            limits = np.iinfo(dtype)
             low_value = float(limits.min)
             high_value = float(limits.max)
-        elif np.issubdtype(values.dtype, np.bool_):
+        elif np.issubdtype(dtype, np.bool_):
             low_value, high_value = 0.0, 1.0
         else:
             raise ImageConversionError(

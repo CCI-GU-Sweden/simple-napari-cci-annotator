@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 from skimage.measure import label, regionprops
+from skimage.segmentation import clear_border
 
 from ._segmentation_io import InstanceRecord, SegmentationError, refresh_instance_records
 
@@ -30,6 +31,23 @@ class ComposedInstances:
     instances: dict[int, InstanceRecord]
     cleanup: tuple[ComponentCleanup, ...]
     provenance: dict[str, Any] = field(default_factory=dict)
+
+
+def clear_border_prediction(
+    result: ComposedInstances, classes: Mapping[int, str]
+) -> ComposedInstances:
+    """Remove source-border instances and keep mask metadata in sync."""
+    before = {int(value) for value in np.unique(result.mask) if value}
+    mask = np.asarray(clear_border(result.mask), dtype=np.uint32)
+    after = {int(value) for value in np.unique(mask) if value}
+    instances = refresh_instance_records(
+        mask,
+        {key: value for key, value in result.instances.items() if key in after},
+        classes,
+    )
+    provenance = dict(result.provenance)
+    provenance["cleared_border_ids"] = sorted(before - after)
+    return ComposedInstances(mask, instances, result.cleanup, provenance)
 
 
 @dataclass(frozen=True)

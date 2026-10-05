@@ -5,7 +5,9 @@ from threading import Event
 import numpy as np
 from qtpy.QtCore import QThread, Signal
 
+from ._instance_mask import clear_border_prediction
 from ._segmentation_tiling import TiledSegmentationEngine
+from ._tiled_inference import InferenceCancelled
 
 
 class SegmentationWorker(QThread):
@@ -55,7 +57,12 @@ class SegmentationWorker(QThread):
                 result = self._predictor.predict_image(
                     self._image, self._settings, self._classes
                 )
+                if self._clear_border_instances:
+                    result = clear_border_prediction(result, self._classes)
                 self.progress.emit(1, 1, "Prediction complete")
+        except InferenceCancelled:
+            self.cancelled.emit()
+            return
         except Exception as exc:
             self.failed.emit(str(exc))
             return

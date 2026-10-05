@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from simple_napari_cci_annotator import (
     AnnotationIO,
@@ -233,6 +234,22 @@ def test_find_label_prefers_canonical_then_source(annotation_io, tmp_path):
     assert annotation_io.find_label("sample", source_path=source_image) == canonical.resolve()
 
 
+@pytest.mark.parametrize("suffix", [".jpg", ".jpeg", ".webp"])
+def test_lossy_source_saves_exact_training_pixels_as_png(annotation_io, tmp_path, suffix):
+    rgb = np.arange(12 * 16 * 3, dtype=np.uint8).reshape(12, 16, 3)
+    saved = annotation_io.save_pair(
+        image_data=rgb,
+        image_name="sample",
+        source_path=tmp_path / f"sample{suffix}",
+        rectangles=(),
+        class_ids=(),
+    )
+
+    assert saved.image_path.suffix == ".png"
+    with Image.open(saved.image_path) as image:
+        np.testing.assert_array_equal(np.asarray(image), rgb)
+
+
 def test_annotation_browser_lists_pairs_and_reports_out_of_bounds(annotation_io):
     result = annotation_io.save_pair(
         image_data=np.zeros((64, 64, 3), dtype=np.uint8),
@@ -346,6 +363,23 @@ def test_normalization_methods_return_uint8(method, lower, upper):
     assert stats["method"] == method
     assert int(converted.min()) >= 0
     assert int(converted.max()) <= 255
+
+
+@pytest.mark.parametrize("filter_method", ["none", "median"])
+def test_dtype_range_uses_source_dtype_after_filtering(filter_method):
+    source = np.full((9, 9), 1000, dtype=np.uint16)
+    layer = SimpleNamespace(data=source, name="field", metadata={"axes": "YX"}, rgb=False)
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0)))
+    settings = ImageProcessingSettings(
+        None, None, None, None, "dtype_range", filter_method=filter_method
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings)
+
+    assert converted.normalization_stats[0]["method"] == "dtype_range"
+    assert converted.normalization_stats[0]["lower"] == 0.0
+    assert converted.normalization_stats[0]["upper"] == 65535.0
+    assert np.all(converted.data == round(1000 / 65535 * 255))
 
 
 @pytest.mark.parametrize("method", ["gaussian", "median", "mean", "low_pass"])

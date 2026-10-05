@@ -15,7 +15,9 @@ from uuid import uuid4
 import numpy as np
 import tifffile
 
+from ._annotation_io import AnnotationIO
 from ._image_adapter import ImageAdapter, ImageProcessingSettings
+from ._instance_mask import clear_border_prediction
 from ._prediction_output import PredictionOutputWriter
 from ._project_store import ProjectStore
 from ._segmentation_io import _temporary_path, _write_json
@@ -390,16 +392,19 @@ class TiffBatchProcessor:
             )
         if cancelled is not None and cancelled():
             raise InferenceCancelled("Batch cancelled by the user.")
-        return self.model.predict_image(
+        result = self.model.predict_image(
             image, self.settings.inference, self.project.config.classes
         )
+        if self.settings.clear_border_instances:
+            result = clear_border_prediction(result, self.project.config.classes)
+        return result
 
 
 def _unique_stems(paths: tuple[Path, ...]) -> dict[Path, str]:
     used: set[str] = set()
     output: dict[Path, str] = {}
     for path in paths:
-        base = path.stem
+        base = AnnotationIO.safe_stem(path.stem)
         candidate = base
         index = 2
         while candidate.lower() in used:

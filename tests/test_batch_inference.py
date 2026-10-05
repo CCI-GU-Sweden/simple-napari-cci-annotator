@@ -157,3 +157,57 @@ def test_batch_cancellation_keeps_completed_output_and_marks_manifest(tmp_path):
     assert [entry["source"] for entry in metadata["files"]] == ["a.tif"]
     assert metadata["files"][0]["status"] == "completed"
     assert metadata["finished_at"]
+
+
+def test_batch_sanitized_stems_do_not_collide(tmp_path):
+    project, processing = _project(tmp_path)
+    project.lock_image_processing(processing.to_mapping())
+    source = tmp_path / "input"
+    source.mkdir()
+    for name in ("a b.tif", "a@b.tif"):
+        tifffile.imwrite(source / name, np.ones((64, 64), dtype=np.uint16))
+    model = _DetectionModel(tmp_path / "model.pt")
+
+    result = TiffBatchProcessor(project, model, _settings(source)).run()
+
+    assert (result.completed, result.failed, result.processed_planes) == (2, 0, 2)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    ids = [entry["planes"][0]["sample_id"] for entry in metadata["files"]]
+    assert len(set(ids)) == 2
+    assert all(entry["status"] == "completed" for entry in metadata["files"])
+
+
+def test_batch_direct_segmentation_clears_border_instances(tmp_path):
+    project, processing = _project(tmp_path, "segment")
+    project.lock_image_processing(processing.to_mapping())
+    source = tmp_path / "input"
+    source.mkdir()
+    tifffile.imwrite(source / "field.tif", np.ones((64, 64), dtype=np.uint16))
+
+    class BorderModel(_SegmentationModel):
+        def predict_image(self, image, settings, classes):
+            mask = np.zeros(image.shape[:2], dtype=np.uint32)
+            mask[:4, :4] = 1
+            mask[20:24, 20:24] = 2
+            instances = {
+                key: InstanceRecord(
+                    key, 0, "Cell", 0.8, "prediction", "predicted", (0, 0, 0, 0), 0
+                )
+                for key in (1, 2)
+            }
+            return ComposedInstances(mask, instances, (), {"mode": "direct"})
+
+    model = BorderModel(tmp_path / "model.pt")
+    settings = BatchInferenceSettings(
+        source, source / "Prediction", InferenceSettings(tile_size=64, overlap=8),
+        clear_border_instances=True,
+    )
+    result = TiffBatchProcessor(project, model, settings).run()
+
+    assert (result.completed, result.failed) == (1, 0)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    plane = metadata["files"][0]["planes"][0]
+    mask = tifffile.imread(result.run_root / plane["output"]["annotation"])
+    assert set(np.unique(mask)) == {0, 2}
+    details = json.loads((result.run_root / plane["output"]["metadata"]).read_text())
+    assert details["prediction"]["tiling"]["cleared_border_ids"] == [1]
