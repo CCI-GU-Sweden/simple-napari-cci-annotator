@@ -72,9 +72,13 @@ from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 
 
 def test_package_exports_and_version():
+    from importlib.metadata import version
+
     import simple_napari_cci_annotator
 
-    assert simple_napari_cci_annotator.__version__ == "0.10.0"
+    assert simple_napari_cci_annotator.__version__ == version(
+        "simple-napari-cci-annotator"
+    )
     assert ProjectStore is not None
     assert AnnotationIO is not None
     assert SimpleCciAnnotatorQWidget is not None
@@ -1160,7 +1164,9 @@ def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
     run_yaml = result.run_root / "run.yaml"
     text = run_yaml.read_text(encoding="utf-8")
     assert "status: completed" in text
-    assert "plugin_version: 0.10.0" in text
+    from simple_napari_cci_annotator import __version__
+
+    assert f"plugin_version: {__version__}" in text
     assert "sha256:" in text
     assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
     promoted = project.paths.models / f"{result.run_root.name}.pt"
