@@ -23,15 +23,18 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "dask[array]",
     "numpy",
-    "qtpy",
-    
+    "pyyaml",
     "ultralytics",
     "pillow",
+    "scikit-image",
+    "scipy",
+    "tifffile",
 ]
 
 [project.optional-dependencies]
-all = ["napari[all]"]
+all = ["napari[all]", "qtpy"]
 
 testing = [
     "tox",
@@ -56,10 +59,14 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml"]
+"simple_napari_cci_annotator" = [
+    "*.yaml",
+    "models/yolo26n.pt",
+    "models/yolo26n-seg.pt",
+]
 
 [tool.setuptools.dynamic]
-version = {attr = "simple_napari_cci_annotator.__init__.__version__"}
+version = {attr = "simple_napari_cci_annotator._version.__version__"}
 
 [tool.black]
 line-length = 79

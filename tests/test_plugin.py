@@ -1,340 +1,1945 @@
-"""Tests for simple-napari-cci-annotator.
+"""Tests for project annotation, tiled inference, and retraining workflows."""
 
-Covers:
-- Package/widget imports
-- Pure-Python yolo_utils helpers (no GPU / YOLO model required)
-- Widget instantiation (CCIYoloWrapper mocked)
-- Default model bootstrap (bundled yolov8n.pt copied into empty folder)
-- Training config write / read round-trip
-"""
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 from PIL import Image
 
-# ---------------------------------------------------------------------------
-# 1. Import smoke tests
-# ---------------------------------------------------------------------------
+from simple_napari_cci_annotator import (
+    AnnotationIO,
+    DatasetBuildSettings,
+    DatasetBuilder,
+    Detection,
+    ImageAdapter,
+    ImageProcessingSettings,
+    InferenceSettings,
+    ProjectStore,
+    SimpleCciAnnotatorQWidget,
+    TiledInferenceEngine,
+    TrainingService,
+    TrainingSettings,
+    create_tile_plan,
+)
+from simple_napari_cci_annotator import _project_store as project_store_module
+from simple_napari_cci_annotator import _training as training_module
+from simple_napari_cci_annotator import _widget as widget_module
+from simple_napari_cci_annotator._annotation_io import (
+    AnnotationError,
+    LabelValidationError,
+)
+from simple_napari_cci_annotator._annotation_browser import (
+    AnnotationBrowser,
+    invalid_rectangle_indices,
+)
+from simple_napari_cci_annotator._image_adapter import (
+    ImageConversionError,
+    apply_image_filter,
+    normalize_to_uint8,
+)
+from simple_napari_cci_annotator._instance_mask import ComposedInstances
+from simple_napari_cci_annotator._project_store import (
+    ClassMapError,
+    ImageProcessingLockedError,
+    InvalidProjectError,
+    ProjectConflictError,
+    TrainingPatchLockedError,
+)
+from simple_napari_cci_annotator._training_crop import (
+    TrainingCropError,
+    crop_bounds_from_center,
+    crop_bounds_from_rectangle,
+    crop_rectangles,
+    crop_sample_id,
+    extract_padded_crop,
+    invalid_crop_box_indices,
+    validate_boxes_within_valid_crop,
+)
+from simple_napari_cci_annotator._tiled_inference import (
+    InferenceCancelled,
+    RawDetection,
+    box_iou,
+    class_aware_nms,
+    extract_padded_tile,
+)
+from simple_napari_cci_annotator._training import TrainingCancelled
+from simple_napari_cci_annotator._yolo_inference import YoloDetectionModel
 
 
-def test_package_importable():
-    import simple_napari_cci_annotator  # noqa: F401
-
-
-def test_version_string():
+def test_package_exports_and_version():
     import simple_napari_cci_annotator
 
-    assert isinstance(simple_napari_cci_annotator.__version__, str)
-    assert simple_napari_cci_annotator.__version__
+    assert simple_napari_cci_annotator.__version__ == "0.10.0"
+    assert ProjectStore is not None
+    assert AnnotationIO is not None
+    assert SimpleCciAnnotatorQWidget is not None
 
 
-def test_widget_class_importable():
-    from simple_napari_cci_annotator import SimpleCciAnnotatorQWidget  # noqa: F401
+def test_initialize_and_reopen_project(tmp_path):
+    root = tmp_path / "annotation-project"
+    root.mkdir()
+
+    project = ProjectStore.initialize(root)
+
+    assert project.paths.config.is_file()
+    assert project.paths.models.is_dir()
+    assert (project.paths.models / "yolo26n.pt").is_file()
+    assert not (project.paths.models / "yolo26n-seg.pt").exists()
+    assert project.paths.images.is_dir()
+    assert project.paths.labels.is_dir()
+    assert project.paths.audit.is_file()
+    assert project.config.classes == {0: "LABEL"}
+    assert project.config.image_processing == {
+        "channels": "unset",
+        "filter": "unset",
+        "normalization": "unset",
+        "locked": False,
+    }
+    assert project.config.training_patch == {
+        "size": 1024,
+        "padding_value": 114,
+        "locked": False,
+    }
+
+    reopened = ProjectStore.load(root)
+    assert reopened.config == project.config
+    assert "schema_version: 1" in project.paths.config.read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# 2. _yolo_utils: _points_to_yolo_xywh
-# ---------------------------------------------------------------------------
+def test_initialize_requires_empty_folder(tmp_path):
+    root = tmp_path / "not-empty"
+    root.mkdir()
+    (root / "unrelated.txt").write_text("keep me", encoding="utf-8")
+
+    with pytest.raises(ProjectConflictError, match="empty folder"):
+        ProjectStore.initialize(root)
+
+    assert (root / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
 
 
-def test_points_to_yolo_xywh_empty():
-    from simple_napari_cci_annotator._yolo_utils import _points_to_yolo_xywh
+def test_initialize_rolls_back_starter_model_if_config_write_fails(tmp_path):
+    root = tmp_path / "rolled-back-project"
+    with patch.object(
+        project_store_module,
+        "_atomic_write_yaml",
+        side_effect=OSError("simulated config failure"),
+    ):
+        with pytest.raises(OSError, match="simulated config failure"):
+            ProjectStore.initialize(root)
 
-    assert _points_to_yolo_xywh([]) is None
-
-
-def test_points_to_yolo_xywh_degenerate_zero_width():
-    from simple_napari_cci_annotator._yolo_utils import _points_to_yolo_xywh
-
-    # All x values equal → width == 0
-    assert _points_to_yolo_xywh([(0.5, 0.2), (0.5, 0.8)]) is None
-
-
-def test_points_to_yolo_xywh_degenerate_zero_height():
-    from simple_napari_cci_annotator._yolo_utils import _points_to_yolo_xywh
-
-    # All y values equal → height == 0
-    assert _points_to_yolo_xywh([(0.2, 0.5), (0.8, 0.5)]) is None
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
 
 
-def test_points_to_yolo_xywh_normal():
-    from simple_napari_cci_annotator._yolo_utils import _points_to_yolo_xywh
+def test_project_class_map_can_grow_and_rename_but_not_orphan_labels(tmp_path):
+    root = tmp_path / "multi-class-project"
+    root.mkdir()
+    project = ProjectStore.initialize(root, classes={0: "Cell", 1: "Debris"})
 
-    # Rectangle from (0.0, 0.0) to (1.0, 1.0) → center 0.5,0.5, wh 1.0,1.0
-    pts = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-    result = _points_to_yolo_xywh(pts)
-    assert result is not None
-    cx, cy, w, h = result
-    assert cx == pytest.approx(0.5)
-    assert cy == pytest.approx(0.5)
-    assert w == pytest.approx(1.0)
-    assert h == pytest.approx(1.0)
+    project.update_classes({0: "Target cell", 1: "Artifact", 2: "Cluster"})
+    assert ProjectStore.load(root).config.classes == {
+        0: "Target cell",
+        1: "Artifact",
+        2: "Cluster",
+    }
 
-
-def test_points_to_yolo_xywh_clamped():
-    from simple_napari_cci_annotator._yolo_utils import _points_to_yolo_xywh
-
-    # Points outside [0,1] should be clamped
-    pts = [(-0.5, -0.5), (1.5, 1.5)]
-    result = _points_to_yolo_xywh(pts)
-    assert result is not None
-    cx, cy, w, h = result
-    assert 0.0 <= cx <= 1.0
-    assert 0.0 <= cy <= 1.0
-    assert 0.0 <= w <= 1.0
-    assert 0.0 <= h <= 1.0
+    (project.paths.labels / "sample.txt").write_text(
+        "2 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+    )
+    with pytest.raises(ClassMapError, match="used by saved annotations"):
+        project.update_classes({0: "Target cell", 1: "Artifact"})
+    with pytest.raises(InvalidProjectError, match="contiguous"):
+        project.update_classes({0: "Target cell", 2: "Cluster"})
 
 
-# ---------------------------------------------------------------------------
-# 3. _yolo_utils: save_vectors_to_txt
-# ---------------------------------------------------------------------------
+def test_existing_project_must_have_required_folders(tmp_path):
+    root = tmp_path / "broken"
+    root.mkdir()
+    (root / "project.yaml").write_text(
+        "schema_version: 1\n"
+        "name: broken\n"
+        "created_at: '2026-09-03T00:00:00+00:00'\n"
+        "classes:\n  0: LABEL\n"
+        "image_processing:\n"
+        "  channels: unset\n"
+        "  normalization: unset\n"
+        "  locked: false\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidProjectError, match="missing folder"):
+        ProjectStore.load(root)
 
 
-def test_save_vectors_to_txt(tmp_path):
-    from simple_napari_cci_annotator._yolo_utils import save_vectors_to_txt
+@pytest.fixture
+def annotation_io(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    return AnnotationIO(ProjectStore.initialize(root))
 
-    vectors = [
-        (0, [(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.1, 0.5)]),
-        (1, [(0.6, 0.6), (0.9, 0.6), (0.9, 0.9), (0.6, 0.9)]),
+
+def test_empty_yolo_label_is_valid(annotation_io):
+    assert annotation_io.parse_yolo_text("\n") == ()
+
+
+def test_yolo_load_keeps_class_properties_and_coordinates(annotation_io, tmp_path):
+    label = tmp_path / "sample.txt"
+    label.write_text("0 0.500000 0.250000 0.400000 0.200000\n", encoding="utf-8")
+
+    loaded = annotation_io.load_label(label, (100, 200, 3))
+
+    assert len(loaded.rectangles) == 1
+    np.testing.assert_allclose(
+        loaded.rectangles[0],
+        np.asarray([[15, 60], [15, 140], [35, 140], [35, 60]]),
+    )
+    assert loaded.properties["class_id"].tolist() == [0]
+    assert loaded.properties["class_name"].tolist() == ["LABEL"]
+    assert loaded.properties["source"].tolist() == ["import"]
+    assert np.isnan(loaded.properties["confidence"][0])
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("0 0.5 0.5 0.2\n", "expected 5 fields"),
+        ("class 0.5 0.5 0.2 0.2\n", "class ID must be an integer"),
+        ("1 0.5 0.5 0.2 0.2\n", "not defined"),
+        ("0 1.2 0.5 0.2 0.2\n", r"within \[0, 1\]"),
+        ("0 0.5 0.5 0 0.2\n", "greater than zero"),
+        ("0 0.95 0.5 0.2 0.2\n", "extends outside"),
+    ],
+)
+def test_yolo_validation_reports_bad_lines(annotation_io, text, expected):
+    with pytest.raises(LabelValidationError, match=expected):
+        annotation_io.parse_yolo_text(text, source="bad.txt")
+
+
+def test_find_label_prefers_canonical_then_source(annotation_io, tmp_path):
+    source_image = tmp_path / "images" / "sample.png"
+    source_image.parent.mkdir()
+    source_image.touch()
+    source_label = source_image.with_suffix(".txt")
+    source_label.write_text("", encoding="utf-8")
+
+    assert annotation_io.find_label("sample", source_path=source_image) == source_label.resolve()
+
+    canonical = annotation_io.project.paths.labels / "sample.txt"
+    canonical.write_text("", encoding="utf-8")
+    assert annotation_io.find_label("sample", source_path=source_image) == canonical.resolve()
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".jpeg", ".webp"])
+def test_lossy_source_saves_exact_training_pixels_as_png(annotation_io, tmp_path, suffix):
+    rgb = np.arange(12 * 16 * 3, dtype=np.uint8).reshape(12, 16, 3)
+    saved = annotation_io.save_pair(
+        image_data=rgb,
+        image_name="sample",
+        source_path=tmp_path / f"sample{suffix}",
+        rectangles=(),
+        class_ids=(),
+    )
+
+    assert saved.image_path.suffix == ".png"
+    with Image.open(saved.image_path) as image:
+        np.testing.assert_array_equal(np.asarray(image), rgb)
+
+
+def test_annotation_browser_lists_pairs_and_reports_out_of_bounds(annotation_io):
+    result = annotation_io.save_pair(
+        image_data=np.zeros((64, 64, 3), dtype=np.uint8),
+        image_name="sample.png",
+        rectangles=(np.asarray([[10, 10], [10, 30], [30, 30], [30, 10]]),),
+        class_ids=(0,),
+    )
+    browser = AnnotationBrowser(annotation_io.project)
+
+    valid = browser.entries()
+
+    assert len(valid) == 1
+    assert valid[0].sample_id == "sample"
+    assert valid[0].box_count == 1
+    assert valid[0].is_valid
+
+    result.label_path.write_text("0 0.95 0.5 0.2 0.2\n", encoding="utf-8")
+    invalid = browser.entries()[0]
+    assert not invalid.is_valid
+    assert any("outside" in error for error in invalid.errors)
+
+
+def test_live_rectangle_validation_reports_zero_based_indices():
+    valid = np.asarray([[0, 0], [0, 10], [10, 10], [10, 0]], dtype=float)
+    outside = np.asarray(
+        [[20, 20], [20, 70], [40, 70], [40, 20]], dtype=float
+    )
+
+    assert invalid_rectangle_indices(
+        (valid, outside), height=64, width=64
+    ) == (1,)
+
+
+def test_save_empty_label_overwrites_and_audits(annotation_io):
+    image = np.zeros((32, 48, 3), dtype=np.uint8)
+
+    first = annotation_io.save_pair(
+        image_data=image,
+        image_name="sample.png",
+        rectangles=(),
+        class_ids=(),
+    )
+    assert first.operation == "created"
+    assert first.image_path.name == "sample.png"
+    assert first.label_path.name == "sample.txt"
+    assert first.label_path.read_text(encoding="utf-8") == ""
+
+    rectangle = np.asarray([[4, 8], [4, 24], [20, 24], [20, 8]], dtype=float)
+    second = annotation_io.save_pair(
+        image_data=image,
+        image_name="sample.png",
+        rectangles=(rectangle,),
+        class_ids=(0,),
+    )
+    assert second.operation == "updated"
+    assert len(list(annotation_io.project.paths.images.iterdir())) == 1
+    assert len(list(annotation_io.project.paths.labels.iterdir())) == 1
+    assert second.label_path.read_text(encoding="utf-8").startswith("0 ")
+
+    events = [
+        json.loads(line)
+        for line in annotation_io.project.paths.audit.read_text(encoding="utf-8").splitlines()
     ]
-    out = tmp_path / "labels.txt"
-    save_vectors_to_txt(vectors, out)
-
-    lines = out.read_text().splitlines()
-    assert len(lines) == 2
-    parts0 = lines[0].split()
-    assert parts0[0] == "0"
-    assert len(parts0) == 5  # class cx cy w h
+    assert [event["operation"] for event in events] == ["created", "updated"]
+    assert events[0]["box_count"] == 0
+    assert events[1]["class_counts"] == {"0": 1}
 
 
-def test_save_vectors_to_txt_skips_degenerate(tmp_path):
-    from simple_napari_cci_annotator._yolo_utils import save_vectors_to_txt
+def test_load_edit_save_close_and_reload_without_drift_or_duplicates(annotation_io):
+    original_label = annotation_io.project.paths.labels / "field.txt"
+    original_label.write_text(
+        "0 0.500000 0.400000 0.250000 0.300000\n", encoding="utf-8"
+    )
+    loaded = annotation_io.load_label(original_label, (80, 120))
+    edited = loaded.rectangles[0] + np.asarray([2.0, 3.0])
 
-    # Single point → degenerate, should produce no output line
-    vectors = [(0, [(0.5, 0.5)])]
-    out = tmp_path / "labels.txt"
-    save_vectors_to_txt(vectors, out)
-    assert out.read_text().strip() == ""
+    saved = annotation_io.save_pair(
+        image_data=np.zeros((80, 120, 3), dtype=np.uint8),
+        image_name="field",
+        sample_id="field",
+        rectangles=(edited,),
+        class_ids=loaded.properties["class_id"],
+    )
+    reopened_io = AnnotationIO(ProjectStore.load(annotation_io.project.paths.root))
+    reloaded = reopened_io.load_label(saved.label_path, (80, 120))
+
+    np.testing.assert_allclose(reloaded.rectangles[0], edited, atol=1e-4)
+    assert len(list(reopened_io.project.paths.images.iterdir())) == 1
+    assert len(list(reopened_io.project.paths.labels.iterdir())) == 1
 
 
-# ---------------------------------------------------------------------------
-# 4. _yolo_utils: create_training_set
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "method, lower, upper",
+    [
+        ("min_max", None, None),
+        ("simple_max", None, None),
+        ("percentile", 1.0, 99.0),
+        ("z_score", -2.0, 2.0),
+        ("fixed_range", 0.0, 100.0),
+        ("dtype_range", None, None),
+    ],
+)
+def test_normalization_methods_return_uint8(method, lower, upper):
+    data = np.arange(100, dtype=np.uint16).reshape(10, 10)
+    converted, stats = normalize_to_uint8(
+        data, method=method, lower=lower, upper=upper
+    )
+
+    assert converted.shape == data.shape
+    assert converted.dtype == np.uint8
+    assert stats["method"] == method
+    assert int(converted.min()) >= 0
+    assert int(converted.max()) <= 255
 
 
-def test_create_training_set_structure(tmp_path):
-    from simple_napari_cci_annotator._yolo_utils import create_training_set
+@pytest.mark.parametrize("filter_method", ["none", "median"])
+def test_dtype_range_uses_source_dtype_after_filtering(filter_method):
+    source = np.full((9, 9), 1000, dtype=np.uint16)
+    layer = SimpleNamespace(data=source, name="field", metadata={"axes": "YX"}, rgb=False)
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0)))
+    settings = ImageProcessingSettings(
+        None, None, None, None, "dtype_range", filter_method=filter_method
+    )
 
-    src_images = tmp_path / "images"
-    src_labels = tmp_path / "labels"
-    src_images.mkdir()
-    src_labels.mkdir()
-    dst = tmp_path / "dataset"
+    converted = ImageAdapter().convert(layer, viewer, settings)
 
-    # Create 4 dummy images + matching label files
-    for i in range(4):
-        img = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
-        img.save(src_images / f"img{i:02d}.png")
-        (src_labels / f"img{i:02d}.txt").write_text(
-            f"0 0.5 0.5 0.2 0.2\n"
+    assert converted.normalization_stats[0]["method"] == "dtype_range"
+    assert converted.normalization_stats[0]["lower"] == 0.0
+    assert converted.normalization_stats[0]["upper"] == 65535.0
+    assert np.all(converted.data == round(1000 / 65535 * 255))
+
+
+@pytest.mark.parametrize("method", ["gaussian", "median", "mean", "low_pass"])
+def test_smoothing_filters_preserve_a_constant_plane(method):
+    data = np.full((9, 9), 17, dtype=np.uint16)
+    filtered = apply_image_filter(data, method=method, radius=2)
+
+    np.testing.assert_allclose(filtered, 17)
+
+
+def test_white_tophat_removes_constant_background():
+    data = np.full((9, 9), 17, dtype=np.uint16)
+    filtered = apply_image_filter(data, method="white_tophat", radius=2)
+
+    np.testing.assert_allclose(filtered, 0)
+
+
+def test_frequency_low_pass_suppresses_high_frequency_noise():
+    checkerboard = (np.indices((64, 64)).sum(axis=0) % 2).astype(float)
+
+    filtered = apply_image_filter(checkerboard, method="low_pass", radius=4)
+
+    assert filtered.shape == checkerboard.shape
+    assert np.std(filtered) < np.std(checkerboard) * 0.1
+    assert float(filtered.mean()) == pytest.approx(0.5, abs=0.01)
+
+
+def test_filter_is_applied_per_channel_before_normalization():
+    data = np.zeros((2, 7, 7), dtype=np.uint16)
+    data[0, 3, 3] = 255
+    data[1] = 100
+    layer = SimpleNamespace(
+        data=data,
+        name="filtered",
+        metadata={"axes": "CYX"},
+        axis_labels=(),
+        rgb=False,
+    )
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0, 0)))
+    settings = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=None,
+        filter_method="mean",
+        filter_radius=1,
+        normalization="fixed_range",
+        lower=0,
+        upper=255,
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings)
+
+    assert converted.data[3, 3, 0] == 51
+    assert converted.data[3, 2, 0] == 51
+    assert converted.data[2, 2, 0] == 0
+    assert np.all(converted.data[..., 1] == 100)
+    assert np.all(converted.data[..., 2] == 0)
+    assert converted.normalization_stats[0]["filter_method"] == "mean"
+    assert converted.normalization_stats[0]["filter_radius"] == 1
+
+
+def test_inversion_happens_after_normalization_and_preserves_empty_channels():
+    data = np.asarray([[[0, 10], [5, 10]]], dtype=np.uint16)
+    layer = SimpleNamespace(
+        data=data,
+        name="inverted",
+        metadata={"axes": "CYX"},
+        axis_labels=(),
+        rgb=False,
+    )
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(0, 0, 0)))
+    settings = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=None,
+        blue_channel=None,
+        normalization="fixed_range",
+        lower=0,
+        upper=10,
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings, invert=True)
+
+    np.testing.assert_array_equal(
+        converted.data[..., 0], np.asarray([[255, 0], [127, 0]], dtype=np.uint8)
+    )
+    assert np.all(converted.data[..., 1:] == 0)
+    assert converted.inverted
+    assert "inverted" not in settings.to_mapping()
+
+
+def test_multidimensional_current_tz_plane_and_channel_mapping():
+    data = np.zeros((2, 3, 4, 5, 6), dtype=np.uint16)
+    base = np.arange(30, dtype=np.uint16).reshape(5, 6)
+    data[1, 2, 0] = base
+    data[1, 2, 1] = base * 2
+    data[1, 2, 3] = base * 3
+    layer = SimpleNamespace(
+        data=data,
+        name="field",
+        metadata={"axes": "TZCYX"},
+        axis_labels=(),
+        rgb=False,
+    )
+    viewer = SimpleNamespace(dims=SimpleNamespace(current_step=(1, 2, 0, 0, 0)))
+    settings = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=1,
+        green_channel=0,
+        blue_channel=3,
+        normalization="min_max",
+    )
+
+    converted = ImageAdapter().convert(layer, viewer, settings)
+
+    assert converted.sample_id == "field__t001__z002"
+    assert converted.data.shape == (5, 6, 3)
+    assert converted.data.dtype == np.uint8
+    assert converted.plane.non_spatial_indices == {0: 1, 1: 2}
+    np.testing.assert_array_equal(converted.data[..., 0], converted.data[..., 1])
+    np.testing.assert_array_equal(converted.data[..., 1], converted.data[..., 2])
+
+
+def test_multiplane_sample_id_is_preserved_in_pair_names(annotation_io):
+    sample_id = "field.ome__t001__z002"
+    result = annotation_io.save_pair(
+        image_data=np.zeros((12, 16, 3), dtype=np.uint8),
+        image_name=sample_id,
+        sample_id=sample_id,
+        rectangles=(),
+        class_ids=(),
+    )
+
+    assert result.image_path.stem == sample_id
+    assert result.label_path.stem == sample_id
+
+
+def test_project_image_processing_settings_lock(tmp_path):
+    root = tmp_path / "locked-project"
+    project = ProjectStore.initialize(root)
+    settings = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="percentile",
+        lower=1.0,
+        upper=99.0,
+    )
+    project.lock_image_processing(settings.to_mapping())
+
+    reopened = ProjectStore.load(root)
+    assert reopened.config.image_processing == settings.to_mapping()
+    reopened.lock_image_processing(settings.to_mapping())
+
+    changed = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=1,
+        green_channel=0,
+        blue_channel=2,
+        normalization="percentile",
+        lower=1.0,
+        upper=99.0,
+    )
+    with pytest.raises(ImageProcessingLockedError):
+        reopened.lock_image_processing(changed.to_mapping())
+
+
+def test_locked_settings_before_filters_equal_explicit_no_filter(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "legacy-filter-project")
+    settings = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    )
+    legacy_mapping = settings.to_mapping()
+    legacy_mapping.pop("filter")
+    project.lock_image_processing(legacy_mapping)
+
+    reopened = ProjectStore.load(project.paths.root)
+    reopened.lock_image_processing(settings.to_mapping())
+
+    filtered = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+        filter_method="median",
+        filter_radius=1,
+    )
+    with pytest.raises(ImageProcessingLockedError):
+        reopened.lock_image_processing(filtered.to_mapping())
+
+
+def test_project_training_patch_contract_locks(tmp_path):
+    root = tmp_path / "patch-project"
+    project = ProjectStore.initialize(root)
+
+    project.lock_training_patch(512, padding_value=114)
+    reopened = ProjectStore.load(root)
+
+    assert reopened.config.training_patch == {
+        "size": 512,
+        "padding_value": 114,
+        "locked": True,
+    }
+    reopened.lock_training_patch(512, padding_value=114)
+    with pytest.raises(TrainingPatchLockedError):
+        reopened.lock_training_patch(1024, padding_value=114)
+
+    annotation_io = AnnotationIO(reopened)
+    with pytest.raises(AnnotationError, match="must be 512×512"):
+        annotation_io.save_pair(
+            image_data=np.zeros((256, 512, 3), dtype=np.uint8),
+            image_name="wrong-size",
+            rectangles=(),
+            class_ids=(),
         )
 
-    create_training_set(
-        path_to_images=src_images,
-        path_to_vectors=src_labels,
-        destination_path=dst,
-        label_names=[(0, "LABEL")],
+
+def test_training_crop_is_fixed_size_padded_and_coordinate_stable():
+    image = np.zeros((300, 900, 3), dtype=np.uint8)
+    image[:, :, 0] = 7
+    bounds = crop_bounds_from_center(150, 700, 512, 300, 900)
+
+    assert (bounds.y0, bounds.x0) == (0, 388)
+    assert (bounds.valid_height, bounds.valid_width) == (300, 512)
+    crop = extract_padded_crop(image, bounds, padding_value=114)
+    assert crop.shape == (512, 512, 3)
+    assert np.all(crop[:300, :, 0] == 7)
+    assert np.all(crop[300:, :, :] == 114)
+
+    rectangle = np.asarray(
+        [[100, 500], [100, 600], [200, 600], [200, 500]], dtype=float
+    )
+    result = crop_rectangles(
+        (rectangle,),
+        {"class_id": np.asarray([1]), "source": np.asarray(["prediction"])},
+        bounds,
+    )
+    np.testing.assert_allclose(
+        result.rectangles[0],
+        np.asarray([[100, 112], [100, 212], [200, 212], [200, 112]]),
+    )
+    assert result.properties["class_id"].tolist() == [1]
+    assert crop_sample_id("field__z002", bounds).endswith(
+        "__crop_y000000_x000388_s512"
     )
 
-    # Expected sub-directories
-    assert (dst / "images" / "train").exists()
-    assert (dst / "images" / "val").exists()
-    assert (dst / "labels" / "train").exists()
-    assert (dst / "labels" / "val").exists()
 
-    # dataset.yaml should exist and reference the right keys
-    yaml_text = (dst / "dataset.yaml").read_text()
-    assert "train:" in yaml_text
-    assert "val:" in yaml_text
-    assert "LABEL" in yaml_text
-
-    # All images should have been distributed
-    train_imgs = list((dst / "images" / "train").iterdir())
-    val_imgs = list((dst / "images" / "val").iterdir())
-    assert len(train_imgs) + len(val_imgs) == 4
-
-
-# ---------------------------------------------------------------------------
-# 5. Widget: training config round-trip
-# ---------------------------------------------------------------------------
-
-
-def _make_widget(qtbot):
-    """Return a SimpleCciAnnotatorQWidget with a mocked napari viewer."""
-    from simple_napari_cci_annotator._widget import SimpleCciAnnotatorQWidget
-
-    viewer = MagicMock()
-    viewer.layers = MagicMock()
-    viewer.layers.__iter__ = MagicMock(return_value=iter([]))
-    w = SimpleCciAnnotatorQWidget(viewer)
-    qtbot.addWidget(w)
-    return w
-
-
-def test_create_training_config_defaults(tmp_path, qtbot):
-    w = _make_widget(qtbot)
-    w._create_training_config(tmp_path)
-
-    cfg_file = tmp_path / "training_config.json"
-    assert cfg_file.exists()
-    cfg = json.loads(cfg_file.read_text())
-    assert cfg["epochs"] == 100
-    assert cfg["batch"] == 8
-    assert cfg["patience"] == 30
-    assert cfg["image_size"] == 640
-
-
-def test_create_training_config_custom_image_size(tmp_path, qtbot):
-    w = _make_widget(qtbot)
-    w._create_training_config(tmp_path, image_size=1024)
-
-    cfg = json.loads((tmp_path / "training_config.json").read_text())
-    assert cfg["image_size"] == 1024
-
-
-def test_load_training_config_reads_file(tmp_path, qtbot):
-    w = _make_widget(qtbot)
-
-    custom = {"image_size": 512, "batch": 4, "epochs": 50, "patience": 10}
-    (tmp_path / "training_config.json").write_text(json.dumps(custom))
-
-    loaded = w._load_training_config(tmp_path)
-    assert loaded == custom
-
-
-def test_load_training_config_falls_back_to_defaults(tmp_path, qtbot):
-    w = _make_widget(qtbot)
-
-    loaded = w._load_training_config(tmp_path)
-    assert loaded["image_size"] == 640
-    assert loaded["epochs"] == 100
-
-
-# ---------------------------------------------------------------------------
-# 6. Widget: instantiation (requires Qt; pytest-qt provides qtbot)
-# ---------------------------------------------------------------------------
-
-
-def test_widget_instantiation(qtbot):
-    from simple_napari_cci_annotator._widget import SimpleCciAnnotatorQWidget
-
-    viewer = MagicMock()
-    viewer.layers = MagicMock()
-    viewer.layers.__iter__ = MagicMock(return_value=iter([]))
-
-    with patch("simple_napari_cci_annotator._widget.CCIYoloWrapper"):
-        w = SimpleCciAnnotatorQWidget(viewer)
-        qtbot.addWidget(w)
-
-    assert w is not None
-    assert w._yolo is None
-    assert w._model_path is None
-
-
-# ---------------------------------------------------------------------------
-# 7. Widget: default model bootstrap
-# ---------------------------------------------------------------------------
-
-
-def test_load_model_empty_folder_copies_bundled(tmp_path, qtbot):
-    """Loading from an empty folder copies the bundled yolov8n.pt there."""
-    from simple_napari_cci_annotator._widget import SimpleCciAnnotatorQWidget
-
-    # Patch CCIYoloWrapper so no real YOLO model is loaded
-    mock_wrapper = MagicMock()
-    bundled_pt = (
-        Path(__file__).parent.parent
-        / "src"
-        / "simple_napari_cci_annotator"
-        / "models"
-        / "yolov8n.pt"
+def test_training_crop_resnaps_clips_partial_boxes_and_blocks_padding():
+    bounds = crop_bounds_from_rectangle(
+        np.asarray([[10, 10], [10, 300], [200, 300], [200, 10]]),
+        512,
+        300,
+        900,
     )
-    if not bundled_pt.exists():
-        pytest.skip("Bundled yolov8n.pt not present in repo")
+    assert bounds.as_rectangle()[2].tolist() == [512.0, 512.0]
+    crossing = np.asarray(
+        [[100, 490], [100, 540], [160, 540], [160, 490]], dtype=float
+    )
+    result = crop_rectangles(
+        (crossing,), {"class_id": np.asarray([0])}, bounds
+    )
+    assert result.discarded_indices == ()
+    assert result.clipped_count == 1
+    np.testing.assert_allclose(
+        result.rectangles[0],
+        np.asarray([[100, 490], [100, 512], [160, 512], [160, 490]]),
+    )
 
-    viewer = MagicMock()
-    viewer.layers = MagicMock()
-    viewer.layers.__iter__ = MagicMock(return_value=iter([]))
+    tiny_remnant = np.asarray(
+        [[100, 511], [100, 540], [160, 540], [160, 511]], dtype=float
+    )
+    discarded = crop_rectangles(
+        (tiny_remnant,), {"class_id": np.asarray([0])}, bounds
+    )
+    assert discarded.discarded_indices == (0,)
+    assert discarded.rectangles == ()
 
-    with patch(
-        "simple_napari_cci_annotator._widget.CCIYoloWrapper",
-        return_value=mock_wrapper,
+    in_padding = np.asarray(
+        [[280, 10], [280, 20], [320, 20], [320, 10]], dtype=float
+    )
+    assert invalid_crop_box_indices((in_padding,), bounds) == (0,)
+    with pytest.raises(TrainingCropError, match="padded pixels"):
+        validate_boxes_within_valid_crop((in_padding,), bounds)
+
+
+def test_project_and_dataset_validation_reject_bbox_in_crop_padding(tmp_path):
+    root = tmp_path / "padding-project"
+    project = ProjectStore.initialize(root)
+    annotation_io = AnnotationIO(project)
+    saved = annotation_io.save_pair(
+        image_data=np.full((512, 512, 3), 114, dtype=np.uint8),
+        image_name="crop",
+        sample_id="crop",
+        rectangles=(),
+        class_ids=(),
+        conversion_metadata={
+            "training_crop": {
+                "size": 512,
+                "valid_height": 300,
+                "valid_width": 512,
+            }
+        },
+    )
+    project.lock_training_patch(512)
+    saved.label_path.write_text("0 0.5 0.8 0.1 0.1\n", encoding="utf-8")
+
+    report = annotation_io.validate_project()
+    preview = DatasetBuilder(project).preview(
+        DatasetBuildSettings(tile_size=512, overlap=100),
+        train_only=True,
+        persist=False,
+    )
+
+    assert any("padding" in error for error in report.errors)
+    assert any("padding" in error for error in preview.errors)
+
+
+def test_invalid_percentile_settings_are_rejected():
+    settings = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=None,
+        blue_channel=None,
+        normalization="percentile",
+        lower=99.0,
+        upper=1.0,
+    )
+    with pytest.raises(ImageConversionError):
+        settings.validate((4, 32, 32))
+
+
+def test_project_validation_finds_pairs_and_missing_labels(annotation_io):
+    image = np.zeros((16, 16), dtype=np.uint8)
+    annotation_io.save_pair(
+        image_data=image,
+        image_name="paired",
+        rectangles=(),
+        class_ids=(),
+    )
+    (annotation_io.project.paths.images / "orphan.png").write_bytes(b"not decoded here")
+
+    report = annotation_io.validate_project()
+
+    assert report.image_count == 2
+    assert report.label_count == 1
+    assert report.paired_count == 1
+    assert not report.is_valid
+    assert any("Missing label" in error for error in report.errors)
+
+
+def test_tile_plan_covers_edges_and_assigns_unique_ownership():
+    plan = create_tile_plan(1800, 2500, tile_size=1024, overlap=200)
+
+    assert plan.tiles[0].y0 == 0
+    assert plan.tiles[0].x0 == 0
+    assert max(tile.y1 for tile in plan.tiles) == 1800
+    assert max(tile.x1 for tile in plan.tiles) == 2500
+    assert len({(tile.row, tile.column) for tile in plan.tiles}) == len(plan.tiles)
+    for y, x in ((0, 0), (900, 1000), (1799, 2499)):
+        owners = [tile for tile in plan.tiles if tile.owns(x, y)]
+        assert len(owners) == 1
+
+
+def test_small_image_tile_is_reflect_padded_without_changing_source():
+    image = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
+    plan = create_tile_plan(5, 7, tile_size=16, overlap=4)
+
+    padded = extract_padded_tile(image, plan.tiles[0], 16)
+
+    assert padded.shape == (16, 16, 3)
+    np.testing.assert_array_equal(padded[:5, :7], image)
+
+
+def test_detection_centered_in_padding_is_discarded():
+    class PaddingPredictor:
+        def predict_tile(self, image, settings):
+            return (
+                RawDetection(1, 1, 5, 5, 0.8, 0),
+                RawDetection(10, 10, 15, 15, 0.9, 0),
+            )
+
+    result = TiledInferenceEngine(PaddingPredictor()).predict(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=0),
+    )
+
+    assert len(result) == 1
+    np.testing.assert_allclose(
+        [result[0].x1, result[0].y1, result[0].x2, result[0].y2],
+        [1, 1, 5, 5],
+    )
+
+
+def _detection(x1, y1, x2, y2, score, class_id=0, tile_id=0, owned=True):
+    return Detection(x1, y1, x2, y2, score, class_id, tile_id, owned)
+
+
+def test_merge_is_class_aware_and_prefers_owner_before_confidence():
+    owner = _detection(10, 10, 30, 30, 0.70, tile_id=1, owned=True)
+    seam_duplicate = _detection(11, 11, 31, 31, 0.95, tile_id=0, owned=False)
+    other_class = _detection(11, 11, 31, 31, 0.90, class_id=1, tile_id=0)
+
+    merged = class_aware_nms((seam_duplicate, owner, other_class), 0.5)
+
+    assert owner in merged
+    assert seam_duplicate not in merged
+    assert other_class in merged
+    assert box_iou(owner, seam_duplicate) > 0.5
+
+
+class _FakePredictor:
+    def __init__(self):
+        self.calls = 0
+
+    def predict_tile(self, image, settings):
+        self.calls += 1
+        # The same global object appears in the horizontal overlap of two tiles.
+        if self.calls == 1:
+            return (RawDetection(75, 20, 95, 40, 0.8, 0),)
+        return (RawDetection(15, 20, 35, 40, 0.9, 0),)
+
+
+def test_tiled_engine_maps_and_merges_overlap_predictions():
+    predictor = _FakePredictor()
+    settings = InferenceSettings(
+        tile_size=100, overlap=40, merge_iou=0.5, device="cpu"
+    )
+
+    detections = TiledInferenceEngine(predictor).predict(
+        np.zeros((80, 160, 3), dtype=np.uint8), settings
+    )
+
+    assert predictor.calls == 2
+    assert len(detections) == 1
+    assert detections[0].owned
+    np.testing.assert_allclose(
+        [detections[0].x1, detections[0].y1, detections[0].x2, detections[0].y2],
+        [75, 20, 95, 40],
+    )
+
+
+def test_tiled_engine_cancels_between_tiles():
+    settings = InferenceSettings(tile_size=100, overlap=40)
+    checks = iter((False, True))
+
+    with pytest.raises(InferenceCancelled):
+        TiledInferenceEngine(_FakePredictor()).predict(
+            np.zeros((80, 160, 3), dtype=np.uint8),
+            settings,
+            cancelled=lambda: next(checks),
+        )
+
+
+def test_yolo_adapter_preserves_rgb_semantics_for_numpy_sources():
+    class FakeUltralyticsModel:
+        def predict(self, **kwargs):
+            self.source = kwargs["source"]
+            return []
+
+    adapter = YoloDetectionModel.__new__(YoloDetectionModel)
+    adapter.model = FakeUltralyticsModel()
+    rgb = np.asarray([[[10, 20, 30]]], dtype=np.uint8)
+
+    assert adapter.predict_tile(rgb, InferenceSettings(tile_size=64)) == ()
+    np.testing.assert_array_equal(
+        adapter.model.source, np.asarray([[[30, 20, 10]]], dtype=np.uint8)
+    )
+
+
+def _save_training_sample(
+    annotation_io,
+    sample_id,
+    *,
+    source_path,
+    positive=True,
+    shape=(80, 120, 3),
+    rectangle=None,
+):
+    if positive:
+        rectangle = rectangle if rectangle is not None else np.asarray(
+            [[20, 30], [20, 60], [45, 60], [45, 30]], dtype=float
+        )
+        rectangles = (rectangle,)
+        class_ids = (0,)
+    else:
+        rectangles = ()
+        class_ids = ()
+    return annotation_io.save_pair(
+        image_data=np.zeros(shape, dtype=np.uint8),
+        image_name=f"{sample_id}.png",
+        sample_id=sample_id,
+        source_path=Path(source_path),
+        rectangles=rectangles,
+        class_ids=class_ids,
+    )
+
+
+def test_project_split_config_is_backward_compatible_and_persistent(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+
+    assert project.config.dataset_split == {
+        "seed": 42,
+        "validation_fraction": 0.2,
+        "assignments": {},
+    }
+    project.update_dataset_split(
+        {"one": "train", "two": "val"}, seed=7, validation_fraction=0.25
+    )
+
+    reopened = ProjectStore.load(project.paths.root)
+    assert reopened.config.dataset_split["seed"] == 7
+    assert reopened.config.dataset_split["validation_fraction"] == 0.25
+    assert reopened.config.dataset_split["assignments"] == {
+        "one": "train",
+        "two": "val",
+    }
+
+
+def test_grouped_split_is_stable_and_never_leaks_a_source(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "field_a_z0", source_path=tmp_path / "source_a.png"
+    )
+    _save_training_sample(
+        annotation_io, "field_a_z1", source_path=tmp_path / "source_a.png"
+    )
+    _save_training_sample(
+        annotation_io,
+        "field_b",
+        source_path=tmp_path / "source_b.png",
+        positive=False,
+    )
+    settings = DatasetBuildSettings(tile_size=64, overlap=16, seed=11)
+
+    first = DatasetBuilder(project).preview(settings)
+
+    assert first.is_valid
+    assert first.assignments["field_a_z0"] == first.assignments["field_a_z1"]
+    assert set(first.assignments.values()) == {"train", "val"}
+    original = dict(first.assignments)
+
+    _save_training_sample(
+        annotation_io, "field_c", source_path=tmp_path / "source_c.png"
+    )
+    second = DatasetBuilder(project).preview(settings)
+
+    assert second.is_valid
+    assert all(second.assignments[key] == value for key, value in original.items())
+
+
+def test_appended_audit_metadata_merges_and_survives_later_saves(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "field_a", source_path=tmp_path / "source_a.png"
+    )
+    with project.paths.audit.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "operation": "metadata",
+                    "sample_id": "field_a",
+                    "metadata": {"patient": "P001", "well": "A01"},
+                }
+            )
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "operation": "metadata",
+                    "sample_id": "field_a",
+                    "metadata": {"well": "A02"},
+                }
+            )
+            + "\n"
+        )
+    _save_training_sample(
+        annotation_io, "field_a", source_path=tmp_path / "source_a.png"
+    )
+
+    preview = DatasetBuilder(project).preview(
+        DatasetBuildSettings(tile_size=64, overlap=16, group_field="metadata.patient"),
+        train_only=True,
+    )
+    events = DatasetBuilder(project)._latest_audit_events()
+
+    assert preview.samples[0].group == "metadata:P001"
+    assert events["field_a"]["metadata"] == {
+        "patient": "P001",
+        "well": "A02",
+    }
+
+
+def test_one_source_requires_explicit_train_only_mode(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "only", source_path=tmp_path / "only.png"
+    )
+    builder = DatasetBuilder(project)
+    settings = DatasetBuildSettings(tile_size=64, overlap=16)
+
+    blocked = builder.preview(settings)
+    exploratory = builder.preview(settings, train_only=True)
+
+    assert not blocked.is_valid
+    assert any("at least two source groups" in error for error in blocked.errors)
+    assert exploratory.is_valid
+    assert exploratory.validation_mode == "none"
+    assert exploratory.assignments == {"only": "train"}
+
+    run_root = tmp_path / "train-only-run"
+    run_root.mkdir()
+    snapshot = builder.create_snapshot(run_root, exploratory, settings)
+    assert "val: images/train" in snapshot.dataset_yaml.read_text(encoding="utf-8")
+
+
+def test_snapshot_has_matching_pairs_manifests_and_no_group_leakage(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "one", source_path=tmp_path / "one.png"
+    )
+    _save_training_sample(
+        annotation_io,
+        "two",
+        source_path=tmp_path / "two.png",
+        positive=False,
+    )
+    settings = DatasetBuildSettings(
+        tile_size=64, overlap=16, negative_tile_ratio=0.5, seed=5
+    )
+    builder = DatasetBuilder(project)
+    preview = builder.preview(settings)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+
+    snapshot = builder.create_snapshot(run_root, preview, settings)
+
+    assert snapshot.dataset_yaml.is_file()
+    assert snapshot.split_manifest.is_file()
+    assert snapshot.tile_manifest.is_file()
+    for split in ("train", "val"):
+        image_stems = {
+            path.stem for path in (snapshot.dataset_root / "images" / split).glob("*.png")
+        }
+        label_stems = {
+            path.stem for path in (snapshot.dataset_root / "labels" / split).glob("*.txt")
+        }
+        assert image_stems == label_stems
+    manifest = snapshot.split_manifest.read_text(encoding="utf-8")
+    assert "image_sha256" in manifest
+    assert "label_sha256" in manifest
+
+
+def test_dataset_requires_locked_normalization_provenance(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    processing = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    rectangle = np.asarray(
+        [[10, 10], [10, 30], [30, 30], [30, 10]], dtype=float
+    )
+    save_kwargs = {
+        "image_data": np.zeros((64, 64, 3), dtype=np.uint8),
+        "image_name": "normalized.png",
+        "sample_id": "normalized",
+        "rectangles": (rectangle,),
+        "class_ids": (0,),
+    }
+    annotation_io.save_pair(
+        **save_kwargs, conversion_metadata={"settings": processing}
+    )
+    builder = DatasetBuilder(project)
+    settings = DatasetBuildSettings(tile_size=64, overlap=0)
+
+    matching = builder.preview(settings, train_only=True)
+
+    assert matching.is_valid
+
+    mismatched = dict(processing)
+    mismatched["normalization"] = {
+        "method": "simple_max",
+        "lower": None,
+        "upper": None,
+        "scope": "per_plane_per_channel",
+    }
+    annotation_io.save_pair(
+        **save_kwargs, conversion_metadata={"settings": mismatched}
+    )
+    rejected = builder.preview(settings, train_only=True)
+
+    assert not rejected.is_valid
+    assert any(
+        "do not match the locked project" in error for error in rejected.errors
+    )
+
+
+def test_large_bbox_rejected_when_tile_clipping_is_too_severe(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    huge = np.asarray([[10, 10], [10, 190], [50, 190], [50, 10]], dtype=float)
+    _save_training_sample(
+        annotation_io,
+        "huge",
+        source_path=tmp_path / "huge.png",
+        shape=(64, 200, 3),
+        rectangle=huge,
+    )
+    settings = DatasetBuildSettings(tile_size=64, overlap=0)
+
+    preview = DatasetBuilder(project).preview(settings, train_only=True)
+
+    assert not preview.is_valid
+    assert preview.box_counts["train"] == 0
+    assert any("cannot meet" in warning for warning in preview.warnings)
+    assert any("No usable training tiles" in error for error in preview.errors)
+
+
+def test_training_service_creates_timestamped_run_and_provenance(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "one", source_path=tmp_path / "one.png"
+    )
+    _save_training_sample(
+        annotation_io, "two", source_path=tmp_path / "two.png", positive=False
+    )
+    dataset_settings = DatasetBuildSettings(tile_size=64, overlap=16, seed=3)
+    preview = DatasetBuilder(project).preview(dataset_settings)
+    base_model = tmp_path / "base.pt"
+    base_model.write_bytes(b"model")
+
+    class FakeModel:
+        task = "detect"
+
+        def add_callback(self, name, callback):
+            self.callback = callback
+
+        def train(self, **kwargs):
+            weights = Path(kwargs["project"]) / kwargs["name"] / "weights"
+            weights.mkdir(parents=True)
+            (weights / "best.pt").write_bytes(b"best")
+            (weights / "last.pt").write_bytes(b"last")
+            self.callback(SimpleNamespace(epoch=0, metrics={}))
+
+    destination = tmp_path / "outputs"
+    settings = TrainingSettings(
+        model_path=base_model,
+        destination=destination,
+        dataset=dataset_settings,
+        epochs=1,
+        batch=1,
+        patience=0,
+    )
+    with patch.object(training_module, "_load_ultralytics_model", return_value=FakeModel()):
+        result = TrainingService(project).run(settings, preview)
+
+    assert result.status == "completed"
+    assert result.run_root.parent == destination.resolve()
+    assert result.run_root.name.startswith("retrain_")
+    assert result.best_model.is_file()
+    run_yaml = result.run_root / "run.yaml"
+    text = run_yaml.read_text(encoding="utf-8")
+    assert "status: completed" in text
+    assert "plugin_version: 0.10.0" in text
+    assert "sha256:" in text
+    assert (result.run_root / "dataset" / "tile_manifest.csv").is_file()
+    promoted = project.paths.models / f"{result.run_root.name}.pt"
+    assert result.promoted_model == promoted
+    assert promoted.read_bytes() == b"best"
+    run_metadata = training_module.yaml.safe_load(text)
+    assert run_metadata["outputs"]["project_model"] == str(
+        Path("models") / promoted.name
+    )
+
+
+def test_training_cancellation_marks_partial_run(tmp_path):
+    project = ProjectStore.initialize(tmp_path / "project")
+    annotation_io = AnnotationIO(project)
+    _save_training_sample(
+        annotation_io, "only", source_path=tmp_path / "only.png"
+    )
+    dataset_settings = DatasetBuildSettings(tile_size=64, overlap=0)
+    preview = DatasetBuilder(project).preview(dataset_settings, train_only=True)
+    model = tmp_path / "base.pt"
+    model.write_bytes(b"model")
+    destination = tmp_path / "outputs"
+    settings = TrainingSettings(
+        model_path=model,
+        destination=destination,
+        dataset=dataset_settings,
+        train_only=True,
+    )
+
+    with pytest.raises(TrainingCancelled):
+        TrainingService(project).run(
+            settings, preview, cancelled=lambda: True
+        )
+
+    runs = list(destination.glob("retrain_*"))
+    assert len(runs) == 1
+    assert "status: cancelled" in (runs[0] / "run.yaml").read_text(encoding="utf-8")
+
+
+class _Signal:
+    def connect(self, callback):
+        self.callback = callback
+
+
+class _Image:
+    def __init__(self, data, name="sample", path=None, metadata=None, **kwargs):
+        self.data = data
+        self.name = name
+        self.metadata = metadata or {}
+        self.source = SimpleNamespace(path=str(path) if path else None)
+        self.rgb = data.ndim == 3 and data.shape[-1] in {3, 4}
+        self.axis_labels = ()
+        self.visible = True
+
+
+class _Shapes:
+    def __init__(self, data, name, properties=None, **kwargs):
+        self.data = data
+        self.name = name
+        self.properties = properties or {}
+        self.metadata = {}
+        self.current_properties = {}
+        self.current_edge_color = None
+        self.edge_color = kwargs.get("edge_color")
+        self.face_color = kwargs.get("face_color")
+        self.selected_data = set()
+        self.events = SimpleNamespace(data=_Signal())
+        self.visible = True
+        self.mode = "select"
+
+
+class _Labels:
+    def __init__(self, data, name, metadata=None, **kwargs):
+        self.data = np.asarray(data)
+        self.name = name
+        self.metadata = metadata or {}
+        self.selected_label = 0
+        self.mode = "pan_zoom"
+        self.color = {}
+        self.visible = True
+        self.events = SimpleNamespace(data=_Signal(), selected_label=_Signal())
+
+    def refresh(self):
+        pass
+
+
+class _Layers(list):
+    def __init__(self):
+        super().__init__()
+        self.selection = SimpleNamespace(
+            active=None,
+            events=SimpleNamespace(active=_Signal()),
+        )
+        self.events = SimpleNamespace(inserted=_Signal(), removed=_Signal())
+
+
+class _Viewer:
+    def __init__(self):
+        self.layers = _Layers()
+        self.dims = SimpleNamespace(
+            current_step=(0, 0, 0),
+            events=SimpleNamespace(current_step=_Signal()),
+        )
+
+    def add_shapes(self, data, *, name, properties=None, **kwargs):
+        layer = _Shapes(data, name, properties, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_image(self, data, *, name, metadata=None, **kwargs):
+        layer = _Image(data, name=name, metadata=metadata, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+    def add_labels(self, data, *, name, metadata=None, **kwargs):
+        layer = _Labels(data, name, metadata, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+
+def test_widget_starts_with_disabled_model_controls(qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+
+    assert widget._project is None
+    assert widget._new_project_button.text() == "New Project"
+    assert widget._model is None
+    assert not widget._choose_model_button.isEnabled()
+    assert not widget._predict_button.isEnabled()
+    assert not widget._save_annotation_button.isEnabled()
+
+
+def test_inference_tile_default_follows_training_patch_until_overridden(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project")
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+
+    assert widget._inference_settings().tile_size == 1024
+    widget._patch_size_combo.setCurrentIndex(widget._patch_size_combo.findData(512))
+    assert widget._inference_settings().tile_size == 512
+    assert widget._training_tile_size_spin.value() == 512
+
+    widget._tile_size_spin.setValue(768)
+    widget._patch_size_combo.setCurrentIndex(widget._patch_size_combo.findData(1024))
+    assert widget._inference_settings().tile_size == 768
+
+    project.lock_training_patch(512, padding_value=114)
+    widget._set_project(ProjectStore.load(project.paths.root))
+    assert widget._training_patch_size() == 512
+    assert widget._inference_settings().tile_size == 512
+
+
+def test_parameter_controls_have_tooltips(qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+
+    controls = (
+        widget._normalization_combo,
+        widget._filter_combo,
+        widget._filter_radius_spin,
+        widget._invert_checkbox,
+        widget._confidence_spin,
+        widget._model_iou_spin,
+        widget._merge_iou_spin,
+        widget._tile_size_spin,
+        widget._overlap_percent_spin,
+        widget._clear_border_instances_checkbox,
+        widget._show_segmentation_grid_checkbox,
+        widget._remove_small_instances_button,
+        widget._compact_instance_ids_button,
+        widget._patch_size_combo,
+        widget._training_model_combo,
+        widget._validation_fraction_spin,
+        widget._epochs_spin,
+        widget._batch_spin,
+        widget._training_device_combo,
+    )
+    assert all(control.toolTip().strip() for control in controls)
+
+
+def test_widget_sections_collapse_and_scroll(qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget.resize(420, 300)
+    widget.show()
+
+    assert widget._project_section.content.isVisible()
+    assert not widget._inference_section.content.isVisible()
+    assert not widget._retrain_section.content.isVisible()
+
+    widget._inference_section.toggle_button.setChecked(True)
+    widget._retrain_section.toggle_button.setChecked(True)
+    qtbot.wait(10)
+
+    assert widget._inference_section.content.isVisible()
+    assert widget._retrain_section.content.isVisible()
+    assert widget._scroll_area.verticalScrollBar().maximum() > 0
+
+
+def test_widget_new_project_and_automatic_bbox_loading(tmp_path, qtbot):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    source_image = tmp_path / "source" / "field.png"
+    source_image.parent.mkdir()
+    source_image.touch()
+    source_image.with_suffix(".txt").write_text(
+        "0 0.5 0.5 0.25 0.5\n", encoding="utf-8"
+    )
+
+    viewer = _Viewer()
+    image_layer = _Image(
+        np.zeros((100, 200, 3), dtype=np.uint8),
+        name="field",
+        path=source_image,
+    )
+    viewer.layers.append(image_layer)
+    viewer.layers.selection.active = image_layer
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+
+    with (
+        patch.object(
+            widget_module.QFileDialog,
+            "getExistingDirectory",
+            return_value=str(project_root),
+        ),
+        patch.object(widget, "_show_info"),
     ):
-        w = SimpleCciAnnotatorQWidget(viewer)
-        qtbot.addWidget(w)
+        widget._on_new_project()
 
-        model_folder = tmp_path / "my_model"
-        model_folder.mkdir()
-
-        w._model_path_input.setText(str(model_folder))
-
-        # Suppress the info dialogs
-        with patch.object(w, "_show_info"):
-            w._on_load_model()
-
-    copied_pt = model_folder / "yolov8n.pt"
-    assert copied_pt.exists(), "Bundled model should have been copied to the folder"
-    assert w._model_path == copied_pt
+    shapes = next(layer for layer in viewer.layers if isinstance(layer, _Shapes))
+    assert widget._project is not None
+    assert len(shapes.data) == 1
+    assert shapes.properties["class_id"].tolist() == [0]
+    assert shapes.properties["class_name"].tolist() == ["LABEL"]
+    assert shapes.metadata["cci_label_path"] == str(source_image.with_suffix(".txt").resolve())
+    assert widget._save_annotation_button.text() == "Import Converted Image + BBoxes"
 
 
-def test_load_model_empty_path_shows_error(tmp_path, qtbot):
-    from simple_napari_cci_annotator._widget import SimpleCciAnnotatorQWidget
+def test_locked_project_normalization_is_authoritative_for_inference_input(
+    tmp_path, qtbot
+):
+    project = ProjectStore.initialize(tmp_path / "project")
+    processing = ImageProcessingSettings(
+        channel_axis=0,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=None,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    source_data = np.asarray(
+        [
+            [[10, 20], [30, 40]],
+            [[100, 200], [300, 400]],
+        ],
+        dtype=np.uint16,
+    )
+    viewer = _Viewer()
+    source = _Image(source_data, name="source")
+    viewer.layers.append(source)
+    viewer.layers.selection.active = source
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
 
-    viewer = MagicMock()
-    viewer.layers = MagicMock()
-    viewer.layers.__iter__ = MagicMock(return_value=iter([]))
+    widget._normalization_combo.setCurrentIndex(
+        widget._normalization_combo.findData("simple_max")
+    )
+    widget._filter_combo.setCurrentIndex(widget._filter_combo.findData("median"))
+    widget._filter_radius_spin.setValue(7)
+    converted = widget._convert_current_image(source)
 
-    with patch("simple_napari_cci_annotator._widget.CCIYoloWrapper"):
-        w = SimpleCciAnnotatorQWidget(viewer)
-        qtbot.addWidget(w)
+    assert converted.settings.normalization == "min_max"
+    assert converted.settings.filter_method == "none"
+    assert converted.settings.filter_radius == 1
+    assert widget._invert_checkbox.isEnabled()
 
-        w._model_path_input.setText("")
-        with patch.object(w, "_show_error") as mock_err:
-            w._on_load_model()
-            mock_err.assert_called_once()
+    widget._invert_checkbox.setChecked(True)
+    inverted = widget._convert_current_image(source)
+    assert inverted.inverted
+    np.testing.assert_array_equal(
+        inverted.data[..., 0], np.asarray([[255, 170], [85, 0]])
+    )
+    np.testing.assert_array_equal(
+        converted.data[..., 0], np.asarray([[0, 85], [170, 255]])
+    )
 
 
-def test_load_model_existing_pt_in_folder(tmp_path, qtbot):
-    """If the folder already has a .pt file, that one is loaded (no copy)."""
-    from simple_napari_cci_annotator._widget import SimpleCciAnnotatorQWidget
+def test_widget_assigns_selected_boxes_to_current_project_class(tmp_path, qtbot):
+    root = tmp_path / "project"
+    root.mkdir()
+    project = ProjectStore.initialize(root, classes={0: "Cell", 1: "Debris"})
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    shapes = viewer.add_shapes(
+        [np.asarray([[10, 10], [10, 20], [20, 20], [20, 10]])],
+        name=widget.ANNOTATION_LAYER_NAME,
+        properties={
+            "class_id": np.asarray([0]),
+            "class_name": np.asarray(["Cell"], dtype=object),
+            "confidence": np.asarray([0.9]),
+            "source": np.asarray(["prediction"], dtype=object),
+            "tile_id": np.asarray([3]),
+        },
+    )
+    shapes.selected_data = {0}
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(1))
 
-    model_folder = tmp_path / "my_model"
-    model_folder.mkdir()
-    fake_pt = model_folder / "custom.pt"
-    fake_pt.write_bytes(b"fake")
+    widget._on_apply_class_to_selected()
 
-    viewer = MagicMock()
-    viewer.layers = MagicMock()
-    viewer.layers.__iter__ = MagicMock(return_value=iter([]))
+    assert shapes.properties["class_id"].tolist() == [1]
+    assert shapes.properties["class_name"].tolist() == ["Debris"]
+    assert shapes.properties["source"].tolist() == ["manual"]
+    assert np.isnan(shapes.properties["confidence"][0])
+    assert "1 Debris: 1" in widget._class_counts_label.text()
+    assert widget._annotation_dirty
+    widget._annotation_dirty = False  # Avoid an unsaved-edits dialog on teardown.
 
-    mock_wrapper = MagicMock()
-    with patch(
-        "simple_napari_cci_annotator._widget.CCIYoloWrapper",
-        return_value=mock_wrapper,
+
+def test_widget_reviews_saved_annotations_and_marks_out_of_bounds(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project")
+    processing = ImageProcessingSettings(
+        channel_axis=2,
+        red_channel=0,
+        green_channel=1,
+        blue_channel=2,
+        normalization="min_max",
+    ).to_mapping()
+    project.lock_image_processing(processing)
+    project.lock_training_patch(512)
+    AnnotationIO(project).save_pair(
+        image_data=np.zeros((512, 512, 3), dtype=np.uint8),
+        image_name="review_me.png",
+        sample_id="review_me",
+        rectangles=(
+            np.asarray([[10, 10], [10, 30], [30, 30], [30, 10]], dtype=float),
+        ),
+        class_ids=(0,),
+        conversion_metadata={"settings": processing},
+    )
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+
+    widget._set_project(project)
+    assert widget._review_sample_combo.count() == 1
+    widget._on_load_review_annotation()
+
+    shapes = widget._annotation_layer()
+    assert shapes is not None
+    assert len(shapes.data) == 1
+    assert widget._save_annotation_button.isEnabled()
+    assert widget._review_save_button.isEnabled()
+
+    valid = np.asarray(shapes.data[0]).copy()
+    shapes.data[0] = np.asarray(
+        [[10, 490], [10, 530], [30, 530], [30, 490]], dtype=float
+    )
+    widget._on_shapes_data_changed()
+    assert widget._annotation_invalid_indices == (0,)
+    assert not widget._save_annotation_button.isEnabled()
+    assert not widget._review_save_button.isEnabled()
+    np.testing.assert_allclose(shapes.face_color[0], [1, 0, 0, 0.35])
+    assert "zero-based indices: 0" in widget._label_status_label.text()
+
+    shapes.data[0] = valid
+    widget._on_shapes_data_changed()
+    assert widget._annotation_invalid_indices == ()
+    assert widget._save_annotation_button.isEnabled()
+    assert widget._review_save_button.isEnabled()
+
+    shapes.data[0] = np.asarray(
+        [[20, 20], [20, 50], [50, 50], [50, 20]], dtype=float
+    )
+    widget._on_shapes_data_changed()
+    with patch.object(widget, "_show_info"):
+        widget._review_save_button.click()
+    assert not widget._annotation_dirty
+    assert "updated" in widget._label_status_label.text()
+
+
+def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
+    root = tmp_path / "project"
+    root.mkdir()
+    source_path = tmp_path / "field.png"
+    source_path.touch()
+    project = ProjectStore.initialize(root)
+    viewer = _Viewer()
+    source = _Image(np.zeros((300, 800, 3), dtype=np.uint8), path=source_path)
+    viewer.layers.append(source)
+    viewer.layers.selection.active = source
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    assert not widget._save_annotation_button.isEnabled()
+    source_boxes = widget._annotation_layer()
+    source_boxes.data = [
+        np.asarray([[100, 200], [100, 300], [200, 300], [200, 200]]),
+        np.asarray([[100, 630], [100, 750], [200, 750], [200, 630]]),
+    ]
+    source_boxes.properties = {
+        "class_id": np.asarray([0, 0]),
+        "class_name": np.asarray(["LABEL", "LABEL"], dtype=object),
+        "confidence": np.asarray([0.8, 0.7]),
+        "source": np.asarray(["prediction", "prediction"], dtype=object),
+        "tile_id": np.asarray([1, 2]),
+    }
+    widget._patch_size_combo.setCurrentIndex(
+        widget._patch_size_combo.findData(512)
+    )
+
+    widget._on_select_training_crop()
+    widget._on_create_training_crop()
+
+    crop_image = widget._get_layer_by_name(widget.CROP_IMAGE_LAYER_NAME)
+    crop_boxes = widget._crop_bbox_layer()
+    assert crop_image.data.shape == (512, 512, 3)
+    assert len(crop_boxes.data) == 2
+    assert "1 clipped at crop boundaries" in widget._crop_status_label.text()
+    assert widget._save_crop_button.isEnabled()
+
+    valid_box = np.asarray(crop_boxes.data[0]).copy()
+    crop_boxes.data[0] = np.asarray(
+        [[280, 40], [280, 90], [320, 90], [320, 40]], dtype=float
+    )
+    widget._on_crop_shapes_changed()
+    assert widget._crop_invalid_indices == (0,)
+    assert not widget._save_crop_button.isEnabled()
+    np.testing.assert_allclose(crop_boxes.face_color[0], [1, 0, 0, 0.35])
+    np.testing.assert_allclose(crop_boxes.face_color[1], [0, 0, 0, 0])
+    assert "zero-based indices: 0" in widget._crop_status_label.text()
+
+    crop_boxes.data[0] = valid_box
+    widget._on_crop_shapes_changed()
+    assert widget._crop_invalid_indices == ()
+    assert widget._save_crop_button.isEnabled()
+    np.testing.assert_allclose(crop_boxes.face_color, np.zeros((2, 4)))
+    assert widget._save_training_crop(show_message=False)
+    assert project.config.training_patch == {
+        "size": 512,
+        "padding_value": 114,
+        "locked": True,
+    }
+    assert len(list(project.paths.images.iterdir())) == 1
+    assert len(list(project.paths.labels.iterdir())) == 1
+
+
+def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-project", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((1024, 1024, 3), dtype=np.uint8),
+        name="sample",
+        path=tmp_path / "sample.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+    assert labels is not None
+    assert labels.data.dtype == np.uint32
+    widget._show_segmentation_grid_checkbox.setChecked(True)
+    widget._update_segmentation_tile_grid(
+        {"mode": "dask_tiled", "core_size": 400},
+        labels.data.shape,
+    )
+    grid = widget._get_layer_by_name(widget.SEGMENTATION_TILE_LAYER_NAME)
+    assert grid is not None
+    assert len(grid.data) == 9
+
+    widget._invert_checkbox.setChecked(True)
+    widget._on_new_mask_instance()
+    instance_id = labels.selected_label
+    data = labels.data.copy()
+    data[10:20, 30:40] = instance_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    with patch.object(widget, "_show_info"):
+        widget._on_save_annotation()
+
+    assert (project.paths.masks / "sample.tif").is_file()
+    assert (project.paths.instances / "sample.json").is_file()
+    metadata = json.loads(
+        (project.paths.instances / "sample.json").read_text(encoding="utf-8")
+    )
+    assert metadata["conversion"]["inverted"] is True
+    widget._load_annotations_for_image(image, force=True)
+    reloaded = widget._segmentation_layer()
+    assert int(reloaded.data[12, 32]) == instance_id
+    assert widget._segment_instances[instance_id].class_id == 0
+
+
+def test_widget_removes_tiny_instances_and_collapses_empty_ids(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-cleanup", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((32, 32, 3), dtype=np.uint8),
+        name="cleanup",
+        path=tmp_path / "cleanup.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+
+    widget._on_new_mask_instance()
+    tiny_id = labels.selected_label
+    data = labels.data.copy()
+    data[0:2, 0:2] = tiny_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    widget._on_new_mask_instance()
+    retained_id = labels.selected_label
+    data = labels.data.copy()
+    data[0, 4:9] = retained_id
+    labels.data = data
+    widget._on_labels_data_changed()
+    widget._on_new_mask_instance()  # Intentionally leave this metadata ID empty.
+    empty_id = labels.selected_label
+
+    widget._on_remove_small_mask_instances()
+
+    assert not np.any(labels.data == tiny_id)
+    assert np.count_nonzero(labels.data == retained_id) == 5
+    assert set(widget._segment_instances) == {retained_id, empty_id}
+    assert "0 Cell: 1" in widget._class_counts_label.text()
+
+    widget._on_compact_mask_instances()
+
+    assert set(np.unique(labels.data)) == {0, 1}
+    assert set(widget._segment_instances) == {1}
+    assert widget._segment_instances[1].class_id == 0
+    assert labels.selected_label == 0
+    assert not widget._segmentation_errors
+    widget._annotation_dirty = False  # Avoid an unsaved-edits dialog on teardown.
+
+
+def test_widget_creates_edits_and_saves_segmentation_training_crop(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-crop", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((300, 800, 3), dtype=np.uint8),
+        name="large",
+        path=tmp_path / "large.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    source_labels = widget._segmentation_layer()
+    assert not widget._save_annotation_button.isEnabled()
+    assert widget._save_annotation_button.text() == (
+        "Use Training Crop to Save Corrections"
+    )
+    assert "working mask" in widget._label_status_label.text()
+    widget._on_new_mask_instance()
+    instance_id = source_labels.selected_label
+    data = source_labels.data.copy()
+    data[100:180, 300:420] = instance_id
+    source_labels.data = data
+    widget._on_labels_data_changed()
+    widget._patch_size_combo.setCurrentIndex(
+        widget._patch_size_combo.findData(512)
+    )
+
+    widget._on_select_training_crop()
+    widget._on_create_training_crop()
+
+    crop_labels = widget._crop_segmentation_layer()
+    assert crop_labels is not None
+    assert crop_labels.data.shape == (512, 512)
+    assert set(np.unique(crop_labels.data)) == {0, 1}
+    assert widget._crop_segment_instances[1].lineage == (instance_id,)
+    assert widget._save_crop_button.isEnabled()
+
+    invalid = crop_labels.data.copy()
+    invalid[400, 10] = 1
+    crop_labels.data = invalid
+    widget._on_labels_data_changed()
+    assert not widget._save_crop_button.isEnabled()
+    assert "synthetic padding" in widget._label_status_label.text()
+    assert crop_labels.color[1] == "red"
+
+    invalid[400, 10] = 0
+    crop_labels.data = invalid
+    widget._on_labels_data_changed()
+    assert widget._save_training_crop(show_message=False)
+    assert len(list(project.paths.images.glob("*.png"))) == 1
+    assert len(list(project.paths.masks.glob("*.tif"))) == 1
+    assert len(list(project.paths.instances.glob("*.json"))) == 1
+    widget._annotation_dirty = False  # The source working mask is intentionally unsaved.
+
+
+@pytest.mark.parametrize("task", ["detect", "segment"])
+def test_full_size_prediction_requires_discard_confirmation(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / task, task=task)
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((64, 96, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    widget._inference_sample_id = widget._current_sample_id
+    widget._inference_converted = widget._converted_image
+
+    if task == "segment":
+        result = ComposedInstances(
+            mask=np.zeros((64, 96), dtype=np.uint32),
+            instances={},
+            cleanup=(),
+        )
+    else:
+        result = ()
+    widget._on_inference_succeeded(result)
+
+    assert widget._annotation_dirty
+    assert not widget._save_annotation_button.isEnabled()
+    assert widget._select_crop_button.isEnabled()
+    assert "Select Training Crop" in widget._save_annotation_button.toolTip()
+    if task == "segment":
+        assert widget._save_annotation_button.text() == (
+            "Use Training Crop to Save Corrections"
+        )
+        assert "unsaved working mask" in widget._label_status_label.text()
+
+    with patch.object(
+        widget_module.QMessageBox,
+        "warning",
+        return_value=widget_module.QMessageBox.Cancel,
+    ) as warning:
+        widget._load_annotations_for_image(image, force=True)
+        assert widget._annotation_dirty
+        warning.assert_called_once()
+        if task == "segment":
+            assert "Select Training Crop" in warning.call_args.args[2]
+
+    events = []
+    event = SimpleNamespace(
+        ignore=lambda: events.append("ignored"),
+        accept=lambda: events.append("accepted"),
+    )
+    with patch.object(
+        widget_module.QMessageBox,
+        "warning",
+        return_value=widget_module.QMessageBox.Cancel,
     ):
-        w = SimpleCciAnnotatorQWidget(viewer)
-        qtbot.addWidget(w)
+        widget.closeEvent(event)
+    assert events == ["ignored"]
+    widget._annotation_dirty = False
 
-        w._model_path_input.setText(str(model_folder))
-        with patch.object(w, "_show_info"):
-            w._on_load_model()
 
-    assert w._model_path == fake_pt
-    # The existing .pt must not have been overwritten
-    assert fake_pt.read_bytes() == b"fake"
+@pytest.mark.parametrize("in_crop", [False, True])
+def test_mask_merge_requires_same_class_and_keeps_lineage(
+    tmp_path, qtbot, in_crop
+):
+    project = ProjectStore.initialize(
+        tmp_path / "merge", task="segment", classes={0: "Cell", 1: "Debris"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((64, 64, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    labels = widget._segmentation_layer()
+    widget._on_new_mask_instance()
+    target_id = labels.selected_label
+    labels.data[20:24, 20:24] = target_id
+    widget._on_labels_data_changed()
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(1))
+    widget._on_new_mask_instance()
+    source_id = labels.selected_label
+    labels.data[24:28, 20:24] = source_id
+    widget._on_labels_data_changed()
+
+    if in_crop:
+        widget._patch_size_combo.setCurrentIndex(
+            widget._patch_size_combo.findData(512)
+        )
+        widget._on_select_training_crop()
+        widget._on_create_training_crop()
+        labels = widget._crop_segmentation_layer()
+        target_id, source_id = 1, 2
+
+    labels.selected_label = target_id
+    before = labels.data.copy()
+    with patch.object(
+        widget_module.QInputDialog, "getText", return_value=(str(source_id), True)
+    ), patch.object(widget, "_show_error") as error:
+        widget._on_merge_mask_instances()
+    np.testing.assert_array_equal(labels.data, before)
+    assert "different classes" in error.call_args.args[0]
+    assert widget._active_segment_instances()[source_id].class_id == 1
+
+    labels.selected_label = source_id
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(0))
+    widget._apply_class_to_selected_instance()
+    labels.selected_label = target_id
+    with patch.object(
+        widget_module.QInputDialog, "getText", return_value=(str(source_id), True)
+    ):
+        widget._on_merge_mask_instances()
+    assert source_id not in widget._active_segment_instances()
+    assert set(np.unique(labels.data)) == {0, target_id}
+    merged = widget._active_segment_instances()[target_id]
+    assert merged.class_id == 0
+    assert merged.source == "manual"
+    assert merged.status == "corrected"
+    assert source_id in merged.lineage
+    widget._annotation_dirty = False
+    widget._crop_dirty = False
+
+
+@pytest.mark.parametrize("task", ["detect", "segment"])
+def test_widget_saves_current_output_outside_training_pool(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / "project", task=task)
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((48, 80, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    output_parent = tmp_path / "outputs"
+    output_parent.mkdir()
+
+    assert widget._save_output_button.isEnabled()
+    with patch.object(
+        widget_module.QFileDialog,
+        "getExistingDirectory",
+        return_value=str(output_parent),
+    ), patch.object(widget, "_show_info"):
+        widget._save_output_button.click()
+
+    folder = output_parent / task / "field"
+    assert (folder / "image.png").is_file()
+    assert (folder / ("mask.tif" if task == "segment" else "labels.txt")).is_file()
+    assert (folder / ("instances.json" if task == "segment" else "result.json")).is_file()
+    assert str(folder) in widget._output_status_label.text()
+    assert not list(project.paths.images.iterdir())
+
+    with patch.object(
+        widget_module.QFileDialog,
+        "getExistingDirectory",
+        return_value=str(output_parent),
+    ), patch.object(
+        widget_module.QMessageBox,
+        "question",
+        return_value=widget_module.QMessageBox.Cancel,
+    ) as question:
+        widget._save_output_button.click()
+    question.assert_called_once()

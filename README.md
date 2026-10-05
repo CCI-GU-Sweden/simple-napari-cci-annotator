@@ -1,121 +1,40 @@
+# Simple napari CCI annotator
 
-[![License MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/blob/main/LICENSE)
-[![Python 3.10–3.12](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)](https://python.org)
-[![tests](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/workflows/tests/badge.svg)](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator/actions)
+## Installation
 
-# Simple napari annotator
+From the repository root, install the plugin and napari into a Python 3.10–3.12 environment:
 
-Minimal napari plugin for YOLO bbox detection + quick correction + retraining.
+```bash
+python -m pip install -e ".[all]"
+napari
+```
 
-No dataset browser, no extra workflow logic. User provides the image in napari.
+In napari, open **Plugins → CCI Annotator → Simple CCI Annotator Plugin**.
 
-## UI flow
+## What it does
 
-1. Path to model (`.pt`) or model folder
-2. `Load model`
-3. `Predict`
-4. Optional destination folder for retrained model (browse or type)
-5. Edit boxes in napari shapes layer (`yolo_bboxes`)
-6. `Add correction`
-7. `Retrain`
+The plugin helps you run YOLO detection or instance segmentation on microscopy images, correct predictions, and save training annotations. It also supports tiled inference on large images, batch prediction of TIFF folders, and retraining from saved annotations.
 
-![UI](assets/Plugin_UI.png)
+## Quick start
 
-## Starting from scratch
+1. Choose **Bounding-box detection** or **Instance segmentation**, then create a project in an empty folder. Use **Open Project** to return to an existing one.
+2. Open an image in napari. Set the channel mapping, optional filter, and normalization, then use **Preview RGB Conversion** to check the pixels used for prediction and training.
+3. Select a compatible YOLO model and click **Predict Current RGB Plane**. Edit the resulting boxes or instance mask as needed.
+4. To save training data, select a 512×512 or 1024×1024 training crop, correct it, and click **Add Crop + Corrections**. The first saved annotation locks the project's image conversion and training patch size.
+5. Use **Save Current Output** to export a full-size prediction without adding it to the training annotations. For a whole folder, use **Batch TIFF prediction** after the project settings are locked.
 
-The model input supports either:
+Inference tiles default to the selected training crop size. You can set another tile size in the prediction controls.
 
-- A `.pt` model file, or
-- A folder path.
+## Output
 
-Folder behavior on `Load model`:
+Training annotations are stored in the project folder. Detection annotations use YOLO `.txt` labels; segmentation annotations use instance-mask TIFF files and JSON metadata.
 
-- If the folder already contains one or more `.pt` files, the first one is loaded.
-- If the folder contains no `.pt` file, the plugin copies the bundled `yolov8n.pt` into that folder and loads it.
-- Empty model input is invalid and will show an error.
+Batch prediction accepts `.tif`, `.tiff`, `.ome.tif`, and `.ome.tiff` files directly inside the selected input folder. It processes every nonspatial plane. Results go to `<input folder>/Prediction/` by default, or to an output folder you choose. Each run includes `analysis_metadata.json` with the settings and file records needed to trace its results.
 
-If you do not have a model yet, start from a pretrained YOLOv8 nano checkpoint and use it as your initial file:
+## More guidance
 
-- Direct download: <https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt>
-- Model overview: <https://docs.ultralytics.com/models/yolov8/>
+- [GUI tutorial](TUTORIAL.md): annotation, batch prediction, and retraining steps.
+- [Python API examples](API_EXAMPLES.md): project creation, training, and headless inference without napari or Qt.
+- [Remaining work](docs/REMAINING_WORK.md): validation and the older plugin's retirement checklist.
 
-After downloading, select that `yolov8n.pt` file in the Model field and continue with the correction/retrain loop.
-
-![Loading a model](assets/Loading_model.png)
-
-## Assumptions
-
-- Input image is already RGB 8-bit (or compatible with clipping/conversion).
-- Single class (`0: LABEL`) for now.
-- Exactly one image layer should be present when using `Add correction`.
-
-![Predicting label](assets/Predicting_label.png)
-
-## Folder behavior
-
-Given a model path like:
-
-`.../my_model/best.pt`
-
-The plugin uses `.../my_model` as root.
-
-### Add correction
-
-Each click saves:
-
-- Image to `my_model/corrections/<image_name>_<timestamp>.png`
-- Labels to `my_model/corrections/<image_name>_<timestamp>.txt`
-- Training config to `my_model/corrections/training_config.json` (created/updated)
-
-Image layer behavior:
-
-- If no image layer exists, `Add correction` shows an error.
-- If more than one image layer exists, `Add correction` shows an error.
-- If exactly one image layer exists, that image layer is used for saving correction image data.
-
-`training_config.json` defaults:
-
-- `image_size`: prefilled from the current image size using `max(height, width)`
-- `batch`: `8`
-- `epochs`: `100`
-- `patience`: `30`
-
-You can edit this file before clicking `Retrain`.
-
-Label format is YOLO detection:
-
-`class x_center y_center width height`
-
-normalized to `[0, 1]`.
-
-### Retrain
-
-Each click creates:
-
-- `<retrain_root>/dataset/`
-  - `images/train`, `images/val`
-  - `labels/train`, `labels/val`
-  - `dataset.yaml`
-- Trains YOLO from those corrections
-- Copies best model to:
-  - `<retrain_root>/best.pt`
-- Deletes training traces folder after extracting `best.pt`
-
-`<retrain_root>` resolution:
-
-- If destination field is set, retraining outputs there.
-- Otherwise it defaults to `my_model/retrained_<timestamp>`.
-
-So the retrained folder keeps a clean dataset + final model, without run artifacts.
-
-Warning: Data labeled will be equally divided between traning and validation (50%).
-
-## Roadmap
-
-- Napari image -> RGB translation -> v0.1.0
-- Better train/test split -> maybe use something similar to sklearn.model_selection? -> v0.1.5
-- Multiple classes (by color identification) -> v1
-    - in case of multiple classes, generate the color -> class -> name translation
-    - in both direction, training and prediction
-- Extend from object detection to also include instance segmentation -> v1.5
-- Add support for other 'classical' model such as StarDist -> v2
+This project is released under the [MIT license](LICENSE).
