@@ -125,7 +125,7 @@ The optional **Show segmentation core grid** control adds a cyan debug Shapes la
 
 ## Large-image bbox prediction and merging
 
-Inference always uses the same converted RGB `uint8` pixels shown by **Preview RGB Conversion** and stored for training. Images are covered by deterministic square tiles (1024 pixels and 20% overlap by default). Images smaller than a tile are reflection-padded for inference; detections centered in padding are discarded.
+Inference always uses the same converted RGB `uint8` pixels shown by **Preview RGB Conversion** and stored for training. Images are covered by deterministic square tiles. The tile size defaults to the selected training patch size (512 or 1024 pixels), with 20% overlap; changing the inference tile size manually overrides this default. Images smaller than a tile are reflection-padded for inference; detections centered in padding are discarded.
 
 Tile-local detections are clipped to valid pixels and translated directly into full-image coordinates. Overlap ownership regions identify which tile should represent a seam object, then a separate class-aware global NMS removes duplicates. **Model IoU** controls suppression inside each YOLO tile; **Merge IoU** controls suppression across tiles. Different classes never suppress one another.
 

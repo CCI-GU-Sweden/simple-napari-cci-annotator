@@ -167,6 +167,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._updating_processing_controls = False
         self._updating_class_controls = False
         self._updating_patch_controls = False
+        self._inference_tile_follows_patch = True
+        self._setting_inference_tile_default = False
         self._last_normalization_method: str | None = None
         self._model: YoloDetectionModel | YoloSegmentationModel | None = None
         self._inference_worker: InferenceWorker | SegmentationWorker | None = None
@@ -432,8 +434,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._tile_size_spin.setRange(64, 8192)
         self._tile_size_spin.setSingleStep(64)
         self._tile_size_spin.setValue(1024)
+        self._tile_size_spin.valueChanged.connect(self._on_inference_tile_size_changed)
         self._tile_size_spin.setToolTip(
-            "Square prediction tile size in pixels. Larger tiles use more memory."
+            "Square prediction tile size in pixels. Defaults to the selected "
+            "training patch size; changing it here overrides that default. "
+            "Larger tiles use more memory."
         )
         self._overlap_percent_spin = QDoubleSpinBox()
         self._overlap_percent_spin.setRange(0.0, 90.0)
@@ -1075,6 +1080,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_project_status()
         self._update_class_counts()
         self._apply_project_processing_settings()
+        self._inference_tile_follows_patch = True
         self._apply_project_patch_settings()
         self._refresh_annotation_browser()
         self._update_action_state()
@@ -2875,6 +2881,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return int(self._project.config.training_patch["size"])
         return 1024
 
+    def _on_inference_tile_size_changed(self, value: int) -> None:
+        del value
+        if not self._setting_inference_tile_default:
+            self._inference_tile_follows_patch = False
+
+    def _sync_inference_tile_default(self) -> None:
+        if not self._inference_tile_follows_patch:
+            return
+        self._setting_inference_tile_default = True
+        try:
+            self._tile_size_spin.setValue(self._training_patch_size())
+        finally:
+            self._setting_inference_tile_default = False
+
     def _apply_project_patch_settings(self) -> None:
         if self._project is None:
             return
@@ -2888,6 +2908,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._training_tile_size_spin.setValue(size)
         finally:
             self._updating_patch_controls = False
+        self._sync_inference_tile_default()
         if contract.get("locked"):
             self._patch_contract_label.setText(
                 f"Project contract: {size}×{size}, padding value "
@@ -2905,6 +2926,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         size = self._training_patch_size()
         self._training_tile_size_spin.setValue(size)
+        self._sync_inference_tile_default()
         padding_value = (
             self._project.config.training_patch["padding_value"]
             if self._project is not None

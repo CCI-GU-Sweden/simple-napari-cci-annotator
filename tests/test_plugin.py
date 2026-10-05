@@ -1259,6 +1259,27 @@ def test_widget_starts_with_disabled_model_controls(qtbot):
     assert not widget._save_annotation_button.isEnabled()
 
 
+def test_inference_tile_default_follows_training_patch_until_overridden(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project")
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+
+    assert widget._inference_settings().tile_size == 1024
+    widget._patch_size_combo.setCurrentIndex(widget._patch_size_combo.findData(512))
+    assert widget._inference_settings().tile_size == 512
+    assert widget._training_tile_size_spin.value() == 512
+
+    widget._tile_size_spin.setValue(768)
+    widget._patch_size_combo.setCurrentIndex(widget._patch_size_combo.findData(1024))
+    assert widget._inference_settings().tile_size == 768
+
+    project.lock_training_patch(512, padding_value=114)
+    widget._set_project(ProjectStore.load(project.paths.root))
+    assert widget._training_patch_size() == 512
+    assert widget._inference_settings().tile_size == 512
+
+
 def test_parameter_controls_have_tooltips(qtbot):
     widget = SimpleCciAnnotatorQWidget(_Viewer())
     qtbot.addWidget(widget)
