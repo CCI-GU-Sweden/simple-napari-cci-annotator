@@ -1,2 +1,0 @@
-[napari.manifest]
-simple-napari-cci-annotator = simple_napari_cci_annotator:napari.yaml
