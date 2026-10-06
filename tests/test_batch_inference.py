@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 import tifffile
+from PIL import Image
 
 from simple_napari_cci_annotator._batch_inference import (
     BatchInferenceError,
@@ -64,17 +65,17 @@ def _settings(source, output=None):
     )
 
 
-def test_batch_requires_locked_project_and_tiff_inputs(tmp_path):
+def test_batch_requires_locked_project_and_supported_inputs(tmp_path):
     project, processing = _project(tmp_path)
     source = tmp_path / "input"
     source.mkdir()
-    (source / "ignored.png").write_bytes(b"not a tiff")
+    (source / "ignored.jpg").write_bytes(b"not a supported input")
     model = _DetectionModel(tmp_path / "model.pt")
     processor = TiffBatchProcessor(project, model, _settings(source))
     with pytest.raises(BatchInferenceError, match="Lock project"):
         processor.validate()
     project.lock_image_processing(processing.to_mapping())
-    with pytest.raises(BatchInferenceError, match="no TIFF"):
+    with pytest.raises(BatchInferenceError, match="no TIFF, PNG, or BMP"):
         processor.validate()
     tifffile.imwrite(source / "A.TIFF", np.arange(64 * 64, dtype=np.uint16).reshape(64, 64))
     tifffile.imwrite(source / "b.ome.tiff", np.zeros((64, 64), dtype=np.uint16))
@@ -88,7 +89,7 @@ def test_batch_detects_all_ome_planes_and_writes_manifest(tmp_path):
     source.mkdir()
     data = np.arange(2 * 64 * 64, dtype=np.uint16).reshape(2, 64, 64)
     tifffile.imwrite(source / "volume.ome.tiff", data, ome=True, metadata={"axes": "ZYX"})
-    (source / "ignored.png").write_bytes(b"ignored")
+    (source / "ignored.jpg").write_bytes(b"ignored")
     model = _DetectionModel(tmp_path / "model.pt")
     result = TiffBatchProcessor(project, model, _settings(source)).run()
 
@@ -211,3 +212,51 @@ def test_batch_direct_segmentation_clears_border_instances(tmp_path):
     assert set(np.unique(mask)) == {0, 2}
     details = json.loads((result.run_root / plane["output"]["metadata"]).read_text())
     assert details["prediction"]["tiling"]["cleared_border_ids"] == [1]
+
+
+def test_batch_processes_png_bmp_and_tiff_with_one_manifest(tmp_path):
+    project, processing = _project(tmp_path)
+    project.lock_image_processing(processing.to_mapping())
+    source = tmp_path / "input"
+    source.mkdir()
+    pixels = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    Image.fromarray(pixels).save(source / "field.png")
+    Image.fromarray((pixels % 256).astype(np.uint8)).save(source / "field.bmp")
+    tifffile.imwrite(source / "field.tif", pixels)
+    model = _DetectionModel(tmp_path / "model.pt")
+
+    assert [path.name for path in find_tiff_inputs(source)] == [
+        "field.bmp", "field.png", "field.tif"
+    ]
+    result = TiffBatchProcessor(project, model, _settings(source)).run()
+
+    assert (result.completed, result.failed, result.processed_planes) == (3, 0, 3)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    ids = [entry["planes"][0]["sample_id"] for entry in metadata["files"]]
+    assert len(set(ids)) == 3
+    for entry in metadata["files"]:
+        plane = entry["planes"][0]
+        assert plane["shape"] == [64, 64, 3]
+        assert (result.run_root / plane["output"]["image"]).is_file()
+
+
+@pytest.mark.parametrize("channels", [3, 4])
+def test_batch_color_png_uses_locked_channel_axis(tmp_path, channels):
+    project, _ = _project(tmp_path)
+    processing = ImageProcessingSettings(2, 0, 1, 2, "min_max")
+    project.lock_image_processing(processing.to_mapping())
+    source = tmp_path / "input"
+    source.mkdir()
+    rgb = np.zeros((64, 64, channels), dtype=np.uint8)
+    rgb[..., 0] = np.arange(64, dtype=np.uint8)[:, None]
+    rgb[..., 1] = np.arange(64, dtype=np.uint8)[None, :]
+    Image.fromarray(rgb).save(source / "rgb.png")
+    model = _DetectionModel(tmp_path / "model.pt")
+
+    result = TiffBatchProcessor(project, model, _settings(source)).run()
+
+    assert (result.completed, result.failed, result.processed_planes) == (1, 0, 1)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    plane = metadata["files"][0]["planes"][0]
+    assert plane["plane_indices"] == {}
+    assert plane["shape"] == [64, 64, 3]

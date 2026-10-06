@@ -1,10 +1,11 @@
-"""Sequential TIFF batch prediction with reproducible run metadata."""
+"""Sequential lossless-image batch prediction with reproducible run metadata."""
 
 from __future__ import annotations
 
 import hashlib
 import itertools
 import os
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 import numpy as np
 import tifffile
+from skimage.io import imread
 
 from ._annotation_io import AnnotationIO
 from ._image_adapter import ImageAdapter, ImageProcessingSettings
@@ -32,6 +34,19 @@ from ._version import __version__
 
 class BatchInferenceError(RuntimeError):
     """Raised when a batch cannot be started."""
+
+
+BATCH_IMAGE_SUFFIXES = frozenset({".tif", ".tiff", ".png", ".bmp"})
+TIFF_SUFFIXES = frozenset({".tif", ".tiff"})
+
+
+@dataclass(frozen=True)
+class _RasterSeries:
+    data: np.ndarray
+    axes: str
+
+    def asarray(self) -> np.ndarray:
+        return self.data
 
 
 @dataclass(frozen=True)
@@ -53,8 +68,8 @@ class BatchInferenceRun:
     processed_planes: int
 
 
-def find_tiff_inputs(folder: Path) -> tuple[Path, ...]:
-    """List only top-level TIFF files, including OME-TIFF variants."""
+def find_batch_inputs(folder: Path) -> tuple[Path, ...]:
+    """List top-level TIFF, PNG, and BMP files."""
     root = Path(folder).expanduser().resolve()
     if not root.is_dir():
         raise BatchInferenceError(f"Input folder does not exist: {root}")
@@ -63,18 +78,22 @@ def find_tiff_inputs(folder: Path) -> tuple[Path, ...]:
             (
                 path
                 for path in root.iterdir()
-                if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
+                if path.is_file() and path.suffix.lower() in BATCH_IMAGE_SUFFIXES
             ),
             key=lambda path: path.name.lower(),
         )
     )
     if not files:
-        raise BatchInferenceError("The input folder has no TIFF or OME-TIFF files.")
+        raise BatchInferenceError("The input folder has no TIFF, PNG, or BMP files.")
     return files
 
 
+# Keep the older helper name available to callers that imported it directly.
+find_tiff_inputs = find_batch_inputs
+
+
 class TiffBatchProcessor:
-    """Run the locked project conversion and one selected model on every TIFF."""
+    """Run the locked project conversion and one selected model on every image."""
 
     def __init__(self, project: ProjectStore, model, settings: BatchInferenceSettings):
         self.project = project
@@ -112,22 +131,22 @@ class TiffBatchProcessor:
                 "Choose a batch output folder outside project annotations."
             )
         if self.settings.source_files is None:
-            return find_tiff_inputs(self.settings.input_folder)
+            return find_batch_inputs(self.settings.input_folder)
         input_root = Path(self.settings.input_folder).expanduser().resolve()
         files = tuple(Path(path).expanduser().resolve() for path in self.settings.source_files)
         if not input_root.is_dir() or not files:
-            raise BatchInferenceError("Choose an existing folder with TIFF files.")
+            raise BatchInferenceError("Choose an existing folder with supported images.")
         if any(
             not path.is_file()
             or path.parent != input_root
-            or path.suffix.lower() not in {".tif", ".tiff"}
+            or path.suffix.lower() not in BATCH_IMAGE_SUFFIXES
             for path in files
         ):
             raise BatchInferenceError(
-                "Selected inputs must be TIFF files directly inside the input folder."
+                "Selected inputs must be TIFF, PNG, or BMP files directly inside the input folder."
             )
         if len(set(files)) != len(files):
-            raise BatchInferenceError("Selected TIFF inputs contain duplicates.")
+            raise BatchInferenceError("Selected batch inputs contain duplicates.")
         return files
 
     def run(
@@ -246,17 +265,30 @@ class TiffBatchProcessor:
         progress: Callable[[int, int, str], None] | None,
         cancelled: Callable[[], bool] | None,
     ) -> None:
-        with tifffile.TiffFile(path) as tiff:
-            if not tiff.series:
-                raise BatchInferenceError("TIFF file contains no image series.")
-            for series_index, series in enumerate(tiff.series):
+        with ExitStack() as stack:
+            if path.suffix.lower() in TIFF_SUFFIXES:
+                series_list = stack.enter_context(tifffile.TiffFile(path)).series
+                if not series_list:
+                    raise BatchInferenceError("TIFF file contains no image series.")
+            else:
+                data = np.asarray(imread(path, as_gray=False))
+                if data.ndim == 2:
+                    axes = "YX"
+                elif data.ndim == 3 and data.shape[-1] in {3, 4}:
+                    axes = "YXC"
+                else:
+                    raise BatchInferenceError(
+                        "PNG and BMP images must be grayscale, RGB, or RGBA."
+                    )
+                series_list = (_RasterSeries(data, axes),)
+            for series_index, series in enumerate(series_list):
                 if cancelled is not None and cancelled():
                     raise InferenceCancelled("Batch cancelled by the user.")
                 data = series.asarray()
                 axes = str(series.axes)
                 if len(axes) != data.ndim:
                     raise BatchInferenceError(
-                        f"TIFF axes {axes!r} do not match shape {data.shape}."
+                        f"Image axes {axes!r} do not match shape {data.shape}."
                     )
                 processing.validate(data.shape)
                 channel_axes = [
@@ -265,7 +297,7 @@ class TiffBatchProcessor:
                 if channel_axes and processing.channel_axis not in channel_axes:
                     raise BatchInferenceError(
                         f"Project channel axis {processing.channel_axis} does not "
-                        f"match TIFF axes {axes!r}."
+                        f"match image axes {axes!r}."
                     )
                 layer = SimpleNamespace(
                     data=data,
@@ -286,7 +318,7 @@ class TiffBatchProcessor:
                 )
                 series_stem = (
                     f"{stem}__s{series_index:03d}"
-                    if len(tiff.series) > 1
+                    if len(series_list) > 1
                     else stem
                 )
                 for indices in plane_indices:

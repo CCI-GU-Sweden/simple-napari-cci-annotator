@@ -738,7 +738,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
 
         self._batch_input_input = QLineEdit()
-        self._batch_input_input.setPlaceholderText("Folder containing TIFF images")
+        self._batch_input_input.setPlaceholderText("Folder containing TIFF, PNG, or BMP images")
         self._batch_input_input.textChanged.connect(self._on_batch_input_changed)
         self._batch_input_button = QPushButton("Choose Input Folder")
         self._batch_input_button.clicked.connect(self._on_choose_batch_input)
@@ -753,7 +753,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Per-image inversion is not locked in the project. This applies the "
             "same inversion choice to every batch plane and records it in metadata."
         )
-        self._batch_start_button = QPushButton("Predict All TIFF Images")
+        self._batch_start_button = QPushButton("Predict All Images")
         self._batch_start_button.clicked.connect(self._on_start_batch)
         self._batch_cancel_button = QPushButton("Cancel Batch")
         self._batch_cancel_button.clicked.connect(self._on_cancel_batch)
@@ -783,7 +783,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         batch_layout.addWidget(self._batch_progress)
         batch_layout.addWidget(self._batch_status_label)
         self._batch_section = CollapsibleSection(
-            "Batch TIFF prediction", batch_layout, expanded=False
+            "Batch image prediction", batch_layout, expanded=False
         )
 
         crop_form = QFormLayout()
@@ -3979,7 +3979,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         start = self._batch_input_input.text().strip()
         chosen = QFileDialog.getExistingDirectory(
             self,
-            "Choose TIFF input folder",
+            "Choose image input folder",
             start or str(self._project.paths.root if self._project else Path.home()),
         )
         if chosen:
@@ -4006,7 +4006,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         input_text = self._batch_input_input.text().strip()
         if not input_text:
-            self._show_error("Choose a TIFF input folder first.")
+            self._show_error("Choose an image input folder first.")
             return
         input_folder = Path(input_text)
         output_text = self._batch_output_input.text().strip()
@@ -4035,7 +4035,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._batch_progress.setRange(0, total)
         self._batch_progress.setValue(0)
         self._batch_status_label.setText(
-            f"Batch: starting {total} TIFF file(s) · output {output_parent}"
+            f"Batch: starting {total} image file(s) · output {output_parent}"
         )
         self._update_action_state()
         worker.start()

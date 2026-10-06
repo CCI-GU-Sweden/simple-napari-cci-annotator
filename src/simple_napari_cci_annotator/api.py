@@ -1,4 +1,4 @@
-"""Headless project, training, and TIFF prediction pipeline.
+"""Headless project, training, and lossless-image prediction pipeline.
 
 This module does not import napari or Qt. It uses the same project contracts,
 model adapters, tiling engines, and output writer as the plugin.
@@ -93,7 +93,7 @@ class ProjectPipeline:
         progress: Callable[[int, int, str], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> BatchInferenceRun:
-        """Predict one TIFF file, including every nonspatial plane and series."""
+        """Predict one TIFF, PNG, or BMP file."""
         path = Path(image_path).expanduser().resolve()
         return self._predict(
             path.parent,
@@ -119,7 +119,7 @@ class ProjectPipeline:
         progress: Callable[[int, int, str], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> BatchInferenceRun:
-        """Predict every top-level TIFF file in a folder."""
+        """Predict every top-level TIFF, PNG, and BMP file in a folder."""
         return self._predict(
             Path(input_folder).expanduser().resolve(),
             model,

@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 import tifffile
+from PIL import Image
 
 from simple_napari_cci_annotator.api import ProjectPipeline
 from simple_napari_cci_annotator._dataset_builder import DatasetBuildSettings
@@ -73,3 +74,24 @@ def test_pipeline_train_reports_invalid_dataset_without_starting_model(tmp_path)
     with pytest.raises(TrainingError, match="No valid image/label pairs"):
         pipeline.train(settings)
     assert not (tmp_path / "training").exists()
+
+
+def test_pipeline_predict_one_png(tmp_path):
+    settings = ImageProcessingSettings(None, None, None, None, "min_max")
+    pipeline = ProjectPipeline.create(
+        tmp_path / "project", image_processing=settings
+    )
+    source = tmp_path / "input"
+    source.mkdir()
+    Image.fromarray(np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)).save(
+        source / "field.png"
+    )
+    model = FakeModel(tmp_path / "model.pt")
+
+    result = pipeline.predict_one(
+        source / "field.png", model, inference=InferenceSettings(tile_size=64, overlap=8)
+    )
+
+    assert (result.completed, result.failed, result.processed_planes) == (1, 0, 1)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    assert metadata["files"][0]["source"] == "field.png"

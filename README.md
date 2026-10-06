@@ -13,7 +13,7 @@ In napari, open **Plugins → CCI Annotator → Simple CCI Annotator Plugin**.
 
 ## What it does
 
-The plugin helps you run YOLO detection or instance segmentation on microscopy images, correct predictions, and save training annotations. It also supports tiled inference on large images, batch prediction of TIFF folders, and retraining from saved annotations.
+The plugin helps you run YOLO detection or instance segmentation on microscopy images, correct predictions, and save training annotations. It also supports tiled inference on large images, batch prediction of image folders, and retraining from saved annotations.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ The plugin helps you run YOLO detection or instance segmentation on microscopy i
 2. Open an image in napari. Set the channel mapping, optional filter, and normalization, then use **Preview RGB Conversion** to check the pixels used for prediction and training.
 3. Select a compatible YOLO model and click **Predict Current RGB Plane**. Edit the resulting boxes or instance mask as needed.
 4. To save training data, select a 512×512 or 1024×1024 training crop, correct it, and click **Add Crop + Corrections**. The first saved annotation locks the project's image conversion and training patch size.
-5. Use **Save Current Output** to export a full-size prediction without adding it to the training annotations. For a whole folder, use **Batch TIFF prediction** after the project settings are locked.
+5. Use **Save Current Output** to export a full-size prediction without adding it to the training annotations. For a whole folder, use **Batch image prediction** after the project settings are locked.
 
 Inference tiles default to the selected training crop size. You can set another tile size in the prediction controls.
 
@@ -29,7 +29,7 @@ Inference tiles default to the selected training crop size. You can set another 
 
 Training annotations are stored in the project folder. Detection annotations use YOLO `.txt` labels; segmentation annotations use instance-mask TIFF files and JSON metadata.
 
-Batch prediction accepts `.tif`, `.tiff`, `.ome.tif`, and `.ome.tiff` files directly inside the selected input folder. It processes every nonspatial plane. Results go to `<input folder>/Prediction/` by default, or to an output folder you choose. Each run includes `analysis_metadata.json` with the settings and file records needed to trace its results.
+Batch prediction accepts `.tif`, `.tiff`, `.ome.tif`, `.ome.tiff`, `.png`, and `.bmp` files directly inside the selected input folder. It processes every nonspatial TIFF plane and each PNG or BMP image. Grayscale, RGB, and RGBA PNG/BMP files are supported when their channel layout matches the project's locked settings. Results go to `<input folder>/Prediction/` by default, or to an output folder you choose. Each run includes `analysis_metadata.json` with the settings and file records needed to trace its results.
 
 ## More guidance
 

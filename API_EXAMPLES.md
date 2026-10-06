@@ -26,7 +26,7 @@ pipeline = ProjectPipeline.open("project")
 
 This channel mapping is for grayscale TIFFs. For multichannel images, set `channel_axis` and the RGB source-channel indices to match your files. Project conversion settings must be locked before prediction; `create(..., image_processing=...)` does that. An existing project can call `pipeline.lock_image_processing(settings)`.
 
-## Predict one TIFF or a folder
+## Predict one image or a folder
 
 ```python
 from simple_napari_cci_annotator import InferenceSettings
@@ -40,7 +40,7 @@ print(one.status, one.run_root)
 print(batch.completed, batch.failed, batch.run_root)
 ```
 
-`predict_one` processes every nonspatial plane and series in one TIFF. `predict_batch` processes all top-level TIFF files in a folder. The default output parent is `input/Prediction`; pass `output_folder="results"` to change it. Each run writes `analysis_metadata.json` alongside detection or segmentation results. The methods also accept `progress(current, total, message)` and `cancelled()` callbacks.
+`predict_one` accepts TIFF, PNG, or BMP. It processes every nonspatial plane and series in a TIFF, or the single image in a PNG/BMP. `predict_batch` processes all top-level TIFF, PNG, and BMP files in a folder. Grayscale, RGB, and RGBA PNG/BMP files must match the project's locked channel settings. The default output parent is `input/Prediction`; pass `output_folder="results"` to change it. Each run writes `analysis_metadata.json` alongside detection or segmentation results. The methods also accept `progress(current, total, message)` and `cancelled()` callbacks.
 
 For a segmentation project, use `yolo26n-seg.pt` or another compatible segmentation model instead.
 

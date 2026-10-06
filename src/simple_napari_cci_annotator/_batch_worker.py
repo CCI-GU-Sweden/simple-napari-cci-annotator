@@ -1,4 +1,4 @@
-"""Qt worker for sequential TIFF batch prediction."""
+"""Qt worker for sequential batch image prediction."""
 
 from __future__ import annotations
 
