@@ -252,6 +252,7 @@ class SegmentationIO:
             operation=operation,
         )
 
+
     def entries(self) -> tuple[SegmentationReviewEntry, ...]:
         image_by_stem = {
             path.stem: path
@@ -304,6 +305,7 @@ class SegmentationIO:
             )
         return tuple(entries)
 
+
     def _append_audit(self, event: dict[str, Any]) -> None:
         payload = (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
@@ -315,6 +317,50 @@ class SegmentationIO:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+def prepare_imported_mask(
+    mask: np.ndarray,
+    image_shape: Sequence[int],
+    classes: Mapping[int, str],
+    class_id: int,
+) -> tuple[np.ndarray, dict[int, InstanceRecord]]:
+    """Turn an external label map into editable pixels and class records."""
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise SegmentationError("The imported mask must be two-dimensional.")
+    expected = tuple(int(size) for size in image_shape[:2])
+    if array.shape != expected:
+        raise SegmentationError(
+            f"Mask shape {array.shape} does not match image shape {expected}."
+        )
+    if not (np.issubdtype(array.dtype, np.integer) or array.dtype == np.bool_):
+        raise SegmentationError("The imported mask must contain integer IDs.")
+    if np.any(array < 0):
+        raise SegmentationError("The imported mask cannot contain negative IDs.")
+    if np.any(array > np.iinfo(np.uint32).max):
+        raise SegmentationError("Instance IDs exceed uint32 storage capacity.")
+    if class_id not in classes:
+        raise SegmentationError(f"Unknown class ID {class_id}.")
+
+    imported = np.asarray(array, dtype=np.uint32).copy()
+    ids = [int(value) for value in np.unique(imported) if value]
+    if ids == [255]:
+        imported[imported == 255] = 1
+        ids = [1]
+    records = refresh_instance_records(
+        imported,
+        {
+            instance_id: {
+                "class_id": class_id,
+                "source": "import",
+                "status": "imported",
+            }
+            for instance_id in ids
+        },
+        classes,
+    )
+    return imported, records
 
 
 def refresh_instance_records(

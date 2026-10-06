@@ -26,6 +26,7 @@ from simple_napari_cci_annotator._segmentation_io import (
     InstanceRecord,
     SegmentationError,
     SegmentationIO,
+    prepare_imported_mask,
 )
 from simple_napari_cci_annotator._segmentation_crop import (
     crop_instance_mask,
@@ -69,6 +70,41 @@ def _record(instance_id: int, class_id: int = 0) -> InstanceRecord:
         bbox=(0, 0, 0, 0),
         area=0,
     )
+
+
+def test_imported_mask_preserves_instance_ids_and_normalizes_binary_255():
+    binary = np.zeros((8, 8), dtype=np.uint8)
+    binary[1:3, 1:3] = 255
+    binary[5:7, 5:7] = 255
+    imported, records = prepare_imported_mask(
+        binary, (8, 8), {0: "Cell", 1: "Debris"}, 1
+    )
+    assert set(np.unique(imported)) == {0, 1}
+    assert disconnected_instance_ids(imported) == (1,)
+    assert binary[1, 1] == 255  # The selected source layer stays unchanged.
+    assert records[1].class_id == 1
+    assert records[1].source == "import"
+
+    instances = np.zeros((8, 8), dtype=np.uint16)
+    instances[1:3, 1:3] = 3
+    instances[5:7, 5:7] = 9
+    imported, records = prepare_imported_mask(instances, (8, 8), {0: "Cell"}, 0)
+    assert set(np.unique(imported)) == {0, 3, 9}
+    assert set(records) == {3, 9}
+
+
+@pytest.mark.parametrize(
+    "mask, message",
+    [
+        (np.zeros((4, 4), dtype=float), "integer IDs"),
+        (np.full((4, 4), -1, dtype=np.int16), "negative IDs"),
+        (np.zeros((4, 4, 3), dtype=np.uint8), "two-dimensional"),
+        (np.zeros((3, 4), dtype=np.uint8), "does not match image shape"),
+    ],
+)
+def test_imported_mask_rejects_invalid_data(mask, message):
+    with pytest.raises(SegmentationError, match=message):
+        prepare_imported_mask(mask, (4, 4), {0: "Cell"}, 0)
 
 
 def test_remove_small_instances_uses_strict_five_pixel_threshold():

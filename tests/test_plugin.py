@@ -1668,6 +1668,54 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     assert widget._segment_instances[instance_id].class_id == 0
 
 
+def test_widget_imports_selected_labels_without_splitting(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "segment-import", task="segment", classes={0: "Cell", 1: "Debris"}
+    )
+    viewer = _Viewer()
+    image = _Image(
+        np.zeros((1024, 1024, 3), dtype=np.uint8),
+        name="field",
+        path=tmp_path / "field.tif",
+    )
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._resolve_unsaved_segmentation = lambda: True
+    widget._set_project(project)
+    target = widget._segmentation_layer()
+
+    external_mask = np.zeros((1024, 1024), dtype=np.uint8)
+    external_mask[10:20, 10:20] = 255
+    external_mask[30:40, 30:40] = 255
+    external = viewer.add_labels(external_mask, name="external_mask")
+    viewer.layers.selection.active = external
+    widget._class_combo.setCurrentIndex(widget._class_combo.findData(1))
+    widget._update_action_state()
+    assert widget._import_mask_button.isEnabled()
+
+    with patch.object(widget, "_show_error") as show_error:
+        widget._on_import_active_mask()
+    show_error.assert_not_called()
+
+    assert set(np.unique(target.data)) == {0, 1}
+    assert set(np.unique(external.data)) == {0, 255}
+    assert widget._segment_instances[1].class_id == 1
+    assert widget._segment_instances[1].source == "import"
+    assert "disconnected instance IDs" in widget._label_status_label.text()
+    assert not widget._save_annotation_button.isEnabled()
+
+    widget._on_split_mask_instance()
+    assert set(widget._segment_instances) == {1, 2}
+    assert all(record.class_id == 1 for record in widget._segment_instances.values())
+    assert not widget._segmentation_errors
+    with patch.object(widget, "_show_info"):
+        widget._on_save_annotation()
+    assert (project.paths.masks / "field.tif").is_file()
+    assert (project.paths.instances / "field.json").is_file()
+
+
 def test_widget_removes_tiny_instances_and_collapses_empty_ids(tmp_path, qtbot):
     project = ProjectStore.initialize(
         tmp_path / "segment-cleanup", task="segment", classes={0: "Cell"}

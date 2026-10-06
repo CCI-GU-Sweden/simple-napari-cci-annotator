@@ -18,6 +18,8 @@ The plugin uses napari's current Z/T position for single-plane prediction. Chang
 3. For detection, edit the `yolo_bboxes` Shapes layer and choose a class for new boxes. For segmentation, edit the `yolo_instances` Labels layer and use the instance controls to assign classes or correct IDs.
 4. Choose **Save Current Output** to export the full-size converted image and its edited result. This export does not add an annotation to the training pool.
 
+To bring in an existing TIFF instance mask, open it in napari as a Labels layer (or open it as an Image layer and use **Convert to Labels**). Keep the matching source image open and select its plane. Select the external Labels layer, choose the class for its instances, then click **Import Selected Labels Layer**. The plugin copies the mask into `yolo_instances` and leaves the external layer untouched. Zero is background; nonzero values identify instances. A binary foreground value of 255 becomes ID 1. Disconnected regions sharing one ID stay together on import; use **Split Disconnected Instance** if needed before saving for training. The mask must match the image plane pixel-for-pixel.
+
 The inference tile size follows the chosen training patch size (512 or 1024 pixels) until you change the inference tile control manually.
 
 ## Save training annotations
@@ -30,7 +32,7 @@ The first saved annotation locks the training patch size and image conversion fo
 
 ## Predict a folder
 
-After saving an annotation and locking the project settings, expand **Batch TIFF prediction**. Choose an input folder, select the model, and click **Start Batch**. The plugin processes every top-level TIFF/OME-TIFF file and every nonspatial plane in each file. It uses the locked project conversion settings. An unreadable or incompatible file is recorded as failed while the batch continues.
+After saving an annotation and locking the project settings, expand **Batch image prediction**. Choose an input folder, select the model, and click **Predict All Images**. The plugin processes every top-level TIFF/OME-TIFF, PNG, and BMP file, including every nonspatial plane in each TIFF. It uses the locked project conversion settings. An unreadable or incompatible file is recorded as failed while the batch continues.
 
 The default output parent is `Prediction` inside the input folder; you can choose another. Each run has its own folder containing the prediction files and `analysis_metadata.json`. Use **Cancel Batch** to stop after the current cancellable operation; completed outputs remain available.
 

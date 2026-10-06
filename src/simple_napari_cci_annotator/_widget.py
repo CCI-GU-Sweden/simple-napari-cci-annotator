@@ -67,6 +67,7 @@ from ._segmentation_io import (
     SegmentationError,
     SegmentationIO,
     SegmentationReviewEntry,
+    prepare_imported_mask,
     refresh_instance_records,
 )
 from ._segmentation_crop import crop_instance_mask, mask_ids_in_padding
@@ -322,6 +323,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Allocate a new instance ID, select it, and enter napari paint mode."
         )
         self._new_instance_button.clicked.connect(self._on_new_mask_instance)
+        self._import_mask_button = QPushButton("Import Selected Labels Layer")
+        self._import_mask_button.setToolTip(
+            "Copy the active Labels layer into the current image's editable mask. "
+            "Each nonzero ID becomes an instance in the selected class; "
+            "disconnected IDs are not split automatically."
+        )
+        self._import_mask_button.clicked.connect(self._on_import_active_mask)
         self._delete_instance_button = QPushButton("Delete Selected Instance")
         self._delete_instance_button.setToolTip(
             "Clear every pixel belonging to the selected instance ID."
@@ -672,6 +680,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         mask_buttons.addWidget(self._new_instance_button)
         mask_buttons.addWidget(self._delete_instance_button)
         annotation_layout.addLayout(mask_buttons)
+        annotation_layout.addWidget(self._import_mask_button)
         mask_cleanup_buttons = QHBoxLayout()
         mask_cleanup_buttons.addWidget(self._split_instance_button)
         mask_cleanup_buttons.addWidget(self._merge_instance_button)
@@ -1726,6 +1735,63 @@ class SimpleCciAnnotatorQWidget(QWidget):
         )
         self._on_selected_instance_changed()
 
+    def _on_import_active_mask(self) -> None:
+        source = self._active_layer()
+        target = self._segmentation_layer()
+        image_layer = self._image_for_annotation()
+        class_id = self._current_class_id()
+        if self._project is None or self._project.config.task != "segment":
+            self._show_error("Open a segmentation project first.")
+            return
+        if self._crop_bounds is not None:
+            self._show_error("Return to the source image before importing a mask.")
+            return
+        if not self._is_labels_layer(source) or source is target:
+            self._show_error("Select an external Labels layer to import.")
+            return
+        if image_layer is None or target is None or class_id is None:
+            self._show_error("Select the matching source image before importing a mask.")
+            return
+        try:
+            converted = self._convert_current_image(image_layer)
+            mask, records = prepare_imported_mask(
+                source.data,
+                converted.data.shape[:2],
+                self._project.config.classes,
+                class_id,
+            )
+        except (ImageConversionError, SegmentationError, ValueError, OSError) as exc:
+            self._show_error(f"Could not import instance mask:\n{exc}")
+            return
+        if not self._resolve_unsaved_changes():
+            return
+
+        self._annotation_image_layer = image_layer
+        self._converted_image = converted
+        self._current_sample_id = self._image_stem(image_layer)
+        self._segment_instances = records
+        source_path = self._source_path(source)
+        target.metadata["cci_import_source_path"] = (
+            str(source_path) if source_path is not None else None
+        )
+        target.data = mask
+        target.selected_label = next(iter(records), 0)
+        self._annotation_dirty = True
+        self._refresh_segmentation_validation()
+        self._update_class_counts()
+        self._on_selected_instance_changed()
+        if self._segmentation_errors:
+            self._label_status_label.setText(
+                f"Imported {len(records)} instance ID(s); "
+                + " · ".join(self._segmentation_errors)
+            )
+        else:
+            self._label_status_label.setText(
+                f"Imported {len(records)} instance ID(s) into the selected class; "
+                "save the annotation or select a training crop."
+            )
+        self._update_action_state()
+
     def _on_delete_mask_instance(self) -> None:
         layer = self._editable_segmentation_layer()
         instance_id = self._selected_instance_id()
@@ -2095,6 +2161,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "axis_labels": list(converted.plane.axis_labels),
             "normalization_stats": list(converted.normalization_stats),
             "prediction": getattr(labels_layer, "metadata", {}).get("cci_prediction"),
+            "import_source_path": getattr(labels_layer, "metadata", {}).get(
+                "cci_import_source_path"
+            ),
         }
         result = self._segmentation_io.save(
             image_data=converted.data,
@@ -4798,6 +4867,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._cancel_inference_button.setEnabled(inference_running)
         selected_instance = self._selected_instance_id()
         for control in (
+            self._import_mask_button,
             self._new_instance_button,
             self._delete_instance_button,
             self._split_instance_button,
@@ -4808,6 +4878,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
         ):
             control.setVisible(is_segment)
         self._instance_details_label.setVisible(is_segment)
+        active_mask = self._active_layer()
+        self._import_mask_button.setEnabled(
+            is_segment
+            and has_image
+            and has_mask
+            and not has_crop
+            and not running
+            and self._is_labels_layer(active_mask)
+            and active_mask is not self._segmentation_layer()
+        )
         self._new_instance_button.setEnabled(is_segment and has_mask and not running)
         self._remove_small_instances_button.setEnabled(
             is_segment and has_mask and not running
