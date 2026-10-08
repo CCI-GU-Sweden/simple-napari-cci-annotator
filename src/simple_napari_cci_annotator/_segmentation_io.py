@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import find_objects
 import tifffile
 
 from ._annotation_io import IMAGE_EXTENSIONS, AnnotationIO
@@ -45,6 +46,12 @@ class InstanceRecord:
             "area": self.area,
             "lineage": list(self.lineage),
         }
+
+
+@dataclass(frozen=True)
+class LabelStatistic:
+    area: int
+    bbox: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -373,7 +380,7 @@ def refresh_instance_records(
     """Reconcile editable mask IDs with metadata and recompute geometry."""
     array = np.asarray(mask, dtype=np.uint32)
     output: dict[int, InstanceRecord] = {}
-    for instance_id in sorted(int(value) for value in np.unique(array) if value):
+    for instance_id, statistic in label_statistics(array).items():
         raw = instances.get(instance_id, {})
         if isinstance(raw, InstanceRecord):
             class_id = raw.class_id
@@ -411,7 +418,6 @@ def refresh_instance_records(
             raise SegmentationError(
                 f"Instance {instance_id} uses unknown class ID {class_id}."
             )
-        ys, xs = np.where(array == instance_id)
         output[instance_id] = InstanceRecord(
             instance_id=instance_id,
             class_id=class_id,
@@ -419,16 +425,62 @@ def refresh_instance_records(
             confidence=confidence,
             source=source,
             status=status,
-            bbox=(
-                int(ys.min()),
-                int(xs.min()),
-                int(ys.max()) + 1,
-                int(xs.max()) + 1,
-            ),
-            area=int(len(ys)),
+            bbox=statistic.bbox,
+            area=statistic.area,
             lineage=lineage,
         )
     return output
+
+
+def label_statistics(mask: np.ndarray) -> dict[int, LabelStatistic]:
+    """Calculate area and bounding box for every nonzero label together."""
+    array = np.asarray(mask, dtype=np.uint32)
+    if array.ndim != 2:
+        raise SegmentationError(
+            f"Instance masks must be two-dimensional; found {array.ndim}D."
+        )
+    maximum = int(array.max(initial=0))
+    if maximum == 0:
+        return {}
+
+    # Dense lookup is fastest for normal masks. The cap prevents a sparse,
+    # very large external ID from allocating an enormous counts/slices table.
+    dense_limit = min(1_000_000, max(65_536, array.size * 4))
+    if maximum <= dense_limit:
+        counts = np.bincount(array.reshape(-1), minlength=maximum + 1)
+        slices = find_objects(array, max_label=maximum)
+        return {
+            int(instance_id): LabelStatistic(
+                area=int(counts[instance_id]),
+                bbox=_slice_bbox(slices[instance_id - 1]),
+            )
+            for instance_id in np.flatnonzero(counts[1:]) + 1
+        }
+
+    values, inverse, counts = np.unique(
+        array.reshape(-1), return_inverse=True, return_counts=True
+    )
+    source_indices = np.flatnonzero(values)
+    compact_lookup = np.zeros(len(values), dtype=np.uint32)
+    compact_lookup[source_indices] = np.arange(
+        1, len(source_indices) + 1, dtype=np.uint32
+    )
+    compact = compact_lookup[inverse].reshape(array.shape)
+    slices = find_objects(compact, max_label=len(source_indices))
+    return {
+        int(values[source_index]): LabelStatistic(
+            area=int(counts[source_index]),
+            bbox=_slice_bbox(slices[compact_id - 1]),
+        )
+        for compact_id, source_index in enumerate(source_indices, start=1)
+    }
+
+
+def _slice_bbox(region: tuple[slice, slice] | None) -> tuple[int, int, int, int]:
+    if region is None:
+        raise SegmentationError("Could not calculate bounds for a present instance ID.")
+    rows, columns = region
+    return int(rows.start), int(columns.start), int(rows.stop), int(columns.stop)
 
 
 def _records_for_save(mask, instances, classes) -> dict[int, InstanceRecord]:

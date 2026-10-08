@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 from qtpy.QtCore import Qt, QUrl
@@ -26,6 +27,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import _debug
 from ._annotation_io import AnnotationError, AnnotationIO, LabelValidationError
 from ._batch_inference import BatchInferenceError, BatchInferenceSettings
 from ._batch_worker import BatchInferenceWorker
@@ -2023,7 +2025,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         elif np.any(data > np.iinfo(np.uint32).max):
             errors.append("mask IDs exceed uint32 storage capacity")
         else:
+            phase_started = perf_counter()
             present = {int(value) for value in np.unique(data) if value}
+            _debug.print_performance_timing(
+                "segmentation validation", "mask ID scan", phase_started
+            )
             records = self._active_segment_instances()
             known = set(records)
             if present - known:
@@ -2039,7 +2045,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
             if invalid_classes:
                 errors.append(f"instances with invalid classes: {invalid_classes}")
                 invalid_ids.update(invalid_classes)
+            phase_started = perf_counter()
             disconnected = disconnected_instance_ids(data)
+            _debug.print_performance_timing(
+                "segmentation validation",
+                "disconnected-instance scan",
+                phase_started,
+            )
             if disconnected:
                 errors.append(
                     f"disconnected instance IDs {list(disconnected)}; split or explicitly keep largest"
@@ -2053,9 +2065,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     )
                     invalid_ids.update(padding_ids)
             if not errors:
-                self._set_active_segment_instances(refresh_instance_records(
-                    data, records, self._project.config.classes
-                ))
+                phase_started = perf_counter()
+                self._set_active_segment_instances(
+                    refresh_instance_records(data, records, self._project.config.classes)
+                )
+                _debug.print_performance_timing(
+                    "segmentation validation", "instance statistics", phase_started
+                )
         self._segmentation_errors = tuple(errors)
         self._segmentation_invalid_ids = tuple(sorted(invalid_ids))
         if errors:
@@ -2076,7 +2092,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 self._label_status_label.setText(
                     "Instances: unsaved edits. Save before changing image or Z/T plane."
                 )
+        phase_started = perf_counter()
         self._apply_instance_colors(layer)
+        _debug.print_performance_timing(
+            "segmentation validation", "color refresh", phase_started
+        )
 
     def _crop_bbox_layer(self):
         layer = self._get_layer_by_name(self.CROP_BBOX_LAYER_NAME)
@@ -3942,7 +3962,15 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._show_error("No matching editable prediction result is available.")
             return
         if is_segment:
+            self._output_status_label.setText(
+                "Output: validating the editable segmentation mask"
+            )
+            self._output_status_label.repaint()
+            phase_started = perf_counter()
             self._refresh_segmentation_validation()
+            _debug.print_performance_timing(
+                "napari prediction output", "pre-save mask validation", phase_started
+            )
             if self._segmentation_errors:
                 self._show_error(
                     "Correct the instance mask before saving output:\n"
@@ -3990,6 +4018,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
         prediction = layer.metadata.get("cci_prediction")
         try:
             if is_segment:
+                self._output_status_label.setText(
+                    "Output: validating and saving segmentation mask"
+                )
+                self._output_status_label.repaint()
+                phase_started = perf_counter()
                 result = writer.save_segmentation(
                     parent,
                     converted.sample_id,
@@ -4000,6 +4033,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     conversion=conversion,
                     prediction=prediction,
                     overwrite=overwrite,
+                )
+                _debug.print_performance_timing(
+                    "napari prediction output", "save call on GUI thread", phase_started
                 )
             else:
                 count = len(layer.data)
@@ -4263,6 +4299,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _on_segmentation_inference_succeeded(
         self, result: ComposedInstances
     ) -> None:
+        total_started = perf_counter()
+        worker_ready_at = getattr(self._inference_worker, "result_ready_at", None)
+        if worker_ready_at is not None:
+            _debug.print_performance_timing(
+                "napari segmentation import", "worker-to-GUI handoff", worker_ready_at
+            )
+        self._set_segmentation_import_status("checking the inference result")
         image_layer = self._annotation_image_layer
         if image_layer is None or self._inference_sample_id is None:
             self._inference_status_label.setText(
@@ -4274,10 +4317,16 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "Inference: result discarded because the active Z/T plane changed"
             )
             return
+        phase_started = perf_counter()
         existing = self._segmentation_layer()
         if existing is not None:
             self.napari_viewer.layers.remove(existing)
+        _debug.print_performance_timing(
+            "napari segmentation import", "remove previous Labels layer", phase_started
+        )
         settings = self._inference_settings()
+        self._set_segmentation_import_status("creating the Labels layer")
+        phase_started = perf_counter()
         labels = self.napari_viewer.add_labels(
             result.mask,
             name=self.SEGMENTATION_LAYER_NAME,
@@ -4299,6 +4348,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 },
             },
         )
+        _debug.print_performance_timing(
+            "napari segmentation import", "create Labels layer", phase_started
+        )
+        self._set_segmentation_import_status("preparing tile and instance display")
+        phase_started = perf_counter()
         self._update_segmentation_tile_grid(result.provenance, result.mask.shape)
         self._segment_instances = result.instances
         self._apply_instance_colors(labels)
@@ -4307,6 +4361,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
             labels.events.selected_label.connect(self._on_selected_instance_changed)
         except (AttributeError, TypeError):
             pass
+        _debug.print_performance_timing(
+            "napari segmentation import", "display setup", phase_started
+        )
+        phase_started = perf_counter()
         self._converted_image = self._inference_converted
         self._current_sample_id = self._inference_sample_id
         direct_save = bool(
@@ -4345,9 +4403,38 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 else " · direct"
             )
         )
+        _debug.print_performance_timing(
+            "napari segmentation import", "interface state update", phase_started
+        )
+        self._set_segmentation_import_status("validating the editable mask")
+        phase_started = perf_counter()
         self._refresh_segmentation_validation()
+        _debug.print_performance_timing(
+            "napari segmentation import", "editable-mask validation", phase_started
+        )
+        self._set_segmentation_import_status("updating object counts")
+        phase_started = perf_counter()
         self._update_class_counts()
         self._on_selected_instance_changed()
+        _debug.print_performance_timing(
+            "napari segmentation import", "counts and selection update", phase_started
+        )
+        _debug.print_performance_timing(
+            "napari segmentation import", "total", total_started
+        )
+        self._inference_status_label.setText(
+            f"Inference: complete · {len(result.instances)} instance(s)"
+            + (
+                f" · {len(result.provenance.get('equivalence_pairs', ()))} seam pair(s)"
+                if result.provenance.get("mode") == "dask_tiled"
+                else " · direct"
+            )
+        )
+
+    def _set_segmentation_import_status(self, phase: str) -> None:
+        """Show a synchronous GUI import phase before its work starts."""
+        self._inference_status_label.setText(f"Inference: importing · {phase}")
+        self._inference_status_label.repaint()
 
     def _update_segmentation_tile_grid(
         self, provenance: dict, image_shape: tuple[int, int]

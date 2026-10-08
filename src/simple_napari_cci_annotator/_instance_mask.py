@@ -157,11 +157,21 @@ def compose_predictions(
 
 def disconnected_instance_ids(mask: np.ndarray) -> tuple[int, ...]:
     array = np.asarray(mask)
+    components = label(array, background=0, connectivity=1)
+    component_count = int(components.max(initial=0))
+    if component_count == 0:
+        return ()
+
+    # skimage labels connected regions of equal-valued pixels, so every
+    # component maps to exactly one source instance. Build that mapping in one
+    # full-mask pass, then count components per source ID.
+    component_sources = np.zeros(component_count + 1, dtype=array.dtype)
+    component_sources[components.ravel()] = array.ravel()
+    source_ids, counts = np.unique(component_sources[1:], return_counts=True)
     return tuple(
         int(instance_id)
-        for instance_id in np.unique(array)
-        if instance_id
-        and label(array == instance_id, connectivity=1).max(initial=0) > 1
+        for instance_id, count in zip(source_ids, counts, strict=True)
+        if instance_id and count > 1
     )
 
 

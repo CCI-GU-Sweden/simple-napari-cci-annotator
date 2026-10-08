@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import tifffile
 
+from simple_napari_cci_annotator import _debug
 from simple_napari_cci_annotator._instance_mask import (
     ComposedInstances,
     PredictedInstance,
@@ -26,6 +27,7 @@ from simple_napari_cci_annotator._segmentation_io import (
     InstanceRecord,
     SegmentationError,
     SegmentationIO,
+    label_statistics,
     prepare_imported_mask,
 )
 from simple_napari_cci_annotator._segmentation_crop import (
@@ -72,6 +74,19 @@ def _record(instance_id: int, class_id: int = 0) -> InstanceRecord:
     )
 
 
+def test_label_statistics_calculates_all_areas_and_bounds():
+    mask = np.zeros((8, 10), dtype=np.uint32)
+    mask[1:4, 2:6] = 3
+    mask[5:7, 7:10] = 1_000_001  # Exercise sparse-ID handling.
+
+    statistics = label_statistics(mask)
+
+    assert statistics[3].area == 12
+    assert statistics[3].bbox == (1, 2, 4, 6)
+    assert statistics[1_000_001].area == 6
+    assert statistics[1_000_001].bbox == (5, 7, 7, 10)
+
+
 def test_imported_mask_preserves_instance_ids_and_normalizes_binary_255():
     binary = np.zeros((8, 8), dtype=np.uint8)
     binary[1:3, 1:3] = 255
@@ -91,6 +106,17 @@ def test_imported_mask_preserves_instance_ids_and_normalizes_binary_255():
     imported, records = prepare_imported_mask(instances, (8, 8), {0: "Cell"}, 0)
     assert set(np.unique(imported)) == {0, 3, 9}
     assert set(records) == {3, 9}
+
+
+def test_disconnected_instance_scan_keeps_touching_different_ids_separate():
+    mask = np.zeros((6, 8), dtype=np.uint32)
+    mask[0:3, 0:2] = 1
+    mask[0:3, 2:4] = 2  # Touches ID 1 but is one separate valid instance.
+    mask[0, 6] = 9
+    mask[1, 7] = 9  # Diagonal contact is disconnected with 4-connectivity.
+    mask[4:6, 4:7] = 1_000_001  # Sparse IDs remain supported.
+
+    assert disconnected_instance_ids(mask) == (9,)
 
 
 @pytest.mark.parametrize(
@@ -560,6 +586,30 @@ def test_dask_tiling_pads_merges_and_relabels_deterministically():
     assert first.provenance["grid"] == [4, 5]
     assert first.provenance["padding"] == {"bottom": 28, "right": 30}
     assert first.provenance["equivalence_pairs"]
+
+
+def test_tiled_segmentation_reports_phases_and_optional_timings(
+    monkeypatch, capsys
+):
+    messages = []
+    monkeypatch.setattr(_debug, "VERBOSE_PERFORMANCE_TIMING", True)
+
+    TiledSegmentationEngine(_FullTilePredictor()).predict(
+        np.zeros((80, 90, 3), dtype=np.uint8),
+        InferenceSettings(tile_size=64, overlap=16, max_detections=10),
+        {0: "Cell"},
+        progress=lambda current, total, text: messages.append(text),
+    )
+
+    assert "All tiles predicted; assembling the tiled mask" in messages
+    assert "Checking tile instance IDs" in messages
+    assert "Finding matches across tile seams" in messages
+    assert "Fusing and relabeling instances" in messages
+    assert "Calculating final instance statistics" in messages
+    assert messages[-1] == "Segmentation merge complete"
+    output = capsys.readouterr().out
+    assert "[CCI timing] tiled segmentation · seam matching:" in output
+    assert "[CCI timing] tiled segmentation · total tiled segmentation:" in output
 
 
 def test_seam_fusion_is_class_aware_and_reports_ambiguity():

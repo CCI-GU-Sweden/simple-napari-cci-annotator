@@ -4,12 +4,14 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from threading import Lock
+from time import perf_counter
 from typing import Any
 
 import dask.array as da
 import numpy as np
 from skimage.segmentation import clear_border
 
+from . import _debug
 from ._instance_mask import ComposedInstances, ComponentCleanup
 from ._segmentation_io import InstanceRecord, SegmentationError, refresh_instance_records
 from ._tiled_inference import InferenceCancelled, InferenceError, InferenceSettings
@@ -36,7 +38,12 @@ class _TileRegistry:
             self.completed.add(tile_id)
             completed = len(self.completed)
         if self.progress is not None:
-            self.progress(completed, self.total, f"Predicted tile {completed}/{self.total}")
+            message = (
+                "All tiles predicted; assembling the tiled mask"
+                if completed == self.total
+                else f"Predicted tile {completed}/{self.total}"
+            )
+            self.progress(completed, self.total, message)
 
 
 class _UnionFind:
@@ -75,6 +82,7 @@ class TiledSegmentationEngine:
         cancelled: Callable[[], bool] | None = None,
         clear_border_instances: bool = False,
     ) -> ComposedInstances:
+        total_started = perf_counter()
         settings.validate()
         array = np.asarray(image)
         if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3:
@@ -109,7 +117,13 @@ class TiledSegmentationEngine:
                 np.asarray(block), settings, dict(classes)
             )
             base_id = tile_id * settings.max_detections
-            labels = np.zeros(result.mask.shape, dtype=np.uint32)
+            local_mask = np.asarray(result.mask, dtype=np.uint32)
+            local_max = int(local_mask.max(initial=0))
+            if local_max > settings.max_detections:
+                raise InferenceError(
+                    f"Tile {tile_id} returned more than max detections."
+                )
+            local_to_global = np.zeros(settings.max_detections + 1, dtype=np.uint32)
             records: dict[int, InstanceRecord] = {}
             for local_id, record in sorted(result.instances.items()):
                 if local_id > settings.max_detections:
@@ -117,7 +131,7 @@ class TiledSegmentationEngine:
                         f"Tile {tile_id} returned more than max detections."
                     )
                 global_id = base_id + int(local_id)
-                labels[result.mask == local_id] = global_id
+                local_to_global[int(local_id)] = global_id
                 records[global_id] = InstanceRecord(
                     instance_id=global_id,
                     class_id=record.class_id,
@@ -129,6 +143,7 @@ class TiledSegmentationEngine:
                     area=0,
                     lineage=(global_id,),
                 )
+            labels = local_to_global[local_mask]
             registry.store(tile_id, records, result.cleanup)
             if cancelled is not None and cancelled():
                 raise InferenceCancelled("Inference cancelled by the user.")
@@ -145,6 +160,7 @@ class TiledSegmentationEngine:
             meta=np.empty((0, 0, 0), dtype=np.uint32),
             allow_rechunk=False,
         )
+        phase_started = perf_counter()
         try:
             temporary_mask = np.asarray(
                 mapped.compute(scheduler="threads")[:, :, 0], dtype=np.uint32
@@ -155,38 +171,66 @@ class TiledSegmentationEngine:
             if isinstance(exc, InferenceError):
                 raise
             raise InferenceError(f"Dask segmentation inference failed: {exc}") from exc
+        _print_phase_timing("tile inference and mask assembly", phase_started)
         if cancelled is not None and cancelled():
             raise InferenceCancelled("Inference cancelled by the user.")
-        if progress is not None:
-            progress(tile_count, tile_count, "Merging tile seams")
 
+        _report_merge_phase(progress, tile_count, "Checking tile instance IDs")
+        phase_started = perf_counter()
         present_ids = {int(value) for value in np.unique(temporary_mask) if value}
         missing_metadata = sorted(present_ids - set(registry.records))
         if missing_metadata:
             raise SegmentationError(
                 f"Tiled prediction produced IDs without metadata: {missing_metadata}."
             )
+        _print_phase_timing("tile ID validation", phase_started)
+        _check_cancelled(cancelled)
+
+        _report_merge_phase(progress, tile_count, "Finding matches across tile seams")
+        phase_started = perf_counter()
         equivalences, conflicts, ambiguous = _seam_equivalences(
             temporary_mask,
             core_size,
             registry.records,
         )
+        _print_phase_timing("seam matching", phase_started)
+        _check_cancelled(cancelled)
+
+        _report_merge_phase(progress, tile_count, "Fusing and relabeling instances")
+        phase_started = perf_counter()
         fused, records, temporary_to_final = _canonical_relabel(
             temporary_mask,
             registry.records,
             classes,
             equivalences,
         )
+        _print_phase_timing("instance fusion and relabeling", phase_started)
+        _check_cancelled(cancelled)
+
+        _report_merge_phase(progress, tile_count, "Cropping mask to the source image")
+        phase_started = perf_counter()
         fused = fused[:original_height, :original_width]
+        _print_phase_timing("source-shape cropping", phase_started)
         cleared_ids: list[int] = []
         if clear_border_instances and np.any(fused):
+            _report_merge_phase(progress, tile_count, "Removing source-border instances")
+            phase_started = perf_counter()
             before = {int(value) for value in np.unique(fused) if value}
             fused = np.asarray(clear_border(fused), dtype=np.uint32)
             after = {int(value) for value in np.unique(fused) if value}
             cleared_ids = sorted(before - after)
             records = {key: value for key, value in records.items() if key in after}
-        records = refresh_instance_records(fused, records, classes)
+            _print_phase_timing("source-border removal", phase_started)
+            _check_cancelled(cancelled)
 
+        _report_merge_phase(progress, tile_count, "Calculating final instance statistics")
+        phase_started = perf_counter()
+        records = refresh_instance_records(fused, records, classes)
+        _print_phase_timing("final instance statistics", phase_started)
+        _check_cancelled(cancelled)
+
+        _report_merge_phase(progress, tile_count, "Recording merge provenance")
+        phase_started = perf_counter()
         cleanup = tuple(
             item
             for tile_id in sorted(registry.cleanup)
@@ -219,6 +263,9 @@ class TiledSegmentationEngine:
                 for tile_id in sorted(registry.cleanup)
             ],
         }
+        _print_phase_timing("merge provenance", phase_started)
+        _print_phase_timing("total tiled segmentation", total_started)
+        _report_merge_phase(progress, tile_count, "Segmentation merge complete")
         return ComposedInstances(fused, records, cleanup, provenance)
 
 
@@ -237,6 +284,24 @@ def _pad_to_core_grid(
         mode=mode,
     )
     return np.ascontiguousarray(padded), (pad_bottom, pad_right)
+
+
+def _report_merge_phase(
+    progress: Callable[[int, int, str], None] | None,
+    tile_count: int,
+    message: str,
+) -> None:
+    if progress is not None:
+        progress(tile_count, tile_count, message)
+
+
+def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise InferenceCancelled("Inference cancelled by the user.")
+
+
+def _print_phase_timing(name: str, started: float) -> None:
+    _debug.print_performance_timing("tiled segmentation", name, started)
 
 
 def _seam_equivalences(
@@ -293,6 +358,7 @@ def _canonical_relabel(
     classes: Mapping[int, str],
     equivalences: tuple[tuple[int, int], ...],
 ) -> tuple[np.ndarray, dict[int, InstanceRecord], dict[int, int]]:
+    phase_started = perf_counter()
     present = sorted(int(value) for value in np.unique(mask) if value)
     union_find = _UnionFind(present)
     for first, second in equivalences:
@@ -302,7 +368,9 @@ def _canonical_relabel(
     for temporary_id in present:
         groups[union_find.find(temporary_id)].append(temporary_id)
     ordered_groups = sorted(groups.values(), key=lambda values: min(values))
-    output = np.zeros(mask.shape, dtype=np.uint32)
+    _print_phase_timing("fusion grouping", phase_started)
+    phase_started = perf_counter()
+    lookup = np.zeros(max(present, default=0) + 1, dtype=np.uint32)
     raw_records: dict[int, dict[str, Any]] = {}
     temporary_to_final: dict[int, int] = {}
     for final_id, members in enumerate(ordered_groups, start=1):
@@ -313,7 +381,7 @@ def _canonical_relabel(
                 f"A fused instance crosses classes: temporary IDs {members}."
             )
         for temporary_id in members:
-            output[mask == temporary_id] = final_id
+            lookup[temporary_id] = final_id
             temporary_to_final[temporary_id] = final_id
         confidences = [
             record.confidence
@@ -329,8 +397,15 @@ def _canonical_relabel(
             "status": "predicted",
             "lineage": members,
         }
+    _print_phase_timing("fusion lookup preparation", phase_started)
+    phase_started = perf_counter()
+    output = lookup[np.asarray(mask)]
+    _print_phase_timing("fusion mask lookup", phase_started)
+    phase_started = perf_counter()
+    refreshed = refresh_instance_records(output, raw_records, classes)
+    _print_phase_timing("fusion intermediate instance statistics", phase_started)
     return (
         output,
-        refresh_instance_records(output, raw_records, classes),
+        refreshed,
         temporary_to_final,
     )

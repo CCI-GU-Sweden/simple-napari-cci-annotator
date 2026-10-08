@@ -6,12 +6,14 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 import tifffile
 
+from . import _debug
 from ._annotation_io import AnnotationIO, LabelValidationError, _format_boxes
 from ._instance_mask import disconnected_instance_ids
 from ._project_store import ProjectStore
@@ -154,6 +156,7 @@ class PredictionOutputWriter:
         prediction: Mapping[str, Any] | None = None,
         overwrite: bool = False,
     ) -> PredictionOutputPaths:
+        total_started = perf_counter()
         if self.project.config.task != "segment":
             raise PredictionOutputError("Mask output requires a segment project.")
         rgb = _validate_rgb(image)
@@ -165,22 +168,35 @@ class PredictionOutputWriter:
         if np.any(array > np.iinfo(np.uint32).max):
             raise PredictionOutputError("Mask IDs exceed uint32 storage capacity.")
         array = np.asarray(array, dtype=np.uint32)
+        phase_started = perf_counter()
         present = {int(value) for value in np.unique(array) if value}
         if present != set(instances):
             raise PredictionOutputError(
                 "Instance metadata IDs must exactly match the IDs in the mask."
             )
+        _debug.print_performance_timing(
+            "prediction output saving", "mask ID validation", phase_started
+        )
+        phase_started = perf_counter()
         disconnected = disconnected_instance_ids(array)
+        _debug.print_performance_timing(
+            "prediction output saving", "disconnected-instance validation", phase_started
+        )
         if disconnected:
             raise PredictionOutputError(
                 f"Disconnected instance IDs must be corrected: {list(disconnected)}."
             )
+        phase_started = perf_counter()
         try:
             records = refresh_instance_records(
                 array, instances, self.project.config.classes
             )
         except SegmentationError as exc:
             raise PredictionOutputError(str(exc)) from exc
+        _debug.print_performance_timing(
+            "prediction output saving", "instance statistics", phase_started
+        )
+        phase_started = perf_counter()
         paths = self.paths(parent, sample_id)
         payload = self._base_payload(
             sample_id, rgb, source_path, conversion, prediction
@@ -190,7 +206,20 @@ class PredictionOutputWriter:
             str(instance_id): record.to_mapping()
             for instance_id, record in sorted(records.items())
         }
-        self._write(paths, rgb, array, payload, overwrite=overwrite)
+        _debug.print_performance_timing(
+            "prediction output saving", "metadata preparation", phase_started
+        )
+        self._write(
+            paths,
+            rgb,
+            array,
+            payload,
+            overwrite=overwrite,
+            timing_scope="prediction output saving",
+        )
+        _debug.print_performance_timing(
+            "prediction output saving", "total", total_started
+        )
         return paths
 
     def _base_payload(
@@ -224,6 +253,7 @@ class PredictionOutputWriter:
         metadata: dict[str, Any],
         *,
         overwrite: bool,
+        timing_scope: str | None = None,
     ) -> None:
         if not overwrite and any(path.exists() for path in paths.files):
             raise PredictionOutputError(
@@ -232,7 +262,13 @@ class PredictionOutputWriter:
         paths.folder.mkdir(parents=True, exist_ok=True)
         temporary = tuple(_temporary_path(path) for path in paths.files)
         try:
+            phase_started = perf_counter()
             Image.fromarray(image, mode="RGB").save(temporary[0], format="PNG")
+            if timing_scope is not None:
+                _debug.print_performance_timing(
+                    timing_scope, "RGB image encoding", phase_started
+                )
+            phase_started = perf_counter()
             if isinstance(annotation, str):
                 with temporary[1].open("w", encoding="utf-8", newline="\n") as stream:
                     stream.write(annotation)
@@ -243,8 +279,22 @@ class PredictionOutputWriter:
                     compression="deflate",
                     photometric="minisblack",
                 )
+            if timing_scope is not None:
+                _debug.print_performance_timing(
+                    timing_scope, "mask encoding", phase_started
+                )
+            phase_started = perf_counter()
             _write_json(temporary[2], metadata)
+            if timing_scope is not None:
+                _debug.print_performance_timing(
+                    timing_scope, "metadata encoding", phase_started
+                )
+            phase_started = perf_counter()
             _replace_many(tuple(zip(temporary, paths.files, strict=True)))
+            if timing_scope is not None:
+                _debug.print_performance_timing(
+                    timing_scope, "atomic file replacement", phase_started
+                )
         finally:
             for path in temporary:
                 path.unlink(missing_ok=True)

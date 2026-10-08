@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Event
+from time import perf_counter
 
 import numpy as np
 from qtpy.QtCore import QThread, Signal
@@ -32,6 +33,7 @@ class SegmentationWorker(QThread):
         self._classes = dict(classes)
         self._clear_border_instances = bool(clear_border_instances)
         self._cancel_event = Event()
+        self.result_ready_at: float | None = None
 
     def request_cancel(self) -> None:
         self._cancel_event.set()
@@ -69,4 +71,5 @@ class SegmentationWorker(QThread):
         if self._cancel_event.is_set():
             self.cancelled.emit()
         else:
+            self.result_ready_at = perf_counter()
             self.succeeded.emit(result)
