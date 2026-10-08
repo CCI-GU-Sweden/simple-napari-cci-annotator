@@ -2,6 +2,26 @@
 
 ## Installation
 
+In a specific environment, install napari (tested with version 0.7 and 0.8)
+
+```shell
+conda create -n napari -c conda-forge napari pyqt --yes
+conda activate napari
+napari
+```
+
+In napari, open **Plugins → Simple CCI Annotator Plugin**. Or search for the CCI plugin.
+
+Napari provide standalone installers for Windows, macOS, and Linux. You can install the plugin from the napari store.
+
+Another way to install is with pip:
+
+```bash
+pip install simple-napari-cci-annotator
+```
+
+The code is on [Githb](https://github.com/CCI-GU-Sweden/simple-napari-cci-annotator).
+
 From the repository root, install the plugin and napari into a Python 3.10–3.12 environment:
 
 ```bash
@@ -9,7 +29,31 @@ python -m pip install -e ".[all]"
 napari
 ```
 
-In napari, open **Plugins → CCI Annotator → Simple CCI Annotator Plugin**.
+### GPU (NVIDIA CUDA) — recommended if you have an NVIDIA GPU
+
+Check your maximum supported CUDA version first:
+
+```shell
+nvidia-smi
+```
+
+Then pick a compatible wheel index (`cu124` = CUDA 12.4, `cu126` = 12.6, etc.). Check the [PyTorch installation selector](https://pytorch.org/get-started/locally/) for the appropriate build.
+
+Then run:
+
+```shell
+conda create -n napari-gpu -c conda-forge napari pyqt --yes
+conda activate napari-gpu
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install ultralytics
+pip install simple-napari-cci-annotator
+```
+
+Quick smoke test:
+
+```shell
+python -c "import numpy, scipy, torch, cv2; from ultralytics import YOLO; print(numpy.__version__, scipy.__version__, torch.__version__, cv2.__version__)"
+```
 
 ## What it does
 

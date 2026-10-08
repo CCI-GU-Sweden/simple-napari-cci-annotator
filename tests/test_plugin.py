@@ -50,6 +50,7 @@ from simple_napari_cci_annotator._project_store import (
     ProjectConflictError,
     TrainingPatchLockedError,
 )
+from simple_napari_cci_annotator._segmentation_io import prepare_imported_mask
 from simple_napari_cci_annotator._training_crop import (
     TrainingCropError,
     crop_bounds_from_center,
@@ -1299,6 +1300,114 @@ def test_widget_starts_with_disabled_model_controls(qtbot):
     assert not widget._save_annotation_button.isEnabled()
 
 
+@pytest.mark.parametrize("task", ["detect", "segment"])
+def test_imported_duplicate_basenames_have_separate_stable_pairs(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / "project", task=task)
+    project.lock_image_processing(ImageProcessingSettings(
+        channel_axis=2, red_channel=0, green_channel=1, blue_channel=2,
+        normalization="simple_max",
+    ).to_mapping())
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    sample_ids = []
+    for index, folder in enumerate(("first", "second")):
+        path = tmp_path / folder / "000000.png"
+        image = _Image(np.full((32, 32, 3), index * 255, dtype=np.uint8), path=path)
+        converted = widget._convert_current_image(image)
+        sample_id = widget._image_stem(image)
+        assert converted.sample_id == sample_id
+        assert sample_id.startswith("000000__")
+        assert widget._image_stem(_Image(image.data, path=path)) == sample_id
+        sample_ids.append(sample_id)
+        if task == "detect":
+            result = widget._annotation_io.save_pair(
+                image_data=converted.data, image_name=image.name,
+                sample_id=sample_id, source_path=path,
+                rectangles=(), class_ids=(),
+            )
+            assert result.label_path.stem == sample_id
+        else:
+            mask = np.zeros((32, 32), dtype=np.uint8)
+            mask[index:index + 2, 1:3] = 255
+            imported, records = prepare_imported_mask(
+                mask, mask.shape, class_id=0, classes=project.config.classes,
+            )
+            result = widget._segmentation_io.save(
+                image_data=converted.data, sample_id=sample_id, source_path=path,
+                mask=imported, instances=records,
+            )
+            assert result.mask_path.stem == sample_id
+            np.testing.assert_array_equal(
+                widget._segmentation_io.load(sample_id, mask.shape).mask, imported
+            )
+        assert result.image_path.stem == sample_id
+    assert len(set(sample_ids)) == 2
+    assert len(list(project.paths.images.iterdir())) == 2
+    reopened = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(reopened)
+    reopened._set_project(ProjectStore.load(project.paths.root))
+    for folder, sample_id in zip(("first", "second"), sample_ids):
+        image = _Image(np.zeros((32, 32, 3), dtype=np.uint8), path=tmp_path / folder / "000000.png")
+        assert reopened._image_stem(image) == sample_id
+    canonical = _Image(image.data, path=result.image_path)
+    assert reopened._image_stem(canonical) == sample_ids[-1]
+
+
+def test_pathless_sources_have_stable_distinct_ids(tmp_path, qtbot):
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget._set_project(ProjectStore.initialize(tmp_path / "project"))
+    first = _Image(np.zeros((32, 32), dtype=np.uint8), name="000000.png")
+    second = _Image(first.data, name=first.name)
+    sample_id = widget._image_stem(first)
+    assert widget._image_stem(first) == sample_id
+    assert widget._image_stem(second) != sample_id
+    first.name = "renamed"
+    assert widget._image_stem(first) == sample_id
+
+
+@pytest.mark.parametrize("plane_suffix", ["", "__z002"])
+def test_unique_sample_ids_find_original_yolo_sidecars(annotation_io, tmp_path, plane_suffix):
+    source = tmp_path / "source" / "images" / "000000.png"
+    labels = source.parent.parent / "labels"
+    labels.mkdir(parents=True)
+    sidecar = labels / f"000000{plane_suffix}.txt"
+    sidecar.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+    # An unrelated canonical filename-only pair must not win this lookup.
+    (annotation_io.project.paths.labels / "000000.txt").write_text(
+        "", encoding="utf-8"
+    )
+    sample_id = f"000000__0123456789ab{plane_suffix}"
+    assert annotation_io.find_label(sample_id, source_path=source) == sidecar.resolve()
+    canonical = annotation_io.project.paths.labels / f"{sample_id}.txt"
+    canonical.write_text("", encoding="utf-8")
+    assert annotation_io.find_label(sample_id, source_path=source) == canonical.resolve()
+
+
+def test_legacy_sample_reused_only_for_its_recorded_source(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project")
+    project.lock_image_processing(ImageProcessingSettings(
+        channel_axis=2, red_channel=0, green_channel=1, blue_channel=2,
+        normalization="simple_max",
+    ).to_mapping())
+    path = tmp_path / "original" / "000000.png"
+    data = np.zeros((32, 32, 3), dtype=np.uint8)
+    AnnotationIO(project).save_pair(
+        image_data=data, image_name="000000", source_path=path,
+        rectangles=(), class_ids=(),
+    )
+    widget = SimpleCciAnnotatorQWidget(_Viewer())
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    original = _Image(data, path=path)
+    assert widget._image_stem(original) == "000000"
+    assert widget._convert_current_image(original).sample_id == "000000"
+    other = _Image(data, path=tmp_path / "other" / "000000.png")
+    assert widget._image_stem(other) != "000000"
+
+
 def test_inference_tile_default_follows_training_patch_until_overridden(tmp_path, qtbot):
     project = ProjectStore.initialize(tmp_path / "project")
     widget = SimpleCciAnnotatorQWidget(_Viewer())
@@ -1656,10 +1765,11 @@ def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot)
     with patch.object(widget, "_show_info"):
         widget._on_save_annotation()
 
-    assert (project.paths.masks / "sample.tif").is_file()
-    assert (project.paths.instances / "sample.json").is_file()
+    sample_id = widget._image_stem(image)
+    assert (project.paths.masks / f"{sample_id}.tif").is_file()
+    assert (project.paths.instances / f"{sample_id}.json").is_file()
     metadata = json.loads(
-        (project.paths.instances / "sample.json").read_text(encoding="utf-8")
+        (project.paths.instances / f"{sample_id}.json").read_text(encoding="utf-8")
     )
     assert metadata["conversion"]["inverted"] is True
     widget._load_annotations_for_image(image, force=True)
@@ -1712,8 +1822,144 @@ def test_widget_imports_selected_labels_without_splitting(tmp_path, qtbot):
     assert not widget._segmentation_errors
     with patch.object(widget, "_show_info"):
         widget._on_save_annotation()
-    assert (project.paths.masks / "field.tif").is_file()
-    assert (project.paths.instances / "field.json").is_file()
+    sample_id = widget._image_stem(image)
+    assert (project.paths.masks / f"{sample_id}.tif").is_file()
+    assert (project.paths.instances / f"{sample_id}.json").is_file()
+
+
+@pytest.mark.parametrize("cancel_switch", [False, True])
+def test_consecutive_same_name_mask_imports_save_matching_crops(
+    tmp_path, qtbot, cancel_switch
+):
+    def discard_on_close(widget):
+        widget._annotation_dirty = False
+        widget._crop_dirty = False
+
+    project = ProjectStore.initialize(tmp_path / "project", task="segment")
+    project.lock_image_processing(ImageProcessingSettings(
+        channel_axis=2, red_channel=0, green_channel=1, blue_channel=2,
+        normalization="simple_max",
+    ).to_mapping())
+    viewer = _Viewer()
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget, before_close_func=discard_on_close)
+    widget._set_project(project)
+    widget._patch_size_combo.setCurrentIndex(widget._patch_size_combo.findData(512))
+    saved_ids = []
+    for index in range(2):
+        pixels = np.zeros((800, 800, 3), dtype=np.uint8)
+        start = 220 + index * 200
+        pixels[start:start + 10, start:start + 10] = 255
+        pixels[start + 20:start + 30, start:start + 10] = 255
+        image = _Image(
+            pixels, name="000000" if index == 0 else "000000 [2]",
+            path=tmp_path / f"source{index}" / "images" / "000000.png",
+        )
+        viewer.layers.append(image)
+        viewer.layers.selection.active = image
+        previous_image = widget._annotation_image_layer
+        previous_converted = widget._converted_image
+        with patch.object(widget_module.QMessageBox, "warning", return_value=(
+            widget_module.QMessageBox.Cancel if index and cancel_switch
+            else widget_module.QMessageBox.Discard
+        )):
+            widget._on_active_layer_changed()
+        if index and cancel_switch:
+            assert widget._annotation_image_layer is previous_image
+            assert widget._converted_image is previous_converted
+        mask = (pixels[..., 0] > 0).astype(np.uint8) * 255
+        mask[300, 300] = 255  # Removed by the <5 pixel cleanup after splitting.
+        external = viewer.add_labels(mask, name=f"000000 [{index * 2 + 1}]")
+        external.source = SimpleNamespace(
+            path=str(tmp_path / f"source{index}" / "masks" / "000000.png")
+        )
+        viewer.layers.selection.active = external
+        if index and cancel_switch:
+            with (
+                patch.object(widget_module.QMessageBox, "warning", return_value=widget_module.QMessageBox.Cancel),
+                patch.object(widget, "_show_error") as show_error,
+            ):
+                widget._on_import_active_mask()
+            show_error.assert_called_once()
+            assert widget._annotation_image_layer is previous_image
+            assert widget._converted_image is previous_converted
+        with (
+            patch.object(widget_module.QMessageBox, "warning", return_value=widget_module.QMessageBox.Discard),
+            patch.object(widget, "_show_error") as show_error,
+        ):
+            widget._on_import_active_mask()
+            show_error.assert_not_called()
+            assert widget._annotation_image_layer is image
+            np.testing.assert_array_equal(widget._segmentation_layer().data > 0, mask > 0)
+            widget._on_select_training_crop()
+            widget._on_create_training_crop()
+            crop_labels = widget._crop_segmentation_layer()
+            crop_labels.selected_label = 1
+            widget._on_split_mask_instance()
+            widget._on_remove_small_mask_instances()
+            widget._on_compact_mask_instances()
+            assert len(widget._crop_segment_instances) == 2
+            assert widget._save_training_crop(show_message=False)
+            show_error.assert_not_called()
+        crop_image = widget._get_layer_by_name(widget.CROP_IMAGE_LAYER_NAME)
+        np.testing.assert_array_equal(crop_image.data[..., 0] > 0, crop_labels.data > 0)
+        mask_path = Path(crop_labels.metadata["cci_mask_path"])
+        saved_ids.append(mask_path.stem)
+        loaded = widget._segmentation_io.load(mask_path.stem, (512, 512))
+        with Image.open(project.paths.images / f"{mask_path.stem}.png") as saved_image:
+            np.testing.assert_array_equal(np.asarray(saved_image)[..., 0] > 0, loaded.mask > 0)
+        widget._on_return_to_source()
+    assert len(set(saved_ids)) == 2
+    assert len(list(project.paths.images.glob("*.png"))) == 2
+    widget._annotation_dirty = False
+
+
+def test_segmentation_crop_rejects_mask_from_another_image(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project", task="segment")
+    viewer = _Viewer()
+    image = _Image(np.zeros((800, 800, 3), dtype=np.uint8), path=tmp_path / "first.png")
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    widget._on_select_training_crop()
+    widget._segmentation_layer().metadata["cci_image_stem"] = "another_image"
+    with patch.object(widget, "_show_error") as show_error:
+        widget._on_create_training_crop()
+    show_error.assert_called_once()
+    assert widget._crop_segmentation_layer() is None
+    assert widget._crop_bounds is None
+
+
+def test_image_switch_saves_previous_mask_with_previous_pixels(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project", task="segment")
+    viewer = _Viewer()
+    pixels = np.zeros((1024, 1024, 3), dtype=np.uint8)
+    pixels[10:20, 10:20] = 255
+    first = _Image(pixels, path=tmp_path / "first.png")
+    viewer.layers.append(first)
+    viewer.layers.selection.active = first
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget, before_close_func=lambda w: setattr(w, "_annotation_dirty", False))
+    widget._set_project(project)
+    widget._on_new_mask_instance()
+    labels = widget._segmentation_layer()
+    labels.data[10:20, 10:20] = labels.selected_label
+    widget._on_labels_data_changed()
+    previous_pixels = widget._converted_image.data.copy()
+    sample_id = widget._image_stem(first)
+    second = _Image(np.zeros_like(pixels), path=tmp_path / "second.png")
+    viewer.layers.append(second)
+    viewer.layers.selection.active = second
+    with patch.object(widget_module.QMessageBox, "warning", return_value=widget_module.QMessageBox.Save):
+        widget._on_active_layer_changed()
+    assert widget._annotation_image_layer is second
+    with Image.open(project.paths.images / f"{sample_id}.png") as saved_image:
+        np.testing.assert_array_equal(np.asarray(saved_image), previous_pixels)
+    saved = widget._segmentation_io.load(sample_id, pixels.shape[:2])
+    assert np.count_nonzero(saved.mask) == 100
+    assert not np.any(widget._segmentation_layer().data)
 
 
 def test_widget_removes_tiny_instances_and_collapses_empty_ids(tmp_path, qtbot):
@@ -1979,7 +2225,7 @@ def test_widget_saves_current_output_outside_training_pool(tmp_path, qtbot, task
     ), patch.object(widget, "_show_info"):
         widget._save_output_button.click()
 
-    folder = output_parent / task / "field"
+    folder = output_parent / task / widget._image_stem(image)
     assert (folder / "image.png").is_file()
     assert (folder / ("mask.tif" if task == "segment" else "labels.txt")).is_file()
     assert (folder / ("instances.json" if task == "segment" else "result.json")).is_file()

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 import numpy as np
 from qtpy.QtCore import Qt, QUrl
@@ -158,6 +162,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._segmentation_invalid_ids: tuple[int, ...] = ()
         self._image_adapter = ImageAdapter()
         self._annotation_image_layer = None
+        self._last_source_image_layer = None
         self._converted_image: ConvertedImage | None = None
         self._current_sample_id: str | None = None
         self._annotation_dirty = False
@@ -1097,6 +1102,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_action_state()
         active = self._active_layer()
         if self._is_source_image_layer(active):
+            self._last_source_image_layer = active
             self._configure_image_controls(active)
             self._load_annotations_for_image(active, force=True)
 
@@ -1123,6 +1129,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if self._is_annotation_review_image(active):
             self._load_annotations_for_image(active)
         elif self._is_source_image_layer(active):
+            self._last_source_image_layer = active
             if (
                 self._crop_bounds is not None
                 and active is not self._crop_source_image_layer
@@ -1189,6 +1196,24 @@ class SimpleCciAnnotatorQWidget(QWidget):
             metadata.get("cci_annotation_review")
         )
 
+    def _source_image_stem(self, image_layer) -> str:
+        """Keep source identities stable without sharing filename-only IDs."""
+        assert self._project is not None
+        source_path = self._source_path(image_layer)
+        if source_path is not None:
+            resolved = source_path.resolve()
+            if resolved.parent == self._project.paths.images.resolve():
+                return source_path.stem
+            identity = os.path.normcase(str(resolved))
+            suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+            return f"{AnnotationIO.safe_stem(source_path.stem)}__{suffix}"
+        metadata = image_layer.metadata
+        stem = metadata.get("cci_source_stem")
+        if not isinstance(stem, str) or not stem:
+            stem = f"{AnnotationIO.safe_stem(image_layer.name)}__{uuid4().hex[:12]}"
+            metadata["cci_source_stem"] = stem
+        return stem
+
     def _image_stem(self, image_layer) -> str:
         assert self._project is not None
         metadata = getattr(image_layer, "metadata", {}) or {}
@@ -1199,17 +1224,47 @@ class SimpleCciAnnotatorQWidget(QWidget):
         value = source_path.stem if source_path is not None else getattr(
             image_layer, "name", "image"
         )
-        base_stem = AnnotationIO.safe_stem(str(value))
+        base_stem = self._source_image_stem(image_layer)
+        legacy_stem = AnnotationIO.safe_stem(str(value))
         try:
             settings = self._effective_processing_settings()
             plane = self._image_adapter.plane_selection(
                 image_layer, self.napari_viewer, settings
             )
-            return self._image_adapter.sample_id(
+            sample_id = self._image_adapter.sample_id(
                 base_stem, plane, settings.channel_axis
             )
+            legacy_stem = self._image_adapter.sample_id(
+                legacy_stem, plane, settings.channel_axis
+            )
         except ImageConversionError:
-            return base_stem
+            sample_id = base_stem
+        # Reuse old filename-only samples only when their recorded owner matches.
+        if source_path is not None and legacy_stem != sample_id:
+            if any(self._project.paths.images.glob(f"{legacy_stem}.*")):
+                owner = None
+                try:
+                    lines = self._project.paths.audit.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    for line in lines:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            isinstance(event, dict)
+                            and event.get("sample_id") == legacy_stem
+                        ):
+                            owner = event.get("source_path")
+                except OSError:
+                    pass
+                if isinstance(owner, str) and owner and (
+                    os.path.normcase(str(Path(owner).resolve()))
+                    == os.path.normcase(str(source_path.resolve()))
+                ):
+                    return legacy_stem
+        return sample_id
 
     def _load_annotations_for_image(self, image_layer, *, force: bool = False) -> None:
         if self._project is not None and self._project.config.task == "segment":
@@ -1740,7 +1795,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
     def _on_import_active_mask(self) -> None:
         source = self._active_layer()
         target = self._segmentation_layer()
-        image_layer = self._image_for_annotation()
+        image_layer = self._last_source_image_layer
+        if image_layer not in self.napari_viewer.layers:
+            image_layer = self._image_for_annotation()
         class_id = self._current_class_id()
         if self._project is None or self._project.config.task != "segment":
             self._show_error("Open a segmentation project first.")
@@ -1754,6 +1811,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if image_layer is None or target is None or class_id is None:
             self._show_error("Select the matching source image before importing a mask.")
             return
+        # A cancelled image switch may have left the previous working mask active.
+        # Resolve that switch before importing into its replacement.
+        if not self._segmentation_matches_image(image_layer):
+            self._configure_image_controls(image_layer)
+            self._load_annotations_for_image(image_layer)
+            target = self._segmentation_layer()
+            if not self._segmentation_matches_image(image_layer):
+                self._show_error(
+                    "The selected image's working mask could not be loaded. "
+                    "Finish switching to that image before importing its labels."
+                )
+                return
+        if not self._resolve_unsaved_changes():
+            return
         try:
             converted = self._convert_current_image(image_layer)
             mask, records = prepare_imported_mask(
@@ -1765,9 +1836,6 @@ class SimpleCciAnnotatorQWidget(QWidget):
         except (ImageConversionError, SegmentationError, ValueError, OSError) as exc:
             self._show_error(f"Could not import instance mask:\n{exc}")
             return
-        if not self._resolve_unsaved_changes():
-            return
-
         self._annotation_image_layer = image_layer
         self._converted_image = converted
         self._current_sample_id = self._image_stem(image_layer)
@@ -2566,6 +2634,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return active
         return self._annotation_image_layer
 
+    def _segmentation_matches_image(self, image_layer) -> bool:
+        labels = self._segmentation_layer()
+        return (
+            image_layer is self._annotation_image_layer
+            and labels is not None
+            and labels.metadata.get("cci_image_stem") == self._image_stem(image_layer)
+        )
+
     def _update_image_status(self, image_layer) -> None:
         shape = tuple(int(size) for size in image_layer.data.shape)
         dtype = getattr(image_layer.data, "dtype", "unknown")
@@ -2647,11 +2723,11 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 if settings.upper is not None:
                     self._upper_value_spin.setValue(settings.upper)
                 self._last_normalization_method = settings.normalization
+            self._on_normalization_changed()
+            self._on_filter_changed()
         finally:
             self._updating_processing_controls = False
 
-        self._on_normalization_changed()
-        self._on_filter_changed()
         self._set_processing_controls_enabled(
             self._project is not None and self._locked_processing_settings is None
         )
@@ -2751,7 +2827,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._upper_parameter_label.setText(upper_label)
         self._lower_value_spin.setEnabled(uses_parameters)
         self._upper_value_spin.setEnabled(uses_parameters)
-        self._converted_image = None
+        if not self._updating_processing_controls:
+            self._converted_image = None
         self._on_processing_value_changed()
 
     def _on_filter_changed(self, index=None) -> None:
@@ -2887,12 +2964,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return converted
 
         settings.validate(tuple(int(size) for size in image_layer.data.shape))
-        source_path = self._source_path(image_layer)
-        base_stem = (
-            source_path.stem
-            if source_path is not None
-            else getattr(image_layer, "name", "image")
-        )
+        base_stem = self._source_image_stem(image_layer)
         converted = self._image_adapter.convert(
             image_layer,
             self.napari_viewer,
@@ -2900,6 +2972,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             base_stem=base_stem,
             invert=self._invert_checkbox.isChecked(),
         )
+        converted = replace(converted, sample_id=self._image_stem(image_layer))
         self._converted_image = converted
         self._current_sample_id = converted.sample_id
         self._plane_status_label.setText(
@@ -3045,6 +3118,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._image_for_annotation()
         if not self._is_source_image_layer(image_layer):
             self._show_error("Select a source image layer first.")
+            return
+        if (
+            self._project.config.task == "segment"
+            and not self._segmentation_matches_image(image_layer)
+        ):
+            self._show_error(
+                "Load the matching image and instance mask before selecting a crop."
+            )
             return
         try:
             converted = self._convert_current_image(image_layer)
@@ -3241,6 +3322,12 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._crop_source_image_layer
         if not self._is_source_image_layer(image_layer):
             self._show_error("The crop source image is no longer available.")
+            return
+        if not self._segmentation_matches_image(image_layer):
+            self._show_error(
+                "The working mask belongs to a different image or plane. "
+                "Select the matching source again."
+            )
             return
         try:
             converted = self._convert_current_image(image_layer)

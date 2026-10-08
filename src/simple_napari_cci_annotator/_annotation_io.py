@@ -103,10 +103,21 @@ class AnnotationIO:
 
         if source_path is not None:
             source_path = Path(source_path)
-            candidates.append(source_path.parent / f"{stem}.txt")
+            # External YOLO pairs still use the original image basename.
+            source_stem = self.safe_stem(source_path.stem)
+            parts = stem.removeprefix(f"{source_stem}__").split("__", 1)
+            if (
+                stem.startswith(f"{source_stem}__")
+                and len(parts[0]) == 12
+                and all(char in "0123456789abcdef" for char in parts[0])
+            ):
+                source_stem += f"__{parts[1]}" if len(parts) == 2 else ""
+            else:
+                source_stem = stem
+            candidates.append(source_path.parent / f"{source_stem}.txt")
             if source_path.parent.name.lower() == "images":
                 candidates.append(
-                    source_path.parent.parent / "labels" / f"{stem}.txt"
+                    source_path.parent.parent / "labels" / f"{source_stem}.txt"
                 )
 
         seen: set[Path] = set()
