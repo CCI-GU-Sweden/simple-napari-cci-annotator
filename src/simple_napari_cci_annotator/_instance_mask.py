@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -98,8 +98,12 @@ def compose_predictions(
     predictions: Sequence[PredictedInstance],
     image_shape: tuple[int, int],
     classes: Mapping[int, str],
+    *,
+    component_policy: str = "largest",
 ) -> ComposedInstances:
     """Compose cleaned predictions using per-pixel confidence ownership."""
+    if component_policy not in {"largest", "preserve"}:
+        raise SegmentationError("Component policy must be largest or preserve.")
     height, width = (int(image_shape[0]), int(image_shape[1]))
     output = np.zeros((height, width), dtype=np.uint32)
     ownership = np.full((height, width), -np.inf, dtype=np.float32)
@@ -115,7 +119,12 @@ def compose_predictions(
             raise SegmentationError(
                 f"Prediction mask shape {mask.shape} does not match {(height, width)}."
             )
-        kept, report = keep_largest_component_by_bbox(mask)
+        if component_policy == "largest":
+            kept, report = keep_largest_component_by_bbox(mask)
+        else:
+            kept = mask
+            count = int(label(mask, connectivity=1).max(initial=0))
+            report = ComponentCleanup(count, 0, 0)
         cleanup.append(report)
         cleaned.append((prediction, kept))
 
@@ -153,6 +162,48 @@ def compose_predictions(
         next_id += 1
     records = refresh_instance_records(compact, raw_records, classes)
     return ComposedInstances(compact, records, tuple(cleanup))
+
+
+def split_prediction_components(
+    result: ComposedInstances, classes: Mapping[int, str]
+) -> ComposedInstances:
+    """Make connected slice nodes after confidence ownership and seam fusion.
+
+    Several nodes may share the same prediction or fused tile lineage.
+    No pixels are removed, and source IDs remain in the provenance mapping.
+    """
+    array = np.asarray(result.mask)
+    if array.ndim != 2 or array.dtype.kind not in "ui":
+        raise SegmentationError("Slice masks must be 2D integer labels.")
+    if np.any(array < 0) or int(array.max(initial=0)) > np.iinfo(np.uint32).max:
+        raise SegmentationError("Slice mask IDs exceed uint32 capacity.")
+    components = label(array, background=0, connectivity=1)
+    count = int(components.max(initial=0))
+    if count > np.iinfo(np.uint32).max:
+        raise SegmentationError("Slice components exceed uint32 capacity.")
+    source_ids = np.zeros(count + 1, dtype=array.dtype)
+    source_ids[components.ravel()] = array.ravel()
+    order = np.argsort(source_ids[1:], kind="stable") + 1
+    lookup = np.zeros(count + 1, dtype=np.uint32)
+    lookup[order] = np.arange(1, count + 1, dtype=np.uint32)
+    mask = lookup[components]
+    records = {}
+    mapping = {}
+    ordinals: dict[int, int] = {}
+    for node_id, component in enumerate(order, 1):
+        source_id = int(source_ids[component])
+        if source_id not in result.instances:
+            raise SegmentationError(f"Missing slice instance metadata: {source_id}.")
+        ordinals[source_id] = ordinals.get(source_id, 0) + 1
+        records[node_id] = replace(result.instances[source_id], instance_id=node_id)
+        mapping[str(node_id)] = {
+            "source_instance_id": source_id,
+            "component_id": ordinals[source_id],
+        }
+    records = refresh_instance_records(mask, records, classes)
+    provenance = dict(result.provenance)
+    provenance["slice_components"] = mapping
+    return ComposedInstances(mask, records, result.cleanup, provenance)
 
 
 def disconnected_instance_ids(mask: np.ndarray) -> tuple[int, ...]:

@@ -81,9 +81,15 @@ class TiledSegmentationEngine:
         progress: Callable[[int, int, str], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
         clear_border_instances: bool = False,
+        component_policy: str = "largest",
+        num_workers: int | None = None,
     ) -> ComposedInstances:
         total_started = perf_counter()
         settings.validate()
+        if component_policy not in {"largest", "preserve"}:
+            raise InferenceError("Component policy must be largest or preserve.")
+        if num_workers is not None and num_workers < 1:
+            raise InferenceError("Tile worker count must be positive.")
         array = np.asarray(image)
         if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3:
             raise InferenceError("Tiled segmentation requires an RGB uint8 image.")
@@ -114,7 +120,9 @@ class TiledSegmentationEngine:
             row, column = location[:2]
             tile_id = row * columns + column
             result = self.predictor.predict_image(
-                np.asarray(block), settings, dict(classes)
+                np.asarray(block), settings, dict(classes),
+                **({"component_policy": component_policy}
+                   if component_policy != "largest" else {}),
             )
             base_id = tile_id * settings.max_detections
             local_mask = np.asarray(result.mask, dtype=np.uint32)
@@ -163,7 +171,8 @@ class TiledSegmentationEngine:
         phase_started = perf_counter()
         try:
             temporary_mask = np.asarray(
-                mapped.compute(scheduler="threads")[:, :, 0], dtype=np.uint32
+                mapped.compute(scheduler="threads", num_workers=num_workers)[:, :, 0],
+                dtype=np.uint32,
             )
         except InferenceCancelled:
             raise
@@ -264,6 +273,8 @@ class TiledSegmentationEngine:
             ],
         }
         _print_phase_timing("merge provenance", phase_started)
+        if component_policy != "largest":
+            provenance["component_policy"] = component_policy
         _print_phase_timing("total tiled segmentation", total_started)
         _report_merge_phase(progress, tile_count, "Segmentation merge complete")
         return ComposedInstances(fused, records, cleanup, provenance)

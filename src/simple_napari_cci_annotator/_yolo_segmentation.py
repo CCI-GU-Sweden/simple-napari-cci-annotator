@@ -41,6 +41,8 @@ class YoloSegmentationModel:
         image: np.ndarray,
         settings: InferenceSettings,
         classes: dict[int, str],
+        *,
+        component_policy: str = "largest",
     ) -> ComposedInstances:
         array = np.asarray(image)
         if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3:
@@ -61,12 +63,12 @@ class YoloSegmentationModel:
         except Exception as exc:
             raise InferenceError(f"YOLO segmentation prediction failed: {exc}") from exc
         if not results:
-            return _direct_result((), array.shape[:2], classes)
+            return _direct_result((), array.shape[:2], classes, component_policy)
         result = results[0]
         boxes = getattr(result, "boxes", None)
         masks = getattr(result, "masks", None)
         if boxes is None or masks is None or len(boxes) == 0:
-            return _direct_result((), array.shape[:2], classes)
+            return _direct_result((), array.shape[:2], classes, component_policy)
         mask_data = _to_numpy(masks.data)
         xyxy = _to_numpy(boxes.xyxy)
         confidence = _to_numpy(boxes.conf).reshape(-1)
@@ -94,10 +96,16 @@ class YoloSegmentationModel:
                     confidence=float(score),
                 )
             )
-        return _direct_result(predictions, (height, width), classes)
+        return _direct_result(predictions, (height, width), classes, component_policy)
 
 
-def _direct_result(predictions, image_shape, classes) -> ComposedInstances:
-    result = compose_predictions(predictions, image_shape, classes)
+def _direct_result(
+    predictions, image_shape, classes, component_policy="largest"
+) -> ComposedInstances:
+    result = compose_predictions(
+        predictions, image_shape, classes, component_policy=component_policy
+    )
     result.provenance.update({"mode": "direct"})
+    if component_policy != "largest":
+        result.provenance["component_policy"] = component_policy
     return result
