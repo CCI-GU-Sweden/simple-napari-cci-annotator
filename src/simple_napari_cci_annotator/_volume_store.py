@@ -252,6 +252,14 @@ class VolumeMaskStore:
             raise VolumeStorageError("Slice has not been committed.")
         return self._masks[index].copy(), _read_json(self._metadata_path(index))
 
+    def slice_metadata(self, z_index: int) -> dict[str, Any]:
+        """Read committed slice records without copying its image-sized mask."""
+        self._ensure_open()
+        index = self._index(z_index)
+        if not self._manifest["slices"][index]["complete"]:
+            raise VolumeStorageError("Slice has not been committed.")
+        return _read_json(self._metadata_path(index))
+
     def write_slice(
         self, z_index: int, result: ComposedInstances, conversion: dict[str, Any]
     ) -> None:

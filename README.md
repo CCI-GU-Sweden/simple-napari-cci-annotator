@@ -69,6 +69,8 @@ The plugin helps you run YOLO detection or instance segmentation on microscopy i
 
 Inference tiles default to the selected training crop size. You can set another tile size in the prediction controls.
 
+For a segmentation volume, expand **3D inference and assembly**, select its Z/Y/X/channel axes and Z range, then use **Predict Z Slices**. Inspect the saved per-slice masks over lazy views of the raw channels. The section supports conversion previews, cancellation, verified resume, and reopening saved runs without repeating inference. These slice instances are not yet assembled into 3D objects; see the [volume tutorial](TUTORIAL.md#predict-a-volume).
+
 ## Output
 
 Training annotations are stored in the project folder. Detection annotations use YOLO `.txt` labels; segmentation annotations use instance-mask TIFF files and JSON metadata.

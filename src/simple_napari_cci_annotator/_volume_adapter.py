@@ -179,6 +179,13 @@ class PreparedVolume:
 class VolumeAdapter:
     """Resolve declared volumes without guessing axes from shape."""
 
+    def infer_axes(self, image_layer) -> VolumeAxes:
+        """Read declared axes for UI defaults; ambiguous input requires selection."""
+        shape = _shape_of(image_layer.data)
+        axes = _axes_from_labels(_declared_labels(image_layer, len(shape)))
+        axes.validate(shape)
+        return axes
+
     def prepare(
         self,
         image_layer,

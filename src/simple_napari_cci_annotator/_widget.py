@@ -98,6 +98,7 @@ from ._training_crop import (
 from ._training_worker import TrainingWorker
 from ._yolo_inference import YoloDetectionModel, available_devices
 from ._yolo_segmentation import YoloSegmentationModel
+from ._volume_panel import VolumePanel
 
 
 class CollapsibleSection(QWidget):
@@ -802,6 +803,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
             "Batch image prediction", batch_layout, expanded=False
         )
 
+        self._volume_panel = VolumePanel(self)
+        self._volume_panel.busy_changed.connect(self._update_action_state)
+        volume_layout = QVBoxLayout()
+        volume_layout.addWidget(self._volume_panel)
+        self._volume_section = CollapsibleSection(
+            "3D inference and assembly", volume_layout, expanded=False
+        )
+
         crop_form = QFormLayout()
         crop_form.addRow("Training patch", self._patch_size_combo)
         crop_buttons = QHBoxLayout()
@@ -868,6 +877,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
         content_layout.addWidget(self._annotation_section)
         content_layout.addWidget(self._review_section)
         content_layout.addWidget(self._inference_section)
+        content_layout.addWidget(self._volume_section)
         content_layout.addWidget(self._batch_section)
         content_layout.addWidget(self._crop_section)
         content_layout.addWidget(self._retrain_section)
@@ -1125,6 +1135,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return layer is not None and layer.__class__.__name__.lower().endswith("labels")
 
     def _on_active_layer_changed(self, event=None) -> None:
+        if self._volume_panel.busy:
+            self._update_action_state()
+            return
         active = self._active_layer()
         if self._is_annotation_review_image(active):
             self._load_annotations_for_image(active)
@@ -1144,6 +1157,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._update_action_state()
 
     def _on_current_step_changed(self, event=None) -> None:
+        if self._volume_panel.busy or (
+            getattr(self._active_layer(), "metadata", {}) or {}
+        ).get("cci_volume_display"):
+            return
         image_layer = self._annotation_image_layer
         if image_layer is None or (
             self._annotation_io is None and self._segmentation_io is None
@@ -1187,6 +1204,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             metadata.get("cci_rgb_preview")
             or metadata.get("cci_training_crop")
             or metadata.get("cci_annotation_review")
+            or metadata.get("cci_volume_display")
         )
 
     @classmethod
@@ -2510,6 +2528,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return True
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        if self._volume_panel.busy:
+            self._volume_panel.cancel()
+            self._volume_panel.status.setText(
+                "3D: cancellation requested. Close again after it stops."
+            )
+            event.ignore()
+            return
         if self._batch_worker is not None and self._batch_worker.isRunning():
             self._batch_worker.request_cancel()
             self._batch_status_label.setText(
@@ -4921,7 +4946,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and self._training_worker.isRunning()
         )
         batch_running = self._batch_worker is not None
-        running = inference_running or training_running or batch_running
+        running = (
+            inference_running or training_running or batch_running
+            or self._volume_panel.busy
+        )
+        self._volume_panel.update_context(
+            external_busy=inference_running or training_running or batch_running or has_crop
+        )
         self._new_project_button.setEnabled(not running and not has_crop)
         self._new_project_task_combo.setEnabled(not running and not has_crop)
         self._open_project_button.setEnabled(not running and not has_crop)
@@ -5060,6 +5091,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             and not has_crop
             and not running
             and self._is_labels_layer(active_mask)
+            and not (getattr(active_mask, "metadata", {}) or {}).get("cci_volume_display")
             and active_mask is not self._segmentation_layer()
         )
         self._new_instance_button.setEnabled(is_segment and has_mask and not running)

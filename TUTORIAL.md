@@ -36,6 +36,20 @@ After saving an annotation and locking the project settings, expand **Batch imag
 
 The default output parent is `Prediction` inside the input folder; you can choose another. Each run has its own folder containing the prediction files and `analysis_metadata.json`. Use **Cancel Batch** to stop after the current cancellable operation; completed outputs remain available.
 
+## Predict a volume
+
+Open a segmentation project, load a compatible model, and expand **3D inference and assembly**. Choose the source volume. Z, Y, X and channel axes are filled from declared axis metadata when possible; choose them explicitly for an ambiguous image. Select one fixed index for each acquisition axis such as time. Set **First Z (inclusive)** and **Last Z (exclusive)** to choose the range; a range of 0 to 10 processes slices 0 through 9.
+
+The volume uses the project's shared R/G/B channels, filtering and normalization. Model, device, confidence and tile settings come from **Large-image tiled prediction**. The channel axis selector in the 3D section resolves where those channels are located in the volume. Inversion and component cleanup are volume controls; **Preserve all components** is the default. Border objects are retained.
+
+Choose a preview Z and click **Preview Slice Conversion** to inspect the RGB input over lazy views of the original selected channels. These raw views keep the source pixel values and display the volume in ZYX order. The original image stays in napari, temporarily hidden while the canonical raw views are shown.
+
+Click **Predict Z Slices**. Results go to a new run folder under `<project>/Prediction/` unless you choose another output parent. Progress and cancellation run in the background. Once inference finishes, the plugin displays the raw channels and a read-only **3D slice predictions** Labels layer. Scroll Z or switch napari to its 3D view to inspect it. Labels have unique display IDs across slices and class colors; select a label to see its source Z, local ID, class and confidence. These are unassembled slice instances; connecting them into 3D objects is the next implementation phase.
+
+Use the saved-run field and **Open Saved Run** to reopen stored masks without running the model. When the selected source matches the saved pixels and geometry, its saved Z range and acquisition selection are used for the raw overlay. Masks can also be opened without the source or model; the status explains when the raw overlay is unavailable. Verification runs in the background.
+
+After cancellation or a failure, completed slices remain on disk. Enable **Show completed slices from an incomplete run** before opening partial output; unfinished slices are marked in metadata and displayed as zeros. To continue inference, select the matching source and model, restore the original axes, Z range, conversion and tile settings, and click **Resume Saved Run**. Resume checks the source and model fingerprints before reusing completed slices. Closing the plugin during active 3D work requests cancellation; close it again once the worker stops.
+
 ## Retrain
 
 In **Dataset building and retraining**, select a starting model, preview the dataset, and start training after validation passes. A normal validation split needs at least two independent source groups. **Train without independent validation** is available for exploratory runs with fewer groups. A completed validated run stores its model and run metadata in a new retraining folder; loading the new model for prediction is a separate choice.
