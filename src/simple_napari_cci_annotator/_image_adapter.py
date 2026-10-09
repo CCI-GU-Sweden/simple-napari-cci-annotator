@@ -302,9 +302,54 @@ class ImageAdapter:
         base_stem: str | None = None,
         invert: bool = False,
     ) -> ConvertedImage:
-        shape = _shape_of(image_layer.data)
         plane = self.plane_selection(image_layer, viewer, settings)
-        channels = self._extract_channels(image_layer.data, shape, plane, settings)
+        return self.convert_plane(
+            image_layer.data,
+            plane,
+            settings,
+            base_stem=base_stem or getattr(image_layer, "name", "image"),
+            invert=invert,
+        )
+
+    def convert_plane(
+        self,
+        data,
+        plane: PlaneSelection,
+        settings: ImageProcessingSettings,
+        *,
+        base_stem: str = "image",
+        invert: bool = False,
+    ) -> ConvertedImage:
+        """Convert an explicit plane without consulting a viewer's position."""
+        shape = _shape_of(data)
+        settings.validate(shape)
+        if (
+            len(plane.axis_indices) != len(shape)
+            or len(plane.axis_labels) != len(shape)
+            or len(plane.plane_axes) != 2
+            or len(set(plane.plane_axes)) != 2
+            or any(
+                isinstance(axis, (bool, np.bool_))
+                or not isinstance(axis, (int, np.integer))
+                or not 0 <= axis < len(shape)
+                for axis in plane.plane_axes
+            )
+            or settings.channel_axis in plane.plane_axes
+        ):
+            raise ImageConversionError("Invalid explicit Y, X plane selection.")
+        for axis, index in enumerate(plane.axis_indices):
+            if axis in plane.plane_axes or axis == settings.channel_axis:
+                if index is not None:
+                    raise ImageConversionError(
+                        "Spatial and channel axes must remain unsliced."
+                    )
+            elif (
+                isinstance(index, (bool, np.bool_))
+                or not isinstance(index, (int, np.integer))
+                or not 0 <= index < shape[axis]
+            ):
+                raise ImageConversionError(f"Invalid plane index for axis {axis}.")
+        channels = self._extract_channels(data, shape, plane, settings)
         reference_shape = next(
             channel.shape for channel in channels if channel is not None
         )
@@ -336,10 +381,9 @@ class ImageAdapter:
             statistics.append(stats)
 
         rgb = np.ascontiguousarray(np.stack(normalized, axis=-1), dtype=np.uint8)
-        source_name = base_stem or getattr(image_layer, "name", "image")
         return ConvertedImage(
             data=rgb,
-            sample_id=self.sample_id(source_name, plane, settings.channel_axis),
+            sample_id=self.sample_id(base_stem, plane, settings.channel_axis),
             plane=plane,
             settings=settings,
             normalization_stats=tuple(statistics),

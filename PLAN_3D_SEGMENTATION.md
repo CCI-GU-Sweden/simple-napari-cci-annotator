@@ -167,6 +167,8 @@ Initially make these displays read-only and use link decisions for corrections. 
 
 ## Implementation sequence and acceptance checks
 
+Point 1 is implemented in `_volume_adapter.py`, with shared explicit-plane conversion in `_image_adapter.py`. The input records capture axes, acquisition indices, Z range, project and resolved channel settings, and canonical ZYX geometry without loading the volume. Axis-aligned scale and translation are supported; rotation, shear, and additional affine transforms are explicitly rejected for now. The collapsible section and prediction actions remain scheduled for points 2 and 3.
+
 1. **Define volume contracts and axes.** Add the adapter and settings/result records. Validate grayscale, RGB, channel-first/channel-last layouts, moved channel axes, acquisition selection, anisotropic scale, and invalid ambiguous inputs. Confirm a selected slice produces the same converted RGB pixels as the 2D path.
 2. **Implement stored slice inference.** Add storage, manifest handling, and a cancellable core runner. Verify equality with the existing per-plane prediction path under the same cleanup policy, including tiled seams, padding, empty slices, class records, and source shape. Add the preservation policy and tests for disconnected components separately.
 3. **Add the collapsible section and intermediate preview.** Confirm raw volume and masks align in Z, Y, X and world coordinates. Check preview before assembly, progress updates, cancellation, closed sources, and scrolling during inference. Verify opening stored masks does not trigger model inference.
