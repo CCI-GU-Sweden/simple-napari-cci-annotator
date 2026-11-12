@@ -32,6 +32,7 @@ dependencies = [
     "scikit-image",
     "scipy",
     "tifffile",
+    "zarr>=3.0,<4; python_version >= '3.11'",
 ]
 
 [project.optional-dependencies]

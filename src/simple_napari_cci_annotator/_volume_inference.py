@@ -27,6 +27,7 @@ class VolumeInferenceSettings:
     inference: InferenceSettings = InferenceSettings()
     component_policy: str = "preserve"
     memory_budget_bytes: int = 1024**3
+    chunked: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,10 +88,34 @@ class VolumeInferenceRunner:
             or rows * columns * inference.max_detections >= np.iinfo(np.uint32).max
         ):
             raise VolumeInferenceError("Slice instance IDs exceed uint32 capacity.")
-        # Conservative array estimate for conversion, cleanup, tile assembly,
-        # and component extraction. Model/driver memory is outside this budget.
-        area = rows * columns * core**2 if tiled else height * width
-        estimate = area * 256 + inference.tile_size**2 * 64
+        if type(settings.chunked) is not bool:
+            raise VolumeInferenceError("Chunked mode must be true or false.")
+        if settings.chunked:
+            from ._volume_zarr import _require_zarr
+
+            _require_zarr()
+            processing = self.volume.processing
+            if processing.filter_method == "low_pass" or processing.normalization not in {
+                "min_max", "simple_max", "fixed_range", "dtype_range", "percentile"
+            }:
+                raise VolumeInferenceError(
+                    "Chunked inference currently requires a local filter and min-max, "
+                    "simple-max, fixed-range, dtype-range, or supported percentile normalization."
+                )
+            dtype = np.dtype(self.volume.source_dtype)
+            if processing.normalization == "percentile" and (
+                processing.filter_method != "none" or dtype.kind not in "uib" or dtype.itemsize > 2
+            ):
+                raise VolumeInferenceError(
+                    "Chunked percentile requires unfiltered 8- or 16-bit integer data."
+                )
+            # Tile arrays, chunk conversion and component buffers. This does not
+            # include model, source-reader chunks, or graph/instance metadata.
+            estimate = inference.tile_size**2 * 256 + 512**2 * 192 + max(height, width) * 32
+        else:
+            # Conservative full-plane estimate. Model memory is additional.
+            area = rows * columns * core**2 if tiled else height * width
+            estimate = area * 256 + inference.tile_size**2 * 64
         if estimate > settings.memory_budget_bytes:
             raise VolumeInferenceError(
                 f"Estimated slice array memory ({estimate} bytes) exceeds "
@@ -137,6 +162,8 @@ class VolumeInferenceRunner:
                 "tile_workers": 1,
                 "mask_dtype": "uint32",
             }
+            if self.settings.chunked:
+                contract["execution_mode"] = "chunked-v1"
             _check_cancelled(cancelled)
             if resume:
                 store = VolumeMaskStore.open(
@@ -158,6 +185,19 @@ class VolumeInferenceRunner:
             for z_index in self.volume.selection.z_indices:
                 _check_cancelled(cancelled)
                 if store.is_complete(z_index):
+                    continue
+                if self.settings.chunked:
+                    from ._volume_chunked_pipeline import predict_chunked_slice
+
+                    report(store.completed_count, f"Converting source Z={z_index} in chunks")
+                    predict_chunked_slice(
+                        self.volume, z_index, self.predictor, self.classes,
+                        self.settings, store, cancelled=cancelled,
+                        progress=lambda current, count, text: report(
+                            store.completed_count, f"Z={z_index} · {current}/{count} tiles · {text}"
+                        ),
+                    )
+                    report(store.completed_count, f"Stored source Z={z_index}")
                     continue
                 converted = self.volume.convert_slice(z_index)
                 _check_cancelled(cancelled)

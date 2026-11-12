@@ -45,7 +45,24 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _mask_digest(mask: np.ndarray) -> str:
-    return hashlib.sha256(np.ascontiguousarray(mask).tobytes()).hexdigest()
+    digest = hashlib.sha256()
+    for block in _mask_blocks(mask):
+        digest.update(np.ascontiguousarray(block).tobytes())
+    return digest.hexdigest()
+
+
+def _mask_blocks(mask, *, target_bytes=4 * 1024 * 1024):
+    """Stream full-width rows in C order so checksums remain compatible."""
+    rows = max(1, target_bytes // max(1, mask.shape[1] * np.dtype(mask.dtype).itemsize))
+    for start in range(0, mask.shape[0], rows):
+        yield np.asarray(mask[start:min(start + rows, mask.shape[0]), :])
+
+
+def _mask_ids(mask):
+    present = set()
+    for block in _mask_blocks(mask):
+        present.update(int(value) for value in np.unique(block) if value)
+    return present
 
 
 def _writer_lock(root: Path):
@@ -241,7 +258,7 @@ class VolumeMaskStore:
         ):
             raise VolumeStorageError("Slice mask checksum or metadata does not match.")
         records = metadata.get("instances", {})
-        present = {str(int(value)) for value in np.unique(mask) if value}
+        present = {str(value) for value in _mask_ids(mask)}
         if set(records) != present or len(records) != entry.get("instance_count"):
             raise VolumeStorageError("Slice instance records do not match the mask.")
 
@@ -251,6 +268,16 @@ class VolumeMaskStore:
         if not self._manifest["slices"][index]["complete"]:
             raise VolumeStorageError("Slice has not been committed.")
         return self._masks[index].copy(), _read_json(self._metadata_path(index))
+
+    def read_block(self, z_index: int, y: slice, x: slice) -> np.ndarray:
+        """Read a bounded block from a committed slice."""
+        self._ensure_open()
+        index = self._index(z_index)
+        if not self._manifest["slices"][index]["complete"]:
+            raise VolumeStorageError("Slice has not been committed.")
+        if not isinstance(y, slice) or not isinstance(x, slice):
+            raise VolumeStorageError("Mask blocks require XY slices.")
+        return self._masks[index, y, x].copy()
 
     def slice_metadata(self, z_index: int) -> dict[str, Any]:
         """Read committed slice records without copying its image-sized mask."""
@@ -267,10 +294,10 @@ class VolumeMaskStore:
         index = self._index(z_index)
         if self._manifest["slices"][index]["complete"]:
             raise VolumeStorageError("Cannot overwrite a committed slice.")
-        mask = np.asarray(result.mask)
-        if mask.shape != self._masks.shape[1:] or mask.dtype != np.dtype("uint32"):
+        mask = result.mask
+        if tuple(mask.shape) != self._masks.shape[1:] or np.dtype(mask.dtype) != np.dtype("uint32"):
             raise VolumeStorageError("Prediction mask must match the stored uint32 XY plane.")
-        present = {int(value) for value in np.unique(mask) if value}
+        present = _mask_ids(mask)
         if present != set(result.instances) or present != set(range(1, len(present) + 1)):
             raise VolumeStorageError("Slice IDs must be compact and match instance records.")
         mask_digest = _mask_digest(mask)
@@ -293,7 +320,10 @@ class VolumeMaskStore:
             ],
         }
         # Data and metadata must become durable before the commit marker.
-        self._masks[index] = mask
+        offset = 0
+        for block in _mask_blocks(mask):
+            self._masks[index, offset:offset + len(block), :] = block
+            offset += len(block)
         self._masks.flush()
         with (self.root / "slice_masks.npy").open("r+b") as stream:
             os.fsync(stream.fileno())

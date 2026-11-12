@@ -154,6 +154,34 @@ def test_preview_preserves_raw_pixels_and_aligns_selected_z(panel):
     assert panel._selected_source.visible
 
 
+def test_zarr_conversion_runs_in_background_and_opens_lazy_source(panel, qtbot, tmp_path):
+    pytest.importorskip("zarr", minversion="3.0")
+    source = panel._selected_source
+    expected = source.data[1:3].copy()
+    panel.z_start.setValue(1)
+    panel.z_stop.setValue(3)
+    destination = tmp_path / "em.zarr"
+    panel.convert_zarr(destination)
+    assert panel.busy
+    assert not panel.zarr_convert_button.isEnabled()
+    wait_idle(panel, qtbot)
+    converted = panel._selected_source
+    assert converted is not source
+    assert isinstance(converted.data, da.Array)
+    np.testing.assert_array_equal(converted.data.compute(), expected)
+    assert converted.scale == (2, 0.3, 0.4)
+    assert converted.translate == (12, 20, 30)
+    assert converted.metadata["axes"] == "ZYX"
+    assert panel.prepare().geometry.shape == (2, 6, 7)
+    assert source in panel.viewer.layers
+    panel.chunked_inference.setChecked(True)
+    panel.memory_mb.setValue(64)
+    panel.start()
+    wait_idle(panel, qtbot)
+    assert panel.host._model.calls == 2
+    assert panel._views[-1].metadata["cci_volume_role"] == "slice_predictions"
+
+
 def test_predicts_and_displays_lazy_read_only_unassembled_masks(panel, qtbot):
     panel.start()
     assert panel.busy

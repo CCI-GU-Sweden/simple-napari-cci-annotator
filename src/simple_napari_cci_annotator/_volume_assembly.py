@@ -63,8 +63,8 @@ class AssemblyResult:
 def assemble_volume(root, settings=None, *, cancelled=None, progress=None):
     """Build a deterministic graph from a complete, verified stored run.
 
-    Overlaps are accumulated in XY blocks. At most two slice masks and block
-    temporaries are resident, while graph memory grows with nodes and overlaps.
+    Overlaps are accumulated in XY blocks; graph memory grows with nodes and
+    overlaps, rather than with the total number of voxels.
     """
     settings = settings or AssemblySettings()
     settings.validate()
@@ -72,6 +72,7 @@ def assemble_volume(root, settings=None, *, cancelled=None, progress=None):
         if not store.complete:
             raise VolumeStorageError("Assembly requires every slice to be complete.")
         entries = store.manifest["slices"]
+        shape = tuple(store.manifest["contract"]["volume"]["geometry"]["shape"][1:])
         nodes = {}
         links = []
         parent = {}
@@ -86,7 +87,7 @@ def assemble_volume(root, settings=None, *, cancelled=None, progress=None):
         for index, entry in enumerate(entries):
             _check_cancelled(cancelled)
             z = entry["z_index"]
-            mask, metadata = store.read_slice(z)
+            metadata = store.slice_metadata(z)
             current = {}
             for local, record in metadata["instances"].items():
                 key = (z, int(local))
@@ -96,8 +97,9 @@ def assemble_volume(root, settings=None, *, cancelled=None, progress=None):
                 nodes[key] = current[node.local_id] = node
                 parent[key] = key
             if previous is not None:
-                previous_z, previous_mask, previous_nodes = previous
-                for (left, right), count in sorted(_overlaps(previous_mask, mask, cancelled).items()):
+                previous_z, previous_nodes = previous
+                overlaps = _overlaps(store, previous_z, z, shape, cancelled) if previous_nodes and current else {}
+                for (left, right), count in sorted(overlaps.items()):
                     a, b = previous_nodes[left], current[right]
                     fraction = count / min(a.area, b.area)
                     iou = count / (a.area + b.area - count)
@@ -112,7 +114,7 @@ def assemble_volume(root, settings=None, *, cancelled=None, progress=None):
                         root_a, root_b = find(source), find(target)
                         if root_a != root_b:
                             parent[max(root_a, root_b)] = min(root_a, root_b)
-            previous = (z, mask, current)
+            previous = (z, current)
             if progress is not None:
                 progress(index + 1, len(entries))
         roots = sorted({find(key) for key in nodes})
@@ -126,13 +128,14 @@ def _check_cancelled(cancelled):
         raise InferenceCancelled("Volume assembly cancelled.")
 
 
-def _overlaps(first, second, cancelled, block_size=512):
+def _overlaps(store, first_z, second_z, shape, cancelled, block_size=512):
     counts = {}
-    for y in range(0, first.shape[0], block_size):
-        for x in range(0, first.shape[1], block_size):
+    for y in range(0, shape[0], block_size):
+        for x in range(0, shape[1], block_size):
             _check_cancelled(cancelled)
-            a = first[y:y + block_size, x:x + block_size]
-            b = second[y:y + block_size, x:x + block_size]
+            region_y, region_x = slice(y, y + block_size), slice(x, x + block_size)
+            a = store.read_block(first_z, region_y, region_x)
+            b = store.read_block(second_z, region_y, region_x)
             both = (a != 0) & (b != 0)
             pairs = (a[both].astype(np.uint64) << np.uint64(32)) | b[both].astype(np.uint64)
             values, frequencies = np.unique(pairs, return_counts=True)

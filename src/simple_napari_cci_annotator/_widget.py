@@ -3048,6 +3048,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
 
     def _convert_current_image(self, image_layer) -> ConvertedImage:
         settings = self._effective_processing_settings()
+        source_metadata = getattr(image_layer, "metadata", {}) or {}
+        if (source_metadata.get("cci_zarr_source") and source_metadata.get("axes") == "ZYXC"
+                and settings.channel_axis != 3):
+            raise ImageConversionError(
+                "This Zarr copy has its channel axis at 3. The current project "
+                "uses a different channel-axis setting; use 3D inference, or a "
+                "project configured for channel axis 3."
+            )
         if self._is_annotation_review_image(image_layer):
             data = np.asarray(image_layer.data)
             if data.dtype != np.uint8 or data.ndim != 3 or data.shape[2] != 3:

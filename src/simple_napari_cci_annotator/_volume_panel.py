@@ -24,6 +24,7 @@ from ._volume_inference import (
 )
 from ._volume_store import VolumeMaskStore
 from ._volume_worker import VolumeInferenceWorker
+from ._volume_zarr import open_volume_zarr, write_volume_zarr
 
 
 class _ArraySource:
@@ -178,6 +179,34 @@ class _AssemblyWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class _ZarrWorker(QThread):
+    progress = Signal(int, int, str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, volume, destination):
+        super().__init__()
+        self.volume = volume
+        self.destination = Path(destination)
+        self._cancel = Event()
+
+    def request_cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            path = write_volume_zarr(
+                self.volume, self.destination, cancelled=self._cancel.is_set,
+                progress=lambda n, total: self.progress.emit(n, total, "Writing Zarr chunks"),
+            )
+            self.succeeded.emit(path)
+        except InferenceCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class VolumePanel(QWidget):
     busy_changed = Signal()
 
@@ -188,6 +217,9 @@ class VolumePanel(QWidget):
         self.worker = None
         self.load_worker = None
         self.assembly_worker = None
+        self.zarr_worker = None
+        self._zarr_source = None
+        self._pending_zarr_source = None
         self._run_source = None
         self._load_volume = None
         self._load_source = None
@@ -200,6 +232,11 @@ class VolumePanel(QWidget):
         self._displayed_run = None
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._source_changed)
+        self.zarr_convert_button = QPushButton("Copy Selected Volume to Zarr v3")
+        self.zarr_convert_button.setToolTip("Copy the selected Z range and acquisition indices as raw chunked pixels.")
+        self.zarr_convert_button.clicked.connect(self._choose_zarr_output)
+        self.zarr_open_button = QPushButton("Open Plugin Zarr Volume")
+        self.zarr_open_button.clicked.connect(self._choose_zarr_input)
         self.axis_combos = {name: QComboBox() for name in ("Z", "Y", "X", "C")}
         for combo in self.axis_combos.values():
             combo.currentIndexChanged.connect(self._axes_changed)
@@ -212,6 +249,12 @@ class VolumePanel(QWidget):
         self.memory_mb = QSpinBox()
         self.memory_mb.setRange(16, 65536)
         self.memory_mb.setValue(1024)
+        self.chunked_inference = QCheckBox("Chunked slice inference (experimental)")
+        self.chunked_inference.setToolTip(
+            "Use disk-backed chunks. Supports local filters and min-max, simple-max, "
+            "fixed-range, dtype-range, or unfiltered 8/16-bit percentile normalization. Source-reader chunks, "
+            "model memory and object metadata are outside the array estimate."
+        )
         self.invert = QCheckBox("Invert volume intensities")
         self.policy = QComboBox()
         self.policy.addItem("Preserve all components", "preserve")
@@ -270,6 +313,7 @@ class VolumePanel(QWidget):
         form.addRow("Preview source Z", self.preview_z)
         form.addRow("Component cleanup", self.policy)
         form.addRow("Array memory budget (MiB)", self.memory_mb)
+        form.addRow(self.chunked_inference)
         form.addRow(self.invert)
         output_row = QHBoxLayout()
         output_row.addWidget(self.output_input)
@@ -287,6 +331,10 @@ class VolumePanel(QWidget):
             actions.addWidget(button)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        zarr_actions = QHBoxLayout()
+        zarr_actions.addWidget(self.zarr_convert_button)
+        zarr_actions.addWidget(self.zarr_open_button)
+        layout.addLayout(zarr_actions)
         layout.addWidget(self.processing_label)
         layout.addWidget(self.readiness_label)
         layout.addWidget(self.preview_button)
@@ -320,13 +368,16 @@ class VolumePanel(QWidget):
 
     @property
     def busy(self):
-        return self.worker is not None or self.load_worker is not None or self.assembly_worker is not None
+        return any(worker is not None for worker in
+                   (self.worker, self.load_worker, self.assembly_worker, self.zarr_worker))
 
     def refresh_sources(self, event=None):
         if self.busy:
             if self.worker is not None and self._run_source not in self.viewer.layers:
                 self.worker.request_cancel()
                 self.status.setText("3D: source closed; stopping after the current operation.")
+            if self.zarr_worker is not None and not any(self._zarr_source is item for item in self.viewer.layers):
+                self.zarr_worker.request_cancel()
             return
         sources = [item for item in self.viewer.layers if self.host._is_source_image_layer(item)]
         if len(sources) == len(self._sources) and all(a is b for a, b in zip(sources, self._sources)):
@@ -350,6 +401,7 @@ class VolumePanel(QWidget):
             return
         index = self.source_combo.currentData()
         source = self._sources[index] if index is not None and index >= 0 else None
+        changed_source = source is not self._selected_source
         self._selected_source = source
         self._updating = True
         shape = () if source is None else source.data.shape
@@ -365,6 +417,8 @@ class VolumePanel(QWidget):
                 combo.addItem(f"Axis {axis} · size {size}", axis)
             combo.setCurrentIndex(0 if defaults.get(name) is None else defaults[name] + 1)
         self._updating = False
+        if changed_source:
+            self.z_start.setValue(0)
         self._axes_changed()
 
     def _axes_changed(self, index=None):
@@ -439,6 +493,7 @@ class VolumePanel(QWidget):
         for control in (
             self.source_combo, *self.axis_combos.values(), self.fixed_widget,
             self.z_start, self.z_stop, self.preview_z, self.memory_mb, self.policy,
+            self.chunked_inference,
             self.invert, self.output_input, self.output_button, self.run_input,
             self.allow_partial,
             self.link_pixels, self.link_fraction, self.link_iou,
@@ -448,6 +503,8 @@ class VolumePanel(QWidget):
         self.predict_button.setEnabled(enabled and ready)
         self.resume_button.setEnabled(enabled and ready and bool(self.run_input.text().strip()))
         self.open_button.setEnabled(enabled)
+        self.zarr_convert_button.setEnabled(enabled and self._selected_source is not None)
+        self.zarr_open_button.setEnabled(enabled)
         self.assemble_button.setEnabled(enabled and bool(self.run_input.text().strip()))
         self.open_assembly_button.setEnabled(enabled)
         self.cancel_button.setEnabled(self.busy)
@@ -465,6 +522,81 @@ class VolumePanel(QWidget):
         chosen = QFileDialog.getExistingDirectory(self, "Choose volume prediction output parent")
         if chosen:
             self.output_input.setText(chosen)
+
+    def _choose_zarr_output(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Create Zarr v3 volume", "volume.zarr", "Zarr directory (*.zarr)")
+        if path:
+            if not path.lower().endswith(".zarr"):
+                path += ".zarr"
+            self.convert_zarr(Path(path))
+
+    def convert_zarr(self, destination):
+        if self.busy or self._external_busy:
+            return
+        try:
+            volume = self.prepare()
+            self._zarr_source = self._selected_source
+            self.zarr_worker = _ZarrWorker(volume, destination)
+            self.zarr_worker.progress.connect(self._progress)
+            self.zarr_worker.succeeded.connect(self._zarr_written)
+            self.zarr_worker.failed.connect(lambda message: self.status.setText(f"3D: Zarr conversion failed · {message}"))
+            self.zarr_worker.cancelled.connect(lambda: self.status.setText("3D: Zarr conversion cancelled; incomplete output cannot be opened."))
+            self.zarr_worker.finished.connect(self._zarr_finished)
+            self.status.setText("3D: preparing Zarr conversion.")
+            self.update_context()
+            self.busy_changed.emit()
+            self.zarr_worker.start()
+        except Exception as exc:
+            self.host._show_error(f"Could not start Zarr conversion: {exc}")
+
+    def _zarr_written(self, path):
+        try:
+            self._pending_zarr_source = self._add_zarr_source(path)
+            self.status.setText(f"3D: Zarr v3 volume saved and opened · {path}")
+        except Exception as exc:
+            self.status.setText(f"3D: Zarr saved at {path}, but could not be opened: {exc}")
+
+    def _choose_zarr_input(self):
+        path = QFileDialog.getExistingDirectory(self, "Open plugin Zarr volume")
+        if path:
+            try:
+                source = self._add_zarr_source(path)
+                self.refresh_sources()
+                index = next(i for i, item in enumerate(self._sources) if item is source)
+                self.source_combo.setCurrentIndex(index + 1)
+                self.status.setText(f"3D: opened Zarr volume · {path}")
+            except Exception as exc:
+                self.host._show_error(f"Could not open Zarr volume: {exc}")
+
+    def _add_zarr_source(self, path):
+        data, info = open_volume_zarr(path)
+        multichannel = info["axes"] == "ZYXC"
+        scale = tuple(info["scale"]) + ((1.0,) if multichannel else ())
+        translate = tuple(info["translate"]) + ((0.0,) if multichannel else ())
+        kwargs = {}
+        if not multichannel and all(unit is not None for unit in info["units"]):
+            kwargs["units"] = tuple(info["units"])
+        return self.viewer.add_image(
+            data, name=f"Zarr · {info['source_name']}", rgb=False,
+            axis_labels=tuple(info["axes"]), scale=scale, translate=translate,
+            metadata={"axes": info["axes"], "cci_zarr_source": str(path)}, **kwargs,
+        )
+
+    def _zarr_finished(self):
+        worker = self.zarr_worker
+        self.zarr_worker = None
+        self._zarr_source = None
+        if worker is not None:
+            worker.deleteLater()
+        self.refresh_sources()
+        if self._pending_zarr_source is not None:
+            index = next((i for i, item in enumerate(self._sources)
+                          if item is self._pending_zarr_source), None)
+            self._pending_zarr_source = None
+            if index is not None:
+                self.source_combo.setCurrentIndex(index + 1)
+        self.update_context()
+        self.busy_changed.emit()
 
     def _choose_run(self):
         root = self.run_input.text().strip() or QFileDialog.getExistingDirectory(self, "Open a saved volume run")
@@ -537,6 +669,7 @@ class VolumePanel(QWidget):
                 VolumeInferenceSettings(
                     self.host._inference_settings(), component_policy=self.policy.currentData(),
                     memory_budget_bytes=self.memory_mb.value() * 1024**2,
+                    chunked=self.chunked_inference.isChecked(),
                 ),
             )
             runner.validate()
@@ -804,7 +937,7 @@ class VolumePanel(QWidget):
         self.busy_changed.emit()
 
     def cancel(self):
-        for worker in (self.worker, self.load_worker, self.assembly_worker):
+        for worker in (self.worker, self.load_worker, self.assembly_worker, self.zarr_worker):
             if worker is not None:
                 worker.request_cancel()
         self.status.setText("3D: cancellation requested; completed slices will be retained.")

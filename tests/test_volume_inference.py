@@ -119,6 +119,135 @@ def test_completed_empty_slices_are_distinct_from_missing_slices(tmp_path):
         assert not np.any(store.mask_array(unique_ids=True).compute())
 
 
+def test_store_writes_and_verifies_chunked_zarr_mask(tmp_path):
+    zarr = pytest.importorskip("zarr", minversion="3")
+    source = volume(shape=(1, 8, 9))
+    predictor = Predictor(tmp_path / "model.pt")
+    reference = runner(tmp_path, source=source, predictor=predictor).run(tmp_path / "reference")
+    with VolumeMaskStore.open(reference.run_root) as store:
+        contract = store.manifest["contract"]
+        expected, metadata = store.read_slice(0)
+    array = zarr.create_array(store=str(tmp_path / "mask.zarr"), data=expected,
+                              chunks=(3, 4), zarr_format=3)
+    result = predictor.predict_image(source.convert_slice(0).image.data, INFERENCE, CLASSES,
+                                     component_policy="preserve")
+    result = split_prediction_components(result, CLASSES)
+    result = replace(result, mask=array)
+    with VolumeMaskStore.create(tmp_path / "chunked", contract) as store:
+        store.write_slice(0, result, metadata["conversion"])
+        store.set_status("completed")
+    with VolumeMaskStore.open(tmp_path / "chunked") as store:
+        actual, _ = store.read_slice(0)
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(2, 8, 9), (2, 80, 90)])
+def test_chunked_volume_runner_matches_existing_predictions(tmp_path, shape):
+    pytest.importorskip("zarr", minversion="3")
+    source = volume(shape)
+    predictor = Predictor(tmp_path / "model.pt")
+    standard = runner(tmp_path, source=source, predictor=predictor).run(tmp_path / "standard")
+    settings = VolumeInferenceSettings(INFERENCE, memory_budget_bytes=128 * 1024**2, chunked=True)
+    chunked = runner(tmp_path, source=source, predictor=predictor, settings=settings).run(tmp_path / "chunked")
+    with VolumeMaskStore.open(standard.run_root) as normal, VolumeMaskStore.open(chunked.run_root) as out:
+        assert out.manifest["contract"]["execution_mode"] == "chunked-v1"
+        for z in source.selection.z_indices:
+            expected, expected_meta = normal.read_slice(z)
+            actual, actual_meta = out.read_slice(z)
+            np.testing.assert_array_equal(actual, expected)
+            assert actual_meta["instances"] == expected_meta["instances"]
+            assert actual_meta["conversion"] == expected_meta["conversion"]
+            assert actual_meta["provenance"] == expected_meta["provenance"]
+
+
+def test_chunked_runner_rejects_unsupported_processing_before_creating_output(tmp_path):
+    source = volume()
+    source = replace(source, processing=replace(source.processing, filter_method="low_pass"))
+    settings = VolumeInferenceSettings(INFERENCE, chunked=True)
+    with pytest.raises(VolumeInferenceError, match="local filter"):
+        runner(tmp_path, source=source, settings=settings).run(tmp_path / "not-created")
+    assert not (tmp_path / "not-created").exists()
+
+
+def test_chunked_runner_preserves_disconnected_components_across_xy_chunks(tmp_path):
+    pytest.importorskip("zarr", minversion="3")
+
+    class PixelPredictor(Predictor):
+        def predict_image(self, image, settings, classes, *, component_policy="largest"):
+            mask = image[..., 0] > 100
+            predictions = ([PredictedInstance(mask, (0, 0, mask.shape[1], mask.shape[0]), 0, 0.8)]
+                           if np.any(mask) else [])
+            return compose_predictions(predictions, mask.shape, classes, component_policy=component_policy)
+
+    data = np.zeros((1, 530, 550), dtype=np.uint16)
+    data[0, 100:525, 120:535] = 500
+    data[0, 15:45, 20:45] = 500
+    source = volume(shape=data.shape, data=data)
+    predictor = PixelPredictor(tmp_path / "model.pt")
+    inference = InferenceSettings(tile_size=256, overlap=32, max_detections=10)
+    ordinary = VolumeInferenceSettings(inference)
+    chunked = VolumeInferenceSettings(inference, memory_budget_bytes=128 * 1024**2, chunked=True)
+    a = runner(tmp_path, source=source, predictor=predictor, settings=ordinary).run(tmp_path / "ordinary")
+    b = runner(tmp_path, source=source, predictor=predictor, settings=chunked).run(tmp_path / "chunked")
+    with VolumeMaskStore.open(a.run_root) as first, VolumeMaskStore.open(b.run_root) as second:
+        expected, expected_meta = first.read_slice(0)
+        actual, actual_meta = second.read_slice(0)
+        np.testing.assert_array_equal(actual, expected)
+        assert actual_meta["instances"] == expected_meta["instances"]
+        assert actual_meta["provenance"]["slice_components"] == expected_meta["provenance"]["slice_components"]
+        assert len(actual_meta["instances"]) == 2
+
+
+def test_chunked_run_cancel_resume_preserves_completed_slices(tmp_path):
+    pytest.importorskip("zarr", minversion="3")
+    source = volume(shape=(3, 8, 9))
+    predictor = Predictor(tmp_path / "model.pt")
+    settings = VolumeInferenceSettings(INFERENCE, chunked=True)
+    current = runner(tmp_path, source=source, predictor=predictor, settings=settings)
+    cancel = [False]
+
+    def progress(completed, total, message):
+        if message == "Stored source Z=0":
+            cancel[0] = True
+
+    path = tmp_path / "resumable"
+    first = current.run(path, cancelled=lambda: cancel[0], progress=progress)
+    assert first.status == "cancelled" and first.completed_slices == 1
+    assert not list(path.glob(".cci-chunks-*"))
+    result = current.run(path, resume=True)
+    assert result.status == "completed" and predictor.calls and len(predictor.calls) == 3
+    with VolumeMaskStore.open(path) as store:
+        assert store.complete
+
+
+def test_chunked_runner_never_requests_a_complete_large_source_plane(tmp_path):
+    pytest.importorskip("zarr", minversion="3")
+
+    class BlockOnlySource:
+        shape = (1, 530, 550)
+        dtype = np.dtype("uint16")
+
+        def __init__(self):
+            self.requests = []
+
+        def __getitem__(self, index):
+            z, y, x = index
+            assert isinstance(z, int) and isinstance(y, slice) and isinstance(x, slice)
+            height = min(y.stop, self.shape[1]) - y.start
+            width = min(x.stop, self.shape[2]) - x.start
+            assert height <= 512 and width <= 512
+            self.requests.append((height, width))
+            return np.zeros((height, width), dtype=self.dtype)
+
+    data = BlockOnlySource()
+    source = volume(shape=data.shape, data=data)
+    inference = InferenceSettings(tile_size=256, overlap=32, max_detections=10)
+    settings = VolumeInferenceSettings(inference, memory_budget_bytes=128 * 1024**2, chunked=True)
+    result = runner(tmp_path, source=source, settings=settings).run(tmp_path / "run")
+    assert result.status == "completed"
+    assert data.requests
+
+
 def test_selected_z_range_uses_global_z_in_records_and_local_storage(tmp_path):
     result = runner(tmp_path, source=volume((5, 8, 9), z_range=(2, 4))).run(tmp_path / "run")
     with VolumeMaskStore.open(result.run_root) as store:

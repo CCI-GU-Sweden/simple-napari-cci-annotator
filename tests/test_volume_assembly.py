@@ -107,3 +107,16 @@ def test_cancelled_assembly_is_not_published(tmp_path, monkeypatch):
     assert not (folder / "assembly.json").exists()
     with pytest.raises(VolumeStorageError):
         open_assembly(folder)
+
+
+def test_assembly_reads_mask_blocks_without_full_slices(tmp_path, monkeypatch):
+    mask = np.ones((7, 8), dtype=np.uint32)
+    root = make_store(tmp_path, [mask, mask], [{1: 0}, {1: 0}])
+
+    def forbid_full_slice(*args, **kwargs):
+        raise AssertionError("assembly must not read a whole slice")
+
+    monkeypatch.setattr(VolumeMaskStore, "read_slice", forbid_full_slice)
+    result = assemble_volume(root)
+    assert result.links[0].intersection == mask.size
+    assert len(set(result.object_for_node.values())) == 1
