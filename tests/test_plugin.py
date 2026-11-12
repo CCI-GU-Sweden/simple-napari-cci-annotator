@@ -1747,6 +1747,89 @@ def test_new_empty_segmentation_skips_full_validation(tmp_path, qtbot):
     widget._annotation_dirty = False
 
 
+@pytest.mark.parametrize("task", ["segment", "detect"])
+def test_stack_browsing_defers_conversion_and_annotation_until_requested(tmp_path, qtbot, task):
+    project = ProjectStore.initialize(tmp_path / task, task=task, classes={0: "Cell"})
+    viewer = _Viewer()
+    image = _Image(np.zeros((4, 32, 32), dtype=np.uint8), name="stack", metadata={"axes": "ZYX"})
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    with patch.object(widget, "_convert_current_image", wraps=widget._convert_current_image) as convert:
+        widget._set_project(project)
+        assert convert.call_count == 0
+        assert widget._annotation_deferred
+        viewer.dims.current_step = (1, 0, 0)
+        widget._on_current_step_changed()
+        assert convert.call_count == 0
+        widget._on_reload_labels()
+        assert convert.call_count == 1
+        layer = widget._segmentation_layer() if task == "segment" else widget._annotation_layer()
+        assert layer is not None and layer.visible
+        viewer.dims.current_step = (2, 0, 0)
+        widget._on_current_step_changed()
+        assert convert.call_count == 1
+        assert not layer.visible
+        assert widget._annotation_deferred
+        viewer.dims.current_step = (1, 0, 0)
+        widget._on_current_step_changed()
+        assert layer.visible
+        assert not widget._annotation_deferred
+        assert convert.call_count == 1
+
+
+def test_unsaved_stack_annotation_is_preserved_when_switch_is_cancelled(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project", task="segment", classes={0: "Cell"})
+    viewer = _Viewer()
+    image = _Image(np.zeros((4, 32, 32), dtype=np.uint8), name="stack", metadata={"axes": "ZYX"})
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    widget._on_reload_labels()
+    layer = widget._segmentation_layer()
+    widget._annotation_dirty = True
+    with patch.object(widget, "_resolve_unsaved_changes", return_value=False) as resolve:
+        viewer.dims.current_step = (1, 0, 0)
+        widget._on_current_step_changed()
+        resolve.assert_called_once()
+        assert widget._annotation_dirty and not layer.visible
+        assert not widget._new_instance_button.isEnabled()
+        viewer.dims.current_step = (0, 0, 0)
+        widget._on_current_step_changed()
+        assert layer.visible and widget._annotation_dirty
+    widget._annotation_dirty = False
+
+
+def test_saved_stack_annotation_reopens_on_request(tmp_path, qtbot):
+    project = ProjectStore.initialize(tmp_path / "project", task="segment", classes={0: "Cell"})
+    viewer = _Viewer()
+    image = _Image(np.zeros((2, 1024, 1024), dtype=np.uint8), name="stack", metadata={"axes": "ZYX"})
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    widget._on_reload_labels()
+    labels = widget._segmentation_layer()
+    widget._on_new_mask_instance()
+    labels.data[10:12, 10:12] = labels.selected_label
+    widget._on_labels_data_changed()
+    with patch.object(widget, "_show_info"):
+        widget._on_save_segmentation()
+    assert not widget._annotation_dirty
+    viewer.dims.current_step = (1, 0, 0)
+    widget._on_current_step_changed()
+    widget._on_reload_labels()
+    assert not np.any(widget._segmentation_layer().data)
+    viewer.dims.current_step = (0, 0, 0)
+    widget._on_current_step_changed()
+    widget._on_reload_labels()
+    assert widget._segmentation_layer().data[10, 10] == 1
+
+
 def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot):
     project = ProjectStore.initialize(
         tmp_path / "segment-project", task="segment", classes={0: "Cell"}

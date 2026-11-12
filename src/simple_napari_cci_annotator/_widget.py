@@ -165,6 +165,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._annotation_image_layer = None
         self._last_source_image_layer = None
         self._converted_image: ConvertedImage | None = None
+        self._annotation_deferred = False
+        self._deferred_layer_states = []
+        self._deferred_source = None
         self._current_sample_id: str | None = None
         self._annotation_dirty = False
         self._annotation_invalid_indices: tuple[int, ...] = ()
@@ -323,7 +326,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
         self._class_counts_label = QLabel("Class counts: unavailable")
         self._class_counts_label.setWordWrap(True)
 
-        self._reload_labels_button = QPushButton("Reload Labels")
+        self._reload_labels_button = QPushButton("Load / Reload Annotation")
+        self._reload_labels_button.setToolTip("Load or create an editable annotation for the current plane.")
         self._reload_labels_button.clicked.connect(self._on_reload_labels)
         self._save_annotation_button = QPushButton("Save Converted Image + BBoxes")
         self._new_instance_button = QPushButton("New Mask Instance")
@@ -1083,6 +1087,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if previous_grid is not None:
             self.napari_viewer.layers.remove(previous_grid)
         self._annotation_image_layer = None
+        self._annotation_deferred = False
+        self._deferred_layer_states = []
+        self._deferred_source = None
         self._annotation_invalid_indices = ()
         self._project = project
         self._annotation_io = AnnotationIO(project) if project.config.task == "detect" else None
@@ -1114,7 +1121,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         if self._is_source_image_layer(active):
             self._last_source_image_layer = active
             self._configure_image_controls(active)
-            self._load_annotations_for_image(active, force=True)
+            if self._is_stack_source(active):
+                self._begin_stack_browsing(active)
+            else:
+                self._load_annotations_for_image(active, force=True)
 
     def _active_layer(self):
         try:
@@ -1153,7 +1163,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
                     remove_selection=True, restore_sources=True
                 )
             self._configure_image_controls(active)
-            self._load_annotations_for_image(active)
+            if self._is_stack_source(active):
+                self._begin_stack_browsing(active)
+            else:
+                self._load_annotations_for_image(active)
         self._update_action_state()
 
     def _on_current_step_changed(self, event=None) -> None:
@@ -1172,7 +1185,66 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._close_crop_session(
                 remove_selection=True, restore_sources=True
             )
-        self._load_annotations_for_image(image_layer)
+        if self._is_stack_source(image_layer):
+            self._begin_stack_browsing(image_layer)
+        else:
+            self._load_annotations_for_image(image_layer)
+
+    def _is_stack_source(self, image_layer) -> bool:
+        try:
+            settings = self._effective_processing_settings()
+            return len(image_layer.data.shape) - 2 - int(settings.channel_axis is not None) > 0
+        except (AttributeError, ValueError):
+            return False
+
+    def _begin_stack_browsing(self, image_layer) -> None:
+        """Keep old annotations out of the way until a plane is requested."""
+        same_plane = False
+        previous_source = self._deferred_source if self._annotation_deferred else self._annotation_image_layer
+        if previous_source is image_layer and self._converted_image is not None:
+            try:
+                same_plane = self._image_adapter.plane_selection(
+                    image_layer, self.napari_viewer, self._effective_processing_settings()
+                ) == self._converted_image.plane
+            except ValueError:
+                pass
+        if same_plane:
+            if self._annotation_deferred:
+                for layer, visible, editable in self._deferred_layer_states:
+                    if any(layer is item for item in self.napari_viewer.layers):
+                        layer.visible = visible
+                        if editable is not None:
+                            layer.editable = editable
+                self._deferred_layer_states = []
+                self._deferred_source = None
+                self._annotation_deferred = False
+                self._update_action_state()
+            return
+        if self._annotation_deferred and self._annotation_image_layer is image_layer:
+            return
+        if not self._annotation_deferred:
+            self._deferred_source = self._annotation_image_layer
+            if self._annotation_dirty:
+                if self._resolve_unsaved_changes():
+                    # A discard must not resurrect the previous layer when the
+                    # user returns; saved edits can be explicitly reloaded.
+                    self._deferred_source = None
+            self._deferred_layer_states = []
+            for layer in (self._annotation_layer(), self._segmentation_layer()):
+                if layer is not None:
+                    self._deferred_layer_states.append(
+                        (layer, getattr(layer, "visible", True), getattr(layer, "editable", None))
+                    )
+                    layer.visible = False
+                    if hasattr(layer, "editable"):
+                        layer.editable = False
+            self._annotation_deferred = True
+        if not self._annotation_dirty:
+            self._annotation_image_layer = image_layer
+        self._label_status_label.setText(
+            "Browsing volume: use Load / Reload Annotation to edit the current plane."
+        )
+        self._update_action_state()
 
     def _on_layers_changed(self, event=None) -> None:
         if self._annotation_image_layer is not None:
@@ -1290,6 +1362,13 @@ class SimpleCciAnnotatorQWidget(QWidget):
         preserve_selection = self._active_layer() is image_layer
         try:
             self._load_annotations_for_image_impl(image_layer, force=force)
+            if (self._annotation_deferred and self._converted_image is not None and
+                    self._annotation_image_layer is image_layer and
+                    self._current_sample_id == self._image_stem(image_layer)):
+                self._annotation_deferred = False
+                self._deferred_layer_states = []
+                self._deferred_source = None
+                self._update_action_state()
         finally:
             if preserve_selection:
                 active = self._active_layer()
@@ -2220,6 +2299,14 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._show_error("Select an image layer first.")
             return
         self._load_annotations_for_image(image_layer, force=True)
+        annotation = (self._segmentation_layer() if self._project.config.task == "segment"
+                      else self._annotation_layer())
+        if (annotation is not None and self._converted_image is not None and
+                self._annotation_image_layer is image_layer and
+                self._current_sample_id == self._image_stem(image_layer)):
+            self._annotation_deferred = False
+            self._deferred_layer_states = []
+            self._update_action_state()
 
     def _on_save_annotation(self) -> None:
         if self._project is not None and self._project.config.task == "segment":
@@ -2842,7 +2929,10 @@ class SimpleCciAnnotatorQWidget(QWidget):
         image_layer = self._image_for_annotation()
         if self._is_source_image_layer(image_layer):
             self._update_plane_status(image_layer)
-            self._load_annotations_for_image(image_layer)
+            if self._is_stack_source(image_layer):
+                self._begin_stack_browsing(image_layer)
+            else:
+                self._load_annotations_for_image(image_layer)
 
     def _on_normalization_changed(self, index=None) -> None:
         method = self._normalization_combo.currentData()
@@ -3999,12 +4089,15 @@ class SimpleCciAnnotatorQWidget(QWidget):
             return
         if not self._resolve_unsaved_changes():
             return
+        if self._annotation_deferred:
+            self._annotation_image_layer = image_layer
         existing = (
             self._segmentation_layer()
             if self._project.config.task == "segment"
             else self._annotation_layer()
         )
-        if existing is not None and len(getattr(existing, "data", ())) > 0:
+        if (not self._annotation_deferred and existing is not None and
+                len(getattr(existing, "data", ())) > 0):
             response = QMessageBox.warning(
                 self,
                 "Replace annotations",
@@ -4335,6 +4428,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "Inference: result discarded because the active Z/T plane changed"
             )
             return
+        self._annotation_deferred = False
+        self._deferred_layer_states = []
         assert self._project is not None
         unknown = sorted(
             {item.class_id for item in result} - set(self._project.config.classes)
@@ -4448,6 +4543,8 @@ class SimpleCciAnnotatorQWidget(QWidget):
                 "Inference: result discarded because the active Z/T plane changed"
             )
             return
+        self._annotation_deferred = False
+        self._deferred_layer_states = []
         phase_started = perf_counter()
         existing = self._segmentation_layer()
         if existing is not None:
@@ -4944,9 +5041,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
         is_segment = bool(has_project and self._project.config.task == "segment")
         image_layer = self._image_for_annotation()
         has_image = self._is_image_layer(image_layer)
-        has_shapes = self._annotation_layer() is not None
-        has_mask = self._editable_segmentation_layer() is not None
-        has_editable_shapes = self._editable_bbox_layer() is not None
+        has_shapes = self._annotation_layer() is not None and not self._annotation_deferred
+        has_mask = self._editable_segmentation_layer() is not None and not self._annotation_deferred
+        has_editable_shapes = self._editable_bbox_layer() is not None and not self._annotation_deferred
         has_crop = self._crop_bounds is not None
         has_crop_selection = (
             self._get_layer_by_name(self.CROP_SELECTION_LAYER_NAME) is not None
@@ -5058,7 +5155,7 @@ class SimpleCciAnnotatorQWidget(QWidget):
             has_project and not patch_locked and not running and not has_crop
         )
         self._select_crop_button.setEnabled(
-            has_project and has_image and not running
+            has_project and has_image and not running and not self._annotation_deferred
         )
         self._create_crop_button.setEnabled(
             has_project and has_crop_selection and not running

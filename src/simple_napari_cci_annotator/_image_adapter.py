@@ -226,6 +226,9 @@ class ImageAdapter:
             if label.strip().lower() in {"c", "ch", "channel", "channels"}:
                 return axis
 
+        if any(label.strip().lower() in {"z", "depth"} for label in labels):
+            return None
+
         rgb = bool(getattr(image_layer, "rgb", False))
         if len(shape) >= 3 and shape[-1] in {3, 4} and rgb:
             return len(shape) - 1

@@ -9,7 +9,7 @@ This guide follows a project from an image to saved predictions and training dat
 3. Open an image in napari and select it. For multidimensional images, choose the channel axis and map source channels to red, green, and blue. Choose a filter and normalization if needed.
 4. Click **Preview RGB Conversion**. The displayed RGB plane is what the model receives and what training annotations store. Check a representative plane before saving your first annotation: the project's channel mapping, filter, and normalization lock after that save.
 
-The plugin uses napari's current Z/T position for single-plane prediction. Change the displayed plane to work on another one.
+The plugin uses napari's current Z/T position for single-plane prediction. For a stack, browsing does not automatically convert each plane or load its annotation. Click **Load / Reload Annotation** to create an editable layer or reopen a saved annotation for the current plane; prediction also prepares the selected plane on demand. When you move away, the previous annotation is hidden and locked. Unsaved edits trigger the save/discard prompt; if you cancel, return to the original plane to continue editing or saving them. Full-size working annotations larger than the project training size still require a training crop for the training dataset.
 
 ## Predict and correct
 
