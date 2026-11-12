@@ -357,6 +357,12 @@ class ImageAdapter:
         normalized: list[np.ndarray] = []
         statistics: list[dict[str, float | str | None]] = []
         for channel in channels:
+            if settings.channel_axis is None and normalized:
+                # Grayscale feeds the same plane to R, G and B. Filtering and
+                # normalization are identical, so reuse their first result.
+                normalized.append(normalized[0])
+                statistics.append(statistics[0].copy())
+                continue
             if channel is None:
                 normalized.append(np.zeros(reference_shape, dtype=np.uint8))
                 statistics.append({"method": "empty", "lower": None, "upper": None})

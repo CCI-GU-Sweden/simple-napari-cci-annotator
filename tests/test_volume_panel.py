@@ -180,6 +180,28 @@ def test_predicts_and_displays_lazy_read_only_unassembled_masks(panel, qtbot):
     assert "class 0 Cell" in panel.details.text()
 
 
+def test_assemble_and_reopen_saved_objects(panel, qtbot):
+    panel.start()
+    wait_idle(panel, qtbot)
+    panel.assemble()
+    wait_idle(panel, qtbot)
+    raw, labels = panel._views
+    assert labels.metadata["assembled"]
+    assert not labels.editable
+    assert isinstance(labels.data, da.Array)
+    assert set(np.unique(labels.data.compute())) == {1}
+    labels.selected_label = 1
+    labels.events.selected_label.emit()
+    assert "source Z=0–3" in panel.details.text()
+    assert "4 slice instances" in panel.details.text()
+    folder = Path(labels.metadata["assembly_root"])
+    panel._clear_views()
+    panel._start_assembly(folder)
+    wait_idle(panel, qtbot)
+    assert panel._views[-1].metadata["assembled"]
+    np.testing.assert_array_equal(panel._views[-1].data.compute(), labels.data.compute())
+
+
 def test_open_saved_run_restores_its_z_selection_without_model_calls(panel, qtbot):
     panel.z_start.setValue(1)
     panel.z_stop.setValue(3)
@@ -244,6 +266,27 @@ def test_detection_project_keeps_volume_prediction_disabled(panel):
     panel.update_context()
     assert not panel.predict_button.isEnabled()
     assert panel.open_button.isEnabled()
+
+
+def test_manual_grayscale_axes_and_model_readiness(panel, qtbot):
+    panel._selected_source.metadata = {}
+    panel.host._model = None
+    panel._source_changed()
+    assert "select distinct" in panel.status.text()
+    for name, axis in (("Z", 0), ("Y", 1), ("X", 2)):
+        panel.axis_combos[name].setCurrentIndex(axis + 1)
+    assert panel.axis_combos["C"].currentData() is None
+    assert "axes selected" in panel.status.text()
+    assert not panel.predict_button.isEnabled()
+    assert "Load a segmentation model" in panel.readiness_label.text()
+    panel.preview()
+    assert not panel.host.errors
+    panel.host._model = Predictor(Path(panel.host._project.paths.root).parent / "second.pt")
+    panel.update_context()
+    assert panel.predict_button.isEnabled()
+    panel.start()
+    wait_idle(panel, qtbot)
+    assert panel.host._model.calls == 4
 
 
 def test_raw_views_reorder_spatial_axes_and_read_one_z_chunk(panel):

@@ -1727,6 +1727,26 @@ def test_widget_creates_and_saves_fixed_training_crop(tmp_path, qtbot):
     assert len(list(project.paths.labels.iterdir())) == 1
 
 
+def test_new_empty_segmentation_skips_full_validation(tmp_path, qtbot):
+    project = ProjectStore.initialize(
+        tmp_path / "empty-segmentation", task="segment", classes={0: "Cell"}
+    )
+    viewer = _Viewer()
+    image = _Image(np.zeros((32, 32), dtype=np.uint8), name="sample")
+    viewer.layers.append(image)
+    viewer.layers.selection.active = image
+    widget = SimpleCciAnnotatorQWidget(viewer)
+    qtbot.addWidget(widget)
+    widget._set_project(project)
+    with patch.object(widget, "_refresh_segmentation_validation") as validate:
+        widget._load_annotations_for_image(image, force=True)
+        validate.assert_not_called()
+        assert not widget._segmentation_errors
+        widget._on_labels_data_changed()
+        validate.assert_called_once()
+    widget._annotation_dirty = False
+
+
 def test_widget_segment_project_saves_and_reloads_instance_mask(tmp_path, qtbot):
     project = ProjectStore.initialize(
         tmp_path / "segment-project", task="segment", classes={0: "Cell"}

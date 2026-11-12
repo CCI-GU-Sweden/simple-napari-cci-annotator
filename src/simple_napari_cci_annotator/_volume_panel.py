@@ -9,7 +9,7 @@ import dask.array as da
 import numpy as np
 from qtpy.QtCore import QThread, Signal
 from qtpy.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
     QWidget,
 )
@@ -18,6 +18,7 @@ from ._class_map import class_color
 from ._image_adapter import ImageProcessingSettings
 from ._tiled_inference import InferenceCancelled
 from ._volume_adapter import VolumeAdapter, VolumeAxes, VolumeInputError
+from ._volume_assembly import AssemblySettings, open_assembly, save_assembly
 from ._volume_inference import (
     VolumeInferenceRunner, VolumeInferenceSettings, _source_digest,
 )
@@ -147,6 +148,36 @@ class _VolumeLoadWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class _AssemblyWorker(QThread):
+    progress = Signal(int, int, str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, path, settings=None):
+        super().__init__()
+        self.path = Path(path)
+        self.settings = settings
+        self._cancel = Event()
+
+    def request_cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        try:
+            path = self.path
+            if self.settings is not None:
+                path = save_assembly(path, self.settings, cancelled=self._cancel.is_set,
+                                     progress=lambda n, total: self.progress.emit(n, total, "Linking slices"))
+            result = open_assembly(path, cancelled=self._cancel.is_set,
+                                   progress=lambda n, total: self.progress.emit(n, total, "Verifying slice masks"))
+            self.succeeded.emit((path, result))
+        except InferenceCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class VolumePanel(QWidget):
     busy_changed = Signal()
 
@@ -156,6 +187,7 @@ class VolumePanel(QWidget):
         self.viewer = host.napari_viewer
         self.worker = None
         self.load_worker = None
+        self.assembly_worker = None
         self._run_source = None
         self._load_volume = None
         self._load_source = None
@@ -165,6 +197,7 @@ class VolumePanel(QWidget):
         self._external_busy = False
         self._views = []
         self._hidden_sources = []
+        self._displayed_run = None
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._source_changed)
         self.axis_combos = {name: QComboBox() for name in ("Z", "Y", "X", "C")}
@@ -185,6 +218,8 @@ class VolumePanel(QWidget):
         self.policy.addItem("Keep largest component", "largest")
         self.processing_label = QLabel()
         self.processing_label.setWordWrap(True)
+        self.readiness_label = QLabel()
+        self.readiness_label.setWordWrap(True)
         self.output_input = QLineEdit()
         self.output_input.setPlaceholderText("Output parent (defaults to project/Prediction)")
         self.output_button = QPushButton("Choose Output Folder")
@@ -194,6 +229,23 @@ class VolumePanel(QWidget):
         self.open_button = QPushButton("Open Saved Run")
         self.open_button.clicked.connect(self._choose_run)
         self.allow_partial = QCheckBox("Show completed slices from an incomplete run")
+        self.link_pixels = QSpinBox()
+        self.link_pixels.setRange(1, 2147483647)
+        self.link_pixels.setValue(1)
+        self.link_fraction = QDoubleSpinBox()
+        self.link_fraction.setRange(0, 1)
+        self.link_fraction.setSingleStep(0.05)
+        self.link_fraction.setValue(0.5)
+        self.link_iou = QDoubleSpinBox()
+        self.link_iou.setRange(0, 1)
+        self.link_iou.setSingleStep(0.05)
+        self.link_pixels.setToolTip("Minimum shared XY pixels on adjacent slices.")
+        self.link_fraction.setToolTip("Shared pixels divided by the smaller slice instance area.")
+        self.link_iou.setToolTip("Optional minimum intersection over union for adjacent slices.")
+        self.assemble_button = QPushButton("Assemble 3D Objects")
+        self.assemble_button.clicked.connect(self.assemble)
+        self.open_assembly_button = QPushButton("Open Assembly")
+        self.open_assembly_button.clicked.connect(self._choose_assembly)
         self.preview_button = QPushButton("Preview Slice Conversion")
         self.preview_button.clicked.connect(self.preview)
         self.predict_button = QPushButton("Predict Z Slices")
@@ -227,15 +279,23 @@ class VolumePanel(QWidget):
         run_row.addWidget(self.run_input)
         run_row.addWidget(self.open_button)
         form.addRow("Saved run", run_row)
+        form.addRow("Z link minimum overlap (pixels)", self.link_pixels)
+        form.addRow("Z link minimum overlap fraction", self.link_fraction)
+        form.addRow("Z link minimum IoU", self.link_iou)
         actions = QHBoxLayout()
         for button in (self.predict_button, self.resume_button, self.cancel_button):
             actions.addWidget(button)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.processing_label)
+        layout.addWidget(self.readiness_label)
         layout.addWidget(self.preview_button)
         layout.addWidget(self.allow_partial)
         layout.addLayout(actions)
+        assembly_actions = QHBoxLayout()
+        assembly_actions.addWidget(self.assemble_button)
+        assembly_actions.addWidget(self.open_assembly_button)
+        layout.addLayout(assembly_actions)
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
         layout.addWidget(self.details)
@@ -260,7 +320,7 @@ class VolumePanel(QWidget):
 
     @property
     def busy(self):
-        return self.worker is not None or self.load_worker is not None
+        return self.worker is not None or self.load_worker is not None or self.assembly_worker is not None
 
     def refresh_sources(self, event=None):
         if self.busy:
@@ -306,8 +366,6 @@ class VolumePanel(QWidget):
             combo.setCurrentIndex(0 if defaults.get(name) is None else defaults[name] + 1)
         self._updating = False
         self._axes_changed()
-        if source is not None and inferred is None:
-            self.status.setText("3D: axes are ambiguous; select Z, Y, X and optional C explicitly.")
 
     def _axes_changed(self, index=None):
         if self._updating or self.busy:
@@ -336,6 +394,14 @@ class VolumePanel(QWidget):
             self.z_stop.setValue(depth)
             self.preview_z.setRange(0, depth - 1)
         self.update_context()
+        if source is not None:
+            axes = [self.axis_combos[name].currentData() for name in ("Z", "Y", "X")]
+            channel = self.axis_combos["C"].currentData()
+            selected = axes + ([] if channel is None else [channel])
+            if None in axes or len(set(selected)) != len(selected):
+                self.status.setText("3D: select distinct Z, Y and X axes; leave C as None for grayscale.")
+            else:
+                self.status.setText("3D: axes selected. Preview or predict the volume.")
 
     def prepare(self):
         source = self._selected_source
@@ -356,17 +422,34 @@ class VolumePanel(QWidget):
         project = self.host._project
         segment = project is not None and project.config.task == "segment"
         ready = segment and self.host._model is not None and self._selected_source is not None
+        if project is None:
+            reason = "Open a segmentation project to predict Z slices."
+        elif not segment:
+            reason = "Z-slice prediction requires a segmentation project."
+        elif self.host._model is None:
+            reason = "Load a segmentation model to predict Z slices."
+        elif self._selected_source is None:
+            reason = "Select a source volume to predict Z slices."
+        elif not enabled:
+            reason = "Wait for the current operation to finish."
+        else:
+            reason = "Ready to predict Z slices."
+        self.readiness_label.setText(reason)
+        self.predict_button.setToolTip(reason)
         for control in (
             self.source_combo, *self.axis_combos.values(), self.fixed_widget,
             self.z_start, self.z_stop, self.preview_z, self.memory_mb, self.policy,
             self.invert, self.output_input, self.output_button, self.run_input,
             self.allow_partial,
+            self.link_pixels, self.link_fraction, self.link_iou,
         ):
             control.setEnabled(enabled)
         self.preview_button.setEnabled(enabled and segment and self._selected_source is not None)
         self.predict_button.setEnabled(enabled and ready)
         self.resume_button.setEnabled(enabled and ready and bool(self.run_input.text().strip()))
         self.open_button.setEnabled(enabled)
+        self.assemble_button.setEnabled(enabled and bool(self.run_input.text().strip()))
+        self.open_assembly_button.setEnabled(enabled)
         self.cancel_button.setEnabled(self.busy)
         try:
             recipe = self.host._effective_processing_settings()
@@ -398,6 +481,7 @@ class VolumePanel(QWidget):
             if any(source is item for item in self.viewer.layers):
                 source.visible = visible
         self._hidden_sources = []
+        self._displayed_run = None
 
     def _show_raw(self, volume, source):
         units = volume.geometry.units
@@ -556,6 +640,7 @@ class VolumePanel(QWidget):
     def _display_loaded(self, result):
         root, manifest, array, colors, records, matched, volume = result
         self._clear_views()
+        self._displayed_run = Path(root).resolve()
         source_present = self._load_source is not None and any(self._load_source is item for item in self.viewer.layers)
         if matched and source_present:
             self._show_raw(volume, self._load_source)
@@ -615,8 +700,111 @@ class VolumePanel(QWidget):
         self.update_context()
         self.busy_changed.emit()
 
+    def assemble(self):
+        if self.busy or self._external_busy or not self.run_input.text().strip():
+            return
+        settings = AssemblySettings(self.link_pixels.value(), self.link_fraction.value(),
+                                    self.link_iou.value())
+        self._start_assembly(Path(self.run_input.text().strip()), settings)
+
+    def _choose_assembly(self):
+        folder = QFileDialog.getExistingDirectory(self, "Open saved 3D assembly")
+        if folder:
+            self._start_assembly(Path(folder))
+
+    def _start_assembly(self, path, settings=None):
+        if self.busy or self._external_busy:
+            return
+        self.assembly_worker = _AssemblyWorker(path, settings)
+        self.assembly_worker.progress.connect(self._progress)
+        self.assembly_worker.succeeded.connect(self._assembly_loaded)
+        self.assembly_worker.failed.connect(self._failed)
+        self.assembly_worker.cancelled.connect(lambda: self.status.setText("3D: assembly cancelled."))
+        self.assembly_worker.finished.connect(self._assembly_finished)
+        self.status.setText("3D: preparing assembly.")
+        self.update_context()
+        self.busy_changed.emit()
+        self.assembly_worker.start()
+
+    def _assembly_loaded(self, result):
+        try:
+            folder, (root, run, graph, array) = result
+            if self._displayed_run != Path(root).resolve():
+                self._clear_views()
+            else:
+                for layer in list(self._views):
+                    if layer.metadata.get("cci_volume_role") in {"slice_predictions", "assembly"}:
+                        if any(layer is item for item in self.viewer.layers):
+                            self.viewer.layers.remove(layer)
+                        self._views.remove(layer)
+            self._displayed_run = Path(root).resolve()
+            self.run_input.setText(str(root))
+            geometry = run["contract"]["volume"]["geometry"]
+            units = geometry["units"]
+            kwargs = {"units": tuple(units)} if all(unit is not None for unit in units) else {}
+            layer = self.viewer.add_labels(
+                array, name=f"3D objects · {Path(folder).name}",
+                scale=tuple(geometry["scale"]), translate=tuple(geometry["translate"]),
+                axis_labels=("Z", "Y", "X"),
+                metadata={"cci_volume_display": True, "cci_volume_role": "assembly",
+                          "assembly_root": str(folder), "run_root": str(root),
+                          "assembly_settings": graph["settings"], "assembled": True}, **kwargs,
+            )
+            layer.editable = False
+            objects = {}
+            colors = {0: (0, 0, 0, 0), None: (0.7, 0.7, 0.7, 1)}
+            for node in graph["nodes"]:
+                obj = node["object_id"]
+                objects.setdefault(obj, []).append(node)
+                colors[obj] = class_color(node["class_id"])
+            node_objects = {(node["z"], node["local_id"]): node["object_id"]
+                            for node in graph["nodes"]}
+            link_counts = {obj: [0, 0] for obj in objects}
+            for link in graph["links"]:
+                affected = {node_objects[tuple(link["source"])], node_objects[tuple(link["target"])]}
+                for obj in affected:
+                    link_counts[obj][0 if link["accepted"] else 1] += 1
+            try:
+                from napari.utils.colormaps import DirectLabelColormap
+                layer.colormap = DirectLabelColormap(color_dict=colors)
+            except ImportError:
+                pass
+            try:
+                layer.events.selected_label.connect(
+                    lambda event=None: self._object_details(layer, objects, link_counts)
+                )
+            except AttributeError:
+                pass
+            self._views.append(layer)
+            accepted = sum(link["accepted"] for link in graph["links"])
+            self.status.setText(f"3D: {len(objects)} objects · {accepted} links. Saved: {folder}")
+            self.details.setText("3D object: select a label to inspect its slice membership.")
+        except Exception as exc:
+            self._failed(f"Could not display assembly: {exc}")
+
+    def _object_details(self, layer, objects, link_counts):
+        nodes = objects.get(layer.selected_label)
+        if not nodes:
+            self.details.setText("3D object: background or unavailable label.")
+            return
+        zs = [node["z"] for node in nodes]
+        accepted, rejected = link_counts[layer.selected_label]
+        self.details.setText(f"3D object {layer.selected_label} · class {nodes[0]['class_id']} · "
+                             f"source Z={min(zs)}–{max(zs)} · {len(nodes)} slice instances · "
+                             f"{sum(node['area'] for node in nodes)} voxels · "
+                             f"{accepted} accepted and {rejected} rejected overlaps.")
+
+    def _assembly_finished(self):
+        worker = self.assembly_worker
+        self.assembly_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.refresh_sources()
+        self.update_context()
+        self.busy_changed.emit()
+
     def cancel(self):
-        for worker in (self.worker, self.load_worker):
+        for worker in (self.worker, self.load_worker, self.assembly_worker):
             if worker is not None:
                 worker.request_cancel()
         self.status.setText("3D: cancellation requested; completed slices will be retained.")

@@ -1285,6 +1285,20 @@ class SimpleCciAnnotatorQWidget(QWidget):
         return sample_id
 
     def _load_annotations_for_image(self, image_layer, *, force: bool = False) -> None:
+        # Napari selects newly added layers. Keep an explicitly selected source
+        # selected when creating its annotation, so Delete targets the image.
+        preserve_selection = self._active_layer() is image_layer
+        try:
+            self._load_annotations_for_image_impl(image_layer, force=force)
+        finally:
+            if preserve_selection:
+                active = self._active_layer()
+                if (active is not image_layer and
+                        (active is self._annotation_layer() or active is self._segmentation_layer()) and
+                        any(image_layer is item for item in self.napari_viewer.layers)):
+                    self.napari_viewer.layers.selection.active = image_layer
+
+    def _load_annotations_for_image_impl(self, image_layer, *, force: bool = False) -> None:
         if self._project is not None and self._project.config.task == "segment":
             self._load_segmentation_for_image(image_layer, force=force)
             return
@@ -1438,6 +1452,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             },
         )
         self._segment_instances = instances
+        if pair is None and self._crop_bounds is None:
+            self._segmentation_errors = ()
+            self._segmentation_invalid_ids = ()
         self._apply_instance_colors(labels)
         try:
             labels.events.data.connect(self._on_labels_data_changed)
@@ -1467,7 +1484,9 @@ class SimpleCciAnnotatorQWidget(QWidget):
             self._save_annotation_button.setText(
                 "Use Training Crop to Save Corrections"
             )
-        self._refresh_segmentation_validation()
+        # A newly created empty mask needs no full-image validation scans.
+        if pair is not None or self._crop_bounds is not None:
+            self._refresh_segmentation_validation()
         self._update_class_counts()
         self._on_selected_instance_changed()
         self._update_action_state()

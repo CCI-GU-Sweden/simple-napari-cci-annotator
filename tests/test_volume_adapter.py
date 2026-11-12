@@ -21,6 +21,7 @@ from simple_napari_cci_annotator._volume_adapter import (
     VolumeAxes,
     VolumeInputError,
 )
+from simple_napari_cci_annotator import _image_adapter as image_adapter_module
 
 
 def layer(data, axes=None, **kwargs):
@@ -33,6 +34,23 @@ def layer(data, axes=None, **kwargs):
 def processing(multichannel=False, **kwargs):
     channels = (0, 2, 1, None) if multichannel else (None,) * 4
     return ImageProcessingSettings(*channels, "min_max", **kwargs)
+
+
+def test_grayscale_conversion_filters_once_and_preserves_rgb(monkeypatch):
+    original = image_adapter_module.apply_image_filter
+    calls = []
+
+    def record_filter(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(image_adapter_module, "apply_image_filter", record_filter)
+    data = np.arange(60, dtype=np.uint16).reshape(3, 4, 5)
+    image = VolumeAdapter().prepare(layer(data, "ZYX"), processing(), invert=True).convert_slice(1).image
+    assert len(calls) == 1
+    np.testing.assert_array_equal(image.data[..., 0], image.data[..., 1])
+    np.testing.assert_array_equal(image.data[..., 1], image.data[..., 2])
+    assert image.normalization_stats[0] == image.normalization_stats[1] == image.normalization_stats[2]
 
 
 @pytest.mark.parametrize("layout", ["ZCYX", "CZYX", "ZYXC", "XYZC"])

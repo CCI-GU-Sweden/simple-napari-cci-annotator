@@ -24,7 +24,7 @@ The code is on [Githb](https://github.com/CCI-GU-Sweden/simple-napari-cci-annota
 
 From the repository root, install the plugin and napari into a Python 3.10–3.12 environment:
 
-```bash
+```bash 
 python -m pip install -e ".[all]"
 napari
 ```
