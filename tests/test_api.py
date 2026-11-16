@@ -119,3 +119,16 @@ def test_pipeline_predict_one_array(tmp_path, monkeypatch):
     assert [p["plane_indices"] for p in metadata["files"][0]["planes"]] == [
         {"0": 0}, {"0": 1}
     ]
+    assert len(result.results) == 2
+    for plane, payload in zip(metadata["files"][0]["planes"], result.results, strict=True):
+        assert plane["output"]["image"] is None
+        assert plane["sha256"]["image"] is None
+        assert payload == json.loads((result.run_root / plane["output"]["metadata"]).read_text())
+        assert payload["boxes"] == []
+    assert not list(result.run_root.rglob("image.png"))
+
+    saved = pipeline.predict_one(
+        image[0], model, save_image=True,
+        inference=InferenceSettings(tile_size=64, overlap=8),
+    )
+    assert len(list(saved.run_root.rglob("image.png"))) == 1

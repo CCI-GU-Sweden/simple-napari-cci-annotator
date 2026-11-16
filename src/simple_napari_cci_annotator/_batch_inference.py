@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import os
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ class BatchInferenceSettings:
     source_files: tuple[Path, ...] | None = None
     source_array: np.ndarray | None = None
     source_axes: str | None = None
+    save_image: bool = True
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ class BatchInferenceRun:
     completed: int
     failed: int
     processed_planes: int
+    results: tuple[dict, ...] = field(default_factory=tuple)
 
 
 def find_batch_inputs(folder: Path) -> tuple[Path, ...]:
@@ -196,6 +199,7 @@ class TiffBatchProcessor:
         }
         _save_metadata(run_root, metadata)
         stems = _unique_stems(files)
+        results: list[dict] = []
         completed = failed = 0
         for file_index, path in enumerate(files, start=1):
             if cancelled is not None and cancelled():
@@ -226,6 +230,7 @@ class TiffBatchProcessor:
                     len(files),
                     progress,
                     cancelled,
+                    results,
                 )
             except InferenceCancelled:
                 entry["status"] = "cancelled"
@@ -255,6 +260,7 @@ class TiffBatchProcessor:
             completed=completed,
             failed=failed,
             processed_planes=processed_planes,
+            results=tuple(results),
         )
 
     def _process_file(
@@ -269,6 +275,7 @@ class TiffBatchProcessor:
         file_count: int,
         progress: Callable[[int, int, str], None] | None,
         cancelled: Callable[[], bool] | None,
+        results: list[dict],
     ) -> None:
         with ExitStack() as stack:
             if self.settings.source_array is not None:
@@ -384,6 +391,7 @@ class TiffBatchProcessor:
                             source_path=None if self.settings.source_array is not None else path,
                             conversion=conversion,
                             prediction=prediction,
+                            save_image=self.settings.save_image,
                         )
                         count = len(result.instances)
                     else:
@@ -399,8 +407,11 @@ class TiffBatchProcessor:
                             source_path=None if self.settings.source_array is not None else path,
                             conversion=conversion,
                             prediction=prediction,
+                            save_image=self.settings.save_image,
                         )
                         count = len(result)
+                    with output.metadata.open(encoding="utf-8") as stream:
+                        results.append(json.load(stream))
                     entry["planes"].append(
                         {
                             "sample_id": converted.sample_id,
@@ -409,14 +420,14 @@ class TiffBatchProcessor:
                             "shape": list(converted.data.shape),
                             "object_count": count,
                             "output": {
-                                "image": str(output.image.relative_to(run_root)),
+                                "image": str(output.image.relative_to(run_root)) if self.settings.save_image else None,
                                 "annotation": str(
                                     output.annotation.relative_to(run_root)
                                 ),
                                 "metadata": str(output.metadata.relative_to(run_root)),
                             },
                             "sha256": {
-                                "image": _sha256(output.image),
+                                "image": _sha256(output.image) if self.settings.save_image else None,
                                 "annotation": _sha256(output.annotation),
                                 "metadata": _sha256(output.metadata),
                             },

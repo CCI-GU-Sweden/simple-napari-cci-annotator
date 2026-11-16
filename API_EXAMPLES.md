@@ -39,12 +39,21 @@ one_array = pipeline.predict_one(image_array, model, axes="ZYX", inference=infer
 batch = pipeline.predict_batch("input", model, inference=inference)
 
 print(one.status, one.run_root)
+print(one_array.results[0]["boxes"])  # one result.json dictionary per plane
 print(batch.completed, batch.failed, batch.run_root)
 ```
 
 `predict_one` accepts a NumPy array or a TIFF, PNG, or BMP path. For arrays, `axes` optionally specifies dimension labels such as `YX`, `ZYX`, or `CYX`; otherwise the last two non-channel dimensions are spatial. The channel axis must match the project's locked settings. Every nonspatial plane is processed. For files, all TIFF series and planes or the single PNG/BMP image are processed. `predict_batch` processes all top-level TIFF, PNG, and BMP files in a folder. Grayscale, RGB, and RGBA PNG/BMP files must match the project's locked channel settings. The default output parent is `input/Prediction` for files and `project/Prediction` for arrays; pass `output_folder="results"` to change it. Results are written to disk, and `analysis_metadata.json` records array input without a source file hash. The methods also accept `progress(current, total, message)` and `cancelled()` callbacks.
 
 For a segmentation project, use `yolo26n-seg.pt` or another compatible segmentation model instead.
+
+The returned `run_root` is the run directory. `results` contains the parsed
+`result.json` (detection) or `instances.json` (segmentation) for each completed
+plane, in processing order. Segmentation masks remain in the run directory;
+their paths are listed in `analysis_metadata.json`. Failed or cancelled planes
+do not appear in `results`. API predictions omit the converted RGB `image.png`
+by default to save space. Pass `save_image=True` to save it. Labels, masks, and
+metadata are still written to the run directory.
 
 ## Train from saved project annotations
 

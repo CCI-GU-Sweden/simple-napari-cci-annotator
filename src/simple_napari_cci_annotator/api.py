@@ -90,6 +90,7 @@ class ProjectPipeline:
         *,
         output_folder: str | Path | None = None,
         axes: str | None = None,
+        save_image: bool = False,
         inference: InferenceSettings | None = None,
         invert: bool = False,
         clear_border_instances: bool = False,
@@ -107,6 +108,7 @@ class ProjectPipeline:
                 root, model, output_folder=output_folder, inference=inference,
                 invert=invert, clear_border_instances=clear_border_instances,
                 source_files=None, source_array=image_path, source_axes=axes,
+                save_image=save_image,
                 progress=progress, cancelled=cancelled,
             )
         if axes is not None:
@@ -120,6 +122,7 @@ class ProjectPipeline:
             invert=invert,
             clear_border_instances=clear_border_instances,
             source_files=(path,),
+            save_image=save_image,
             progress=progress,
             cancelled=cancelled,
         )
@@ -130,6 +133,7 @@ class ProjectPipeline:
         model: str | Path | object,
         *,
         output_folder: str | Path | None = None,
+        save_image: bool = False,
         inference: InferenceSettings | None = None,
         invert: bool = False,
         clear_border_instances: bool = False,
@@ -145,6 +149,7 @@ class ProjectPipeline:
             invert=invert,
             clear_border_instances=clear_border_instances,
             source_files=None,
+            save_image=save_image,
             progress=progress,
             cancelled=cancelled,
         )
@@ -163,6 +168,7 @@ class ProjectPipeline:
         cancelled: Callable[[], bool] | None,
         source_array: np.ndarray | None = None,
         source_axes: str | None = None,
+        save_image: bool = False,
     ) -> BatchInferenceRun:
         predictor = self._load_model(model)
         output = (
@@ -179,6 +185,7 @@ class ProjectPipeline:
             source_files=source_files,
             source_array=source_array,
             source_axes=source_axes,
+            save_image=save_image,
         )
         return TiffBatchProcessor(self.project, predictor, settings).run(
             progress=progress, cancelled=cancelled

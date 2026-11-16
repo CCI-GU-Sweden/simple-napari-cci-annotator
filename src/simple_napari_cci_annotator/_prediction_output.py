@@ -82,6 +82,7 @@ class PredictionOutputWriter:
         conversion: Mapping[str, Any] | None = None,
         prediction: Mapping[str, Any] | None = None,
         overwrite: bool = False,
+        save_image: bool = True,
     ) -> PredictionOutputPaths:
         if self.project.config.task != "detect":
             raise PredictionOutputError("Detection output requires a detect project.")
@@ -140,7 +141,7 @@ class PredictionOutputWriter:
             sample_id, rgb, source_path, conversion, prediction
         )
         payload["boxes"] = rows
-        self._write(paths, rgb, label_text, payload, overwrite=overwrite)
+        self._write(paths, rgb, label_text, payload, overwrite=overwrite, save_image=save_image)
         return paths
 
     def save_segmentation(
@@ -155,6 +156,7 @@ class PredictionOutputWriter:
         conversion: Mapping[str, Any] | None = None,
         prediction: Mapping[str, Any] | None = None,
         overwrite: bool = False,
+        save_image: bool = True,
     ) -> PredictionOutputPaths:
         total_started = perf_counter()
         if self.project.config.task != "segment":
@@ -215,6 +217,7 @@ class PredictionOutputWriter:
             array,
             payload,
             overwrite=overwrite,
+            save_image=save_image,
             timing_scope="prediction output saving",
         )
         _debug.print_performance_timing(
@@ -253,28 +256,31 @@ class PredictionOutputWriter:
         metadata: dict[str, Any],
         *,
         overwrite: bool,
+        save_image: bool = True,
         timing_scope: str | None = None,
     ) -> None:
-        if not overwrite and any(path.exists() for path in paths.files):
+        destinations = paths.files if save_image else (paths.annotation, paths.metadata)
+        if not overwrite and any(path.exists() for path in destinations):
             raise PredictionOutputError(
                 f"Output already exists in {paths.folder}. Confirm overwrite first."
             )
         paths.folder.mkdir(parents=True, exist_ok=True)
-        temporary = tuple(_temporary_path(path) for path in paths.files)
+        temporary = tuple(_temporary_path(path) for path in destinations)
         try:
             phase_started = perf_counter()
-            Image.fromarray(image, mode="RGB").save(temporary[0], format="PNG")
+            if save_image:
+                Image.fromarray(image, mode="RGB").save(temporary[0], format="PNG")
             if timing_scope is not None:
                 _debug.print_performance_timing(
                     timing_scope, "RGB image encoding", phase_started
                 )
             phase_started = perf_counter()
             if isinstance(annotation, str):
-                with temporary[1].open("w", encoding="utf-8", newline="\n") as stream:
+                with temporary[-2].open("w", encoding="utf-8", newline="\n") as stream:
                     stream.write(annotation)
             else:
                 tifffile.imwrite(
-                    temporary[1],
+                    temporary[-2],
                     annotation,
                     compression="deflate",
                     photometric="minisblack",
@@ -284,13 +290,13 @@ class PredictionOutputWriter:
                     timing_scope, "mask encoding", phase_started
                 )
             phase_started = perf_counter()
-            _write_json(temporary[2], metadata)
+            _write_json(temporary[-1], metadata)
             if timing_scope is not None:
                 _debug.print_performance_timing(
                     timing_scope, "metadata encoding", phase_started
                 )
             phase_started = perf_counter()
-            _replace_many(tuple(zip(temporary, paths.files, strict=True)))
+            _replace_many(tuple(zip(temporary, destinations, strict=True)))
             if timing_scope is not None:
                 _debug.print_performance_timing(
                     timing_scope, "atomic file replacement", phase_started

@@ -128,6 +128,10 @@ def test_batch_segmentation_uses_custom_output_and_records_failed_file(tmp_path)
     metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
     assert [entry["status"] for entry in metadata["files"]] == ["failed", "completed"]
     plane = metadata["files"][1]["planes"][0]
+    assert len(result.results) == 1
+    assert result.results[0] == json.loads(
+        (result.run_root / plane["output"]["metadata"]).read_text()
+    )
     mask = tifffile.imread(result.run_root / plane["output"]["annotation"])
     assert mask.dtype == np.uint32
     assert int(mask.max()) == 1
