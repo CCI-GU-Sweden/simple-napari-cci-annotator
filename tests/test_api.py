@@ -95,3 +95,27 @@ def test_pipeline_predict_one_png(tmp_path):
     assert (result.completed, result.failed, result.processed_planes) == (1, 0, 1)
     metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
     assert metadata["files"][0]["source"] == "field.png"
+
+
+def test_pipeline_predict_one_array(tmp_path, monkeypatch):
+    processing = ImageProcessingSettings(None, None, None, None, "min_max")
+    pipeline = ProjectPipeline.create(tmp_path / "project", image_processing=processing)
+    model = FakeModel(tmp_path / "model.pt")
+    image = np.arange(2 * 64 * 64, dtype=np.uint16).reshape(2, 64, 64)
+    monkeypatch.setattr(
+        "simple_napari_cci_annotator._batch_inference.imread",
+        lambda *args, **kwargs: pytest.fail("array input must not be read from disk"),
+    )
+
+    result = pipeline.predict_one(
+        image, model, axes="ZYX", output_folder=tmp_path / "results",
+        inference=InferenceSettings(tile_size=64, overlap=8),
+    )
+
+    assert (result.completed, result.failed, result.processed_planes) == (1, 0, 2)
+    metadata = json.loads((result.run_root / "analysis_metadata.json").read_text())
+    assert metadata["files"][0]["source"] == "array"
+    assert metadata["files"][0]["source_sha256"] is None
+    assert [p["plane_indices"] for p in metadata["files"][0]["planes"]] == [
+        {"0": 0}, {"0": 1}
+    ]

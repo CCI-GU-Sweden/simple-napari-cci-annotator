@@ -43,7 +43,7 @@ TIFF_SUFFIXES = frozenset({".tif", ".tiff"})
 @dataclass(frozen=True)
 class _RasterSeries:
     data: np.ndarray
-    axes: str
+    axes: str | tuple[str, ...]
 
     def asarray(self) -> np.ndarray:
         return self.data
@@ -57,6 +57,8 @@ class BatchInferenceSettings:
     invert: bool = False
     clear_border_instances: bool = False
     source_files: tuple[Path, ...] | None = None
+    source_array: np.ndarray | None = None
+    source_axes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,8 @@ class TiffBatchProcessor:
             raise BatchInferenceError(
                 "Choose a batch output folder outside project annotations."
             )
+        if self.settings.source_array is not None:
+            return (Path(self.settings.input_folder) / "array",)
         if self.settings.source_files is None:
             return find_batch_inputs(self.settings.input_folder)
         input_root = Path(self.settings.input_folder).expanduser().resolve()
@@ -209,7 +213,8 @@ class TiffBatchProcessor:
             metadata["files"].append(entry)
             _save_metadata(run_root, metadata)
             try:
-                entry["source_sha256"] = _sha256(path)
+                if self.settings.source_array is None:
+                    entry["source_sha256"] = _sha256(path)
                 self._process_file(
                     path,
                     stems[path],
@@ -266,7 +271,21 @@ class TiffBatchProcessor:
         cancelled: Callable[[], bool] | None,
     ) -> None:
         with ExitStack() as stack:
-            if path.suffix.lower() in TIFF_SUFFIXES:
+            if self.settings.source_array is not None:
+                data = self.settings.source_array
+                axes = self.settings.source_axes
+                if axes is None:
+                    labels = [f"A{i}" for i in range(data.ndim)]
+                    spatial = [i for i in range(data.ndim) if i != processing.channel_axis]
+                    if len(spatial) < 2:
+                        raise BatchInferenceError("The source must contain two spatial axes.")
+                    labels[spatial[-2]], labels[spatial[-1]] = "Y", "X"
+                    if processing.channel_axis is not None:
+                        processing.validate(data.shape)
+                        labels[processing.channel_axis] = "C"
+                    axes = tuple(labels)
+                series_list = (_RasterSeries(data, axes),)
+            elif path.suffix.lower() in TIFF_SUFFIXES:
                 series_list = stack.enter_context(tifffile.TiffFile(path)).series
                 if not series_list:
                     raise BatchInferenceError("TIFF file contains no image series.")
@@ -285,7 +304,7 @@ class TiffBatchProcessor:
                 if cancelled is not None and cancelled():
                     raise InferenceCancelled("Batch cancelled by the user.")
                 data = series.asarray()
-                axes = str(series.axes)
+                axes = series.axes
                 if len(axes) != data.ndim:
                     raise BatchInferenceError(
                         f"Image axes {axes!r} do not match shape {data.shape}."
@@ -362,7 +381,7 @@ class TiffBatchProcessor:
                             converted.data,
                             result.mask,
                             result.instances,
-                            source_path=path,
+                            source_path=None if self.settings.source_array is not None else path,
                             conversion=conversion,
                             prediction=prediction,
                         )
@@ -377,7 +396,7 @@ class TiffBatchProcessor:
                             confidences=tuple(item.confidence for item in result),
                             sources=("prediction",) * len(result),
                             tile_ids=tuple(item.tile_id for item in result),
-                            source_path=path,
+                            source_path=None if self.settings.source_array is not None else path,
                             conversion=conversion,
                             prediction=prediction,
                         )

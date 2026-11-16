@@ -9,6 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from ._batch_inference import (
     BatchInferenceRun,
     BatchInferenceSettings,
@@ -83,17 +85,32 @@ class ProjectPipeline:
 
     def predict_one(
         self,
-        image_path: str | Path,
+        image_path: str | Path | np.ndarray,
         model: str | Path | object,
         *,
         output_folder: str | Path | None = None,
+        axes: str | None = None,
         inference: InferenceSettings | None = None,
         invert: bool = False,
         clear_border_instances: bool = False,
         progress: Callable[[int, int, str], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> BatchInferenceRun:
-        """Predict one TIFF, PNG, or BMP file."""
+        """Predict one file or in-memory array, saving results to a run folder.
+
+        For arrays, axes can describe dimension order (for example, "ZYX" or
+        "CYX"). Otherwise the last two non-channel dimensions are spatial.
+        """
+        if isinstance(image_path, np.ndarray):
+            root = self.project.paths.root
+            return self._predict(
+                root, model, output_folder=output_folder, inference=inference,
+                invert=invert, clear_border_instances=clear_border_instances,
+                source_files=None, source_array=image_path, source_axes=axes,
+                progress=progress, cancelled=cancelled,
+            )
+        if axes is not None:
+            raise ValueError("axes is only supported for NumPy array input.")
         path = Path(image_path).expanduser().resolve()
         return self._predict(
             path.parent,
@@ -144,6 +161,8 @@ class ProjectPipeline:
         source_files: tuple[Path, ...] | None,
         progress: Callable[[int, int, str], None] | None,
         cancelled: Callable[[], bool] | None,
+        source_array: np.ndarray | None = None,
+        source_axes: str | None = None,
     ) -> BatchInferenceRun:
         predictor = self._load_model(model)
         output = (
@@ -158,6 +177,8 @@ class ProjectPipeline:
             invert=invert,
             clear_border_instances=clear_border_instances,
             source_files=source_files,
+            source_array=source_array,
+            source_axes=source_axes,
         )
         return TiffBatchProcessor(self.project, predictor, settings).run(
             progress=progress, cancelled=cancelled

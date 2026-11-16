@@ -34,13 +34,15 @@ from simple_napari_cci_annotator import InferenceSettings
 inference = InferenceSettings(tile_size=512, overlap=102)
 model = pipeline.project.paths.models / "yolo26n.pt"
 one = pipeline.predict_one("input/field_001.ome.tiff", model, inference=inference)
+# Or predict an array already in memory (here, a ZYX stack):
+one_array = pipeline.predict_one(image_array, model, axes="ZYX", inference=inference)
 batch = pipeline.predict_batch("input", model, inference=inference)
 
 print(one.status, one.run_root)
 print(batch.completed, batch.failed, batch.run_root)
 ```
 
-`predict_one` accepts TIFF, PNG, or BMP. It processes every nonspatial plane and series in a TIFF, or the single image in a PNG/BMP. `predict_batch` processes all top-level TIFF, PNG, and BMP files in a folder. Grayscale, RGB, and RGBA PNG/BMP files must match the project's locked channel settings. The default output parent is `input/Prediction`; pass `output_folder="results"` to change it. Each run writes `analysis_metadata.json` alongside detection or segmentation results. The methods also accept `progress(current, total, message)` and `cancelled()` callbacks.
+`predict_one` accepts a NumPy array or a TIFF, PNG, or BMP path. For arrays, `axes` optionally specifies dimension labels such as `YX`, `ZYX`, or `CYX`; otherwise the last two non-channel dimensions are spatial. The channel axis must match the project's locked settings. Every nonspatial plane is processed. For files, all TIFF series and planes or the single PNG/BMP image are processed. `predict_batch` processes all top-level TIFF, PNG, and BMP files in a folder. Grayscale, RGB, and RGBA PNG/BMP files must match the project's locked channel settings. The default output parent is `input/Prediction` for files and `project/Prediction` for arrays; pass `output_folder="results"` to change it. Results are written to disk, and `analysis_metadata.json` records array input without a source file hash. The methods also accept `progress(current, total, message)` and `cancelled()` callbacks.
 
 For a segmentation project, use `yolo26n-seg.pt` or another compatible segmentation model instead.
 
